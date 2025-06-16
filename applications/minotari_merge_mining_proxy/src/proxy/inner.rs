@@ -288,7 +288,16 @@ impl InnerService {
                             );
                         } else {
                             // self-select related, do not change.
-                            json_resp = json_rpc::default_block_accept_response(request["id"].as_i64());
+                            json_resp = json_rpc::success_response(
+                                request["id"].as_i64(),
+                                json!({ "status": "OK", "untrusted": !self.initial_sync_achieved.load(Ordering::SeqCst)}),
+                            );
+                            let resp = resp.into_inner();
+                            json_resp = crate::proxy::utils::append_aux_chain_data(
+                                json_resp,
+                                json!({"id": TARI_CHAIN_ID, "block_hash": resp.block_hash.to_hex()}),
+                            );
+                            // json_resp = json_rpc::default_block_accept_response(request["id"].as_i64());
                             trace!(
                                 target: LOG_TARGET,
                                 "pool merged mining proxy_submit_to_origin({}) json_resp: {}",
@@ -446,6 +455,9 @@ impl InnerService {
         let aux_chain_mr = hex::encode(final_block_template_data.aux_chain_mr.clone());
         let block_reward = final_block_template_data.template.tari_miner_data.reward;
         let total_fees = final_block_template_data.template.tari_miner_data.total_fees;
+
+        self.block_templates.remove_outdated_height(tari_height).await;
+
         let monerod_resp = crate::proxy::utils::add_aux_data(
             monerod_resp,
             json!({ "base_difficulty": final_block_template_data.template.monero_difficulty }),

@@ -107,6 +107,21 @@ impl BlockTemplateRepository {
         let mut b = self.blocks.write().await;
         b.remove(hash.as_ref())
     }
+
+    // Remove data before provided height
+    pub async fn remove_outdated_height(&self, height: u64) {
+        if height == 0 {
+            trace!(target: LOG_TARGET, "skip remove");
+            return;
+        }
+        
+        trace!(target: LOG_TARGET, "Removing outdated final block templates");
+        let mut b = self.blocks.write().await;
+        *b = b.drain().filter(|(_, i) | {
+            i.data.template.tari_block.header.as_ref().map(|h | h.height >= height).unwrap_or(false)
+        }).collect();
+    }
+
 }
 
 /// Setup values for the new block.
