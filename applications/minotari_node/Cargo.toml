@@ -70,6 +70,8 @@ tari_metrics = { workspace = true, optional = true, features = ["server"] }
 url = { version = "2.5.4", features = ["default", "serde"] }
 axum = { version = "0.8.4", features = ["default", "http2"] }
 http = "0.2.12"
+hex = "0.4.2" # add
+monero = { version = "0.21.0", features = ["serde"] }
 
 [features]
 default = ["libtor"]

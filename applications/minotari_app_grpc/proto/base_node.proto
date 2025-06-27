@@ -102,6 +102,9 @@ service BaseNode {
     rpc GetNetworkState(GetNetworkStateRequest) returns (GetNetworkStateResponse);
     // PayRef (Payment Reference) lookup for block explorers and external services
     rpc SearchPaymentReferences(SearchPaymentReferencesRequest) returns (stream PaymentReferenceResponse);
+
+    rpc GetMergeMiningTemplate(MergeMiningTemplateRequest) returns (MergeMiningTemplateResponse);
+    rpc SubmitMergeMining(SubmitMergeMiningRequest) returns (SubmitMergeMiningResponse);
 }
 
 message GetAssetMetadataRequest {
@@ -607,4 +610,38 @@ message PaymentReferenceResponse {
     bytes spent_block_hash = 8;
     // Transaction output amount will be 0 for non set a
     uint64 min_value_promise = 9;
+}
+
+message MergeMiningTemplateRequest {
+    string wallet_address = 1;
+    
+    string coinbase_extra = 2;
+}
+
+message MergeMiningTemplateResponse {
+    uint64 difficulty = 1;
+
+    uint64 height = 2;
+
+    uint64 reward = 3;
+
+    bytes header_blob = 4;
+
+    bytes body_blob = 5;
+
+    string merge_mining_hash = 6;
+}
+
+message SubmitMergeMiningRequest {
+    bytes header_blob = 1;
+
+    bytes body_blob = 2;
+
+    string seed_hash = 3;
+
+    string monero_block_blob = 4;
+}
+
+message SubmitMergeMiningResponse {
+    bytes block_hash = 1;
 }

@@ -63,7 +63,7 @@ use tari_core::{
     consensus::{ConsensusManager, NetworkConsensus},
     iterators::NonOverlappingIntegerPairIter,
     mempool::{service::LocalMempoolService, TxStorageResponse},
-    proof_of_work::{Difficulty, PowAlgorithm},
+    proof_of_work::{Difficulty, PowAlgorithm, monero_rx, monero_rx::FixedByteArray, PowData},
     transactions::{
         generate_coinbase_with_wallet_output,
         transaction_components::{
@@ -78,7 +78,9 @@ use tari_core::{
         transaction_key_manager::{create_memory_db_key_manager, TariKeyId, TransactionKeyManagerInterface, TxoStage},
     },
     validation::tari_rx_vm_key_height,
+    AuxChainHashes,
 };
+
 use tari_p2p::{auto_update::SoftwareUpdaterHandle, services::liveness::LivenessHandle};
 use tari_utilities::{hex::Hex, message_format::MessageFormat, ByteArray};
 use tokio::task;
@@ -3065,6 +3067,199 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         Ok(Response::new(rx))
     }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_merge_mining_template(
+        &self,
+        request: Request<tari_rpc::MergeMiningTemplateRequest>,
+    ) -> Result<Response<tari_rpc::MergeMiningTemplateResponse>, Status> {
+        self.check_method_enabled(GrpcMethod::GetMergeMiningTemplate)?;
+        let request = request.into_inner();
+        let report_error_flag = self.report_error_flag();
+        
+        info!(target: LOG_TARGET,"Incoming GRPC request for GetTemplateMergeMining: {:?}", request);
+    
+        // 1. 判断是否同步完成
+        let status_watch = self.state_machine_handle.get_status_info_watch();
+        let initial_sync_achived = status_watch.borrow().bootstrapped;
+        if !initial_sync_achived {
+            return Err(obscure_error_if_true(report_error_flag, Status::internal("Initial sync not achieved")));
+        }
+        
+        // 2. 调用 get_new_block_template
+        let mut handler = self.node_service.clone();
+        let algo = PowAlgorithm::RandomXM;
+
+        let mut new_template = handler.get_new_block_template(algo, 0).await.map_err(|e| {
+            warn!(
+                target: LOG_TARGET,
+                "Could not get new block template: {}",
+                e.to_string()
+            );
+            obscure_error_if_true(report_error_flag, Status::internal(e.to_string()))
+        })?;
+        
+        // 3. generate coinbase 调用
+        let key_manager = create_memory_db_key_manager().map_err(|e| {
+            obscure_error_if_true(
+                report_error_flag,
+                Status::internal(format!("Key manager error: '{}'", e)),
+            )
+        })?;
+
+        let wallet_payment_address = TariAddress::from_str(&request.wallet_address).map_err(|e| {
+            obscure_error_if_true(
+                report_error_flag,
+                Status::internal(format!("Invalid wallet address: '{}'", e)),
+            )
+        })?;
+
+        let coinbase_extra = if request.coinbase_extra.trim().is_empty() {
+            String::new()
+        } else {
+            request.coinbase_extra.clone()
+        };
+
+        let difficulty = new_template.target_difficulty.as_u64();
+        let total_fees = new_template.total_fees;
+        let block_reward = new_template.reward;
+        let script_key_id = TariKeyId::default();
+        let height = new_template.header.height;
+
+        let (_, coinbase_output, coinbase_kernel, _) = generate_coinbase_with_wallet_output(
+            total_fees.into(),
+            block_reward.into(),
+            height,
+            &CoinBaseExtra::try_from(coinbase_extra.as_bytes().to_vec()).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?,
+            &key_manager,
+            &script_key_id,
+            &wallet_payment_address,
+            true,
+            self.consensus_rules.consensus_constants(height),
+            RangeProofType::RevealedValue,
+            PaymentId::Open {
+                user_data: vec![],
+                tx_type: TxType::Coinbase,
+            },
+        ).await
+        .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
+        // 增加 coinbase output 和 coinbase kernel 
+        new_template.body.add_output(coinbase_output);
+        new_template.body.add_kernel(coinbase_kernel);
+
+
+        // 4. 调用 get_new_block 方法
+        let new_block = match handler.get_new_block(new_template).await {
+            Ok(b) => b,
+            Err(CommsInterfaceError::ChainStorageError(ChainStorageError::InvalidArguments { message, .. })) => {
+                return Err(obscure_error_if_true(
+                    report_error_flag,
+                    Status::invalid_argument(message),
+                ));
+            },
+            Err(CommsInterfaceError::ChainStorageError(ChainStorageError::CannotCalculateNonTipMmr(msg))) => {
+                let status = Status::with_details(
+                    tonic::Code::FailedPrecondition,
+                    msg,
+                    Bytes::from_static(b"CannotCalculateNonTipMmr"),
+                );
+                return Err(obscure_error_if_true(report_error_flag, status));
+            },
+            Err(e) => {
+                return Err(obscure_error_if_true(
+                    report_error_flag,
+                    Status::internal(e.to_string()),
+                ))
+            },
+        };
+
+        // 5. 计算 merge mining hash
+        let aux_chain_hashes = AuxChainHashes::try_from(vec![monero::Hash::from_slice(new_block.header.merge_mining_hash().as_slice())]).map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
+        
+        let aux_chain_single_hashes = aux_chain_hashes[0];
+
+        let aux_chain_mr = hex::encode(aux_chain_single_hashes.clone());
+
+        let (header, block_body) = new_block.into_header_body();
+        let mut header_bytes = Vec::new();
+        BorshSerialize::serialize(&header, &mut header_bytes)
+            .map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
+        let mut block_body_bytes = Vec::new();
+        BorshSerialize::serialize(&block_body, &mut block_body_bytes)
+            .map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
+
+        Ok(Response::new(tari_rpc::MergeMiningTemplateResponse {
+            difficulty: difficulty,
+            height,
+            reward: block_reward.into(),
+            header_blob: header_bytes,
+            body_blob: block_body_bytes,
+            merge_mining_hash: aux_chain_mr,
+        }))
+    }
+    
+    #[allow(clippy::too_many_lines)]
+    async fn submit_merge_mining(
+        &self,
+        request: Request<tari_rpc::SubmitMergeMiningRequest>,
+    ) -> Result<Response<tari_rpc::SubmitMergeMiningResponse>, Status> {
+        self.check_method_enabled(GrpcMethod::SubmitMergeMining)?;
+        let request = request.into_inner();
+        let report_error_flag = self.report_error_flag();
+    
+        info!(target: LOG_TARGET, "Incoming GRPC request for SubmitMergeMining: {:?}", request);
+
+        // 1. 解析参数        
+        let mut header_bytes = request.header_blob.as_slice();
+
+        let mut body_bytes = request.body_blob.as_slice();
+
+        let header = BorshDeserialize::deserialize(&mut header_bytes)
+            .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
+        let body = BorshDeserialize::deserialize(&mut body_bytes)
+            .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+        
+        let mut block = Block::new(header, body);
+
+        // 解析 seed_hash
+        let seed_hash = FixedByteArray::from_hex(&request.seed_hash.replace('\"', "")).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
+        // 解析 monero_block
+        let monero_block = monero_rx::deserialize_monero_block_from_hex(&request.monero_block_blob).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+ 
+        // 解析 merge_hash
+        let merge_mining_hash = block.header.merge_mining_hash();
+        
+        let aux_chain_hashes = AuxChainHashes::try_from(vec![monero::Hash::from_slice(merge_mining_hash.as_slice())]).map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
+        
+        let monero_data = monero_rx::construct_monero_data(
+            monero_block,
+            seed_hash.clone(),
+            aux_chain_hashes.clone(),
+            merge_mining_hash,
+        ).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
+        let mut monero_data_bytes = Vec::new();
+        BorshSerialize::serialize(&monero_data, &mut monero_data_bytes).unwrap();
+
+        // 2. 组装参数
+        block.header.pow.pow_data = PowData::try_from(monero_data_bytes).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+        
+        // 3. 调用 submit block 方法
+        let mut handler = self.node_service.clone();
+        let block_hash = handler
+            .submit_block(block)
+            .await
+            .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?
+            .to_vec();
+
+        Ok(Response::new(tari_rpc::SubmitMergeMiningResponse {
+            block_hash: block_hash
+        }))
+    }
+
 }
 
 enum BlockGroupType {

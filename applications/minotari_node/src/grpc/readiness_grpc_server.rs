@@ -368,4 +368,18 @@ impl tari_rpc::base_node_server::BaseNode for ReadinessGrpcServer {
     ) -> Result<Response<Self::SearchPaymentReferencesStream>, Status> {
         return Err(self.get_not_available_status());
     }
+
+    async fn get_merge_mining_template(
+        &self,
+        _request: Request<tari_rpc::MergeMiningTemplateRequest>,
+    ) -> Result<Response<tari_rpc::MergeMiningTemplateResponse>, Status> {
+        return Err(self.get_not_available_status());
+    }
+
+    async fn submit_merge_mining(
+        &self,
+        _request: Request<tari_rpc::SubmitMergeMiningRequest>,
+    ) -> Result<Response<tari_rpc::SubmitMergeMiningResponse>, Status> {
+        return Err(self.get_not_available_status());
+    }
 }
