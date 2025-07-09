@@ -656,7 +656,7 @@ message MiningBlockRequest {
 message MiningBlockResponse {
     Block block = 1;
     
-    uint64 difficulty = 2;
+    uint64 target_difficulty = 2;
 
     bytes vm_key = 3;
 
