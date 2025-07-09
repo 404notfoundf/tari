@@ -3080,11 +3080,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         info!(target: LOG_TARGET,"Incoming GRPC request for GetTemplateMergeMining: {:?}", request);
     
         // 1. 判断是否同步完成
-        let status_watch = self.state_machine_handle.get_status_info_watch();
-        let initial_sync_achived = status_watch.borrow().bootstrapped;
-        if !initial_sync_achived {
-            return Err(obscure_error_if_true(report_error_flag, Status::internal("Initial sync not achieved")));
-        }
+        // let status_watch = self.state_machine_handle.get_status_info_watch();
+        // let initial_sync_achived = status_watch.borrow().bootstrapped;
+        // if !initial_sync_achived {
+        //     return Err(obscure_error_if_true(report_error_flag, Status::internal("Initial sync not achieved")));
+        // }
         
         // 2. 调用 get_new_block_template
         let mut handler = self.node_service.clone();
@@ -3148,7 +3148,6 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         new_template.body.add_output(coinbase_output);
         new_template.body.add_kernel(coinbase_kernel);
 
-
         // 4. 调用 get_new_block 方法
         let new_block = match handler.get_new_block(new_template).await {
             Ok(b) => b,
@@ -3210,7 +3209,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
     
         info!(target: LOG_TARGET, "Incoming GRPC request for SubmitMergeMining: {:?}", request);
 
-        // 1. 解析参数        
+        // 1. 解析相关参数        
         let mut header_bytes = request.header_blob.as_slice();
 
         let mut body_bytes = request.body_blob.as_slice();
@@ -3247,7 +3246,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         // 2. 组装参数
         block.header.pow.pow_data = PowData::try_from(monero_data_bytes).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
         
-        // 3. 调用 submit block 方法
+        // 3. 调用 submit_block 方法
         let mut handler = self.node_service.clone();
         let block_hash = handler
             .submit_block(block)
@@ -3260,6 +3259,129 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn get_mining_block(
+        &self,
+        request: Request<tari_rpc::MiningBlockRequest>,
+    ) -> Result<Response<tari_rpc::MiningBlockResponse>, Status> {
+        self.check_method_enabled(GrpcMethod::GetMiningBlock)?;
+        let request = request.into_inner();
+        let report_error_flag = self.report_error_flag();
+
+        // 1. 调用 get_new_block_template
+        let mut handler = self.node_service.clone();
+        let algo = PowAlgorithm::Sha3x;
+        let mut new_template = handler.get_new_block_template(algo, 0).await.map_err(|e| {
+            warn!(
+                target: LOG_TARGET,
+                "Could not get new block template: {}",
+                e.to_string()
+            );
+            obscure_error_if_true(report_error_flag, Status::internal(e.to_string()))
+        })?;
+    
+
+        // 2. 调用generate_coinbase
+        let key_manager = create_memory_db_key_manager().map_err(|e| {
+            obscure_error_if_true(
+                report_error_flag,
+                Status::internal(format!("Key manager error: '{}'", e)),
+            )
+        })?;
+
+        let coinbase_extra = if request.coinbase_extra.trim().is_empty() {
+            String::new()
+        } else {
+            request.coinbase_extra.clone()
+        };
+
+        let wallet_payment_address = TariAddress::from_str(&request.wallet_address).map_err(|e| {
+            obscure_error_if_true(
+                report_error_flag,
+                Status::internal(format!("Invalid wallet address: '{}'", e)),
+            )
+        })?;
+
+        let difficulty = new_template.target_difficulty.as_u64();
+        let total_fees = new_template.total_fees;
+        let block_reward = new_template.reward;
+        let script_key_id = TariKeyId::default();
+        let height = new_template.header.height;
+
+        let vm_key = *handler
+            .get_header(tari_rx_vm_key_height(new_template.header.height))
+            .await
+            .map_err(|_| {
+                obscure_error_if_true(report_error_flag, Status::not_found("Tari block not found ".to_string()))
+            })?
+            .ok_or_else(|| {
+                obscure_error_if_true(report_error_flag, Status::not_found("Tari block not found ".to_string()))
+            })?
+            .hash();
+        
+        let (_, coinbase_output, coinbase_kernel, _) = generate_coinbase_with_wallet_output(
+            total_fees.into(),
+            block_reward.into(),
+            height,
+            &CoinBaseExtra::try_from(coinbase_extra.as_bytes().to_vec()).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?,
+            &key_manager,
+            &script_key_id,
+            &wallet_payment_address,
+            true,
+            self.consensus_rules.consensus_constants(height),
+            RangeProofType::RevealedValue,
+            PaymentId::Open {
+                user_data: vec![],
+                tx_type: TxType::Coinbase,
+            },
+        ).await
+        .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
+        // coninbase_kernel 和 coinbase_output 添加到 template
+        new_template.body.add_output(coinbase_output);
+        new_template.body.add_kernel(coinbase_kernel);
+        
+        // 3. 调用 get_new_block 方法
+        let new_block = match handler.get_new_block(new_template).await {
+            Ok(b) => b,
+            Err(CommsInterfaceError::ChainStorageError(ChainStorageError::InvalidArguments { message, .. })) => {
+                return Err(obscure_error_if_true(
+                    report_error_flag,
+                    Status::invalid_argument(message),
+                ));
+            },
+            Err(CommsInterfaceError::ChainStorageError(ChainStorageError::CannotCalculateNonTipMmr(msg))) => {
+                let status = Status::with_details(
+                    tonic::Code::FailedPrecondition,
+                    msg,
+                    Bytes::from_static(b"CannotCalculateNonTipMmr"),
+                );
+                return Err(obscure_error_if_true(report_error_flag, status));
+            },
+            Err(e) => {
+                return Err(obscure_error_if_true(
+                    report_error_flag,
+                    Status::internal(e.to_string()),
+                ))
+            },
+        };
+
+        let mining_hash = new_block.header.mining_hash().to_vec();
+
+        let block: Option<tari_rpc::Block> = Some(
+            new_block
+                .try_into()
+                .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e)))?,
+        );
+
+        // 4. 构建返回值
+        Ok(Response::new(tari_rpc::MiningBlockResponse {
+            block: block,
+            difficulty: difficulty,
+            vm_key: vm_key.to_vec(),
+            mining_hash: mining_hash,
+        }))
+    }
 }
 
 enum BlockGroupType {

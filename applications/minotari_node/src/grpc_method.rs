@@ -68,11 +68,12 @@ pub enum GrpcMethod {
     SearchPaymentReferences,
     GetMergeMiningTemplate,
     SubmitMergeMining,
+    GetMiningBlock,
 }
 
 impl GrpcMethod {
     /// All the GRPC methods as a fixed array
-    pub const ALL_VARIANTS: [GrpcMethod; 39] = [
+    pub const ALL_VARIANTS: [GrpcMethod; 40] = [
         GrpcMethod::ListHeaders,
         GrpcMethod::GetHeaderByHash,
         GrpcMethod::GetBlocks,
@@ -112,11 +113,12 @@ impl GrpcMethod {
         GrpcMethod::SearchPaymentReferences,
         GrpcMethod::GetMergeMiningTemplate,
         GrpcMethod::SubmitMergeMining,
+        GrpcMethod::GetMiningBlock,
     ];
 }
 
 impl IntoIterator for GrpcMethod {
-    type IntoIter = std::array::IntoIter<GrpcMethod, 39>;
+    type IntoIter = std::array::IntoIter<GrpcMethod, 40>;
     type Item = GrpcMethod;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -170,6 +172,7 @@ impl FromStr for GrpcMethod {
             "search_payment_references" => Ok(GrpcMethod::SearchPaymentReferences),
             "get_merge_mining_template" => Ok(GrpcMethod::GetMergeMiningTemplate),
             "submit_merge_mining" => Ok(GrpcMethod::SubmitMergeMining),
+            "get_mining_block" => Ok(GrpcMethod::GetMiningBlock),
             _ => Err(format!("'{}' not supported", s)),
         }
     }
@@ -269,6 +272,7 @@ mod tests {
                 GrpcMethod::SearchPaymentReferences => count += 1,
                 GrpcMethod::GetMergeMiningTemplate => count += 1,
                 GrpcMethod::SubmitMergeMining => count += 1,
+                GrpcMethod::GetMiningBlock => count += 1,
             }
         }
         assert_eq!(count, GrpcMethod::ALL_VARIANTS.len());

@@ -382,4 +382,11 @@ impl tari_rpc::base_node_server::BaseNode for ReadinessGrpcServer {
     ) -> Result<Response<tari_rpc::SubmitMergeMiningResponse>, Status> {
         return Err(self.get_not_available_status());
     }
+
+    async fn get_mining_block(
+        &self,
+        _request: Request<tari_rpc::MiningBlockRequest>,
+    ) -> Result<Response<tari_rpc::MiningBlockResponse>, Status> {
+        return Err(self.get_not_available_status());
+    }
 }

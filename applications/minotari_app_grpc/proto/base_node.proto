@@ -105,6 +105,7 @@ service BaseNode {
 
     rpc GetMergeMiningTemplate(MergeMiningTemplateRequest) returns (MergeMiningTemplateResponse);
     rpc SubmitMergeMining(SubmitMergeMiningRequest) returns (SubmitMergeMiningResponse);
+    rpc GetMiningBlock(MiningBlockRequest) returns (MiningBlockResponse);
 }
 
 message GetAssetMetadataRequest {
@@ -644,4 +645,20 @@ message SubmitMergeMiningRequest {
 
 message SubmitMergeMiningResponse {
     bytes block_hash = 1;
+}
+
+message MiningBlockRequest {
+    string wallet_address = 1;
+    
+    string coinbase_extra = 2;
+}
+
+message MiningBlockResponse {
+    Block block = 1;
+    
+    uint64 difficulty = 2;
+
+    bytes vm_key = 3;
+
+    bytes mining_hash = 4;
 }
