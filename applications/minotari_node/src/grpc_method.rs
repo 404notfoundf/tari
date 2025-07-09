@@ -66,6 +66,7 @@ pub enum GrpcMethod {
     GetTemplateRegistrations,
     GetSideChainUtxos,
     SearchPaymentReferences,
+    SearchPaymentReferencesViaOutputHash,
     GetMergeMiningTemplate,
     SubmitMergeMining,
     GetMiningBlock,
@@ -73,7 +74,7 @@ pub enum GrpcMethod {
 
 impl GrpcMethod {
     /// All the GRPC methods as a fixed array
-    pub const ALL_VARIANTS: [GrpcMethod; 40] = [
+    pub const ALL_VARIANTS: [GrpcMethod; 41] = [
         GrpcMethod::ListHeaders,
         GrpcMethod::GetHeaderByHash,
         GrpcMethod::GetBlocks,
@@ -111,6 +112,7 @@ impl GrpcMethod {
         GrpcMethod::GetTemplateRegistrations,
         GrpcMethod::GetSideChainUtxos,
         GrpcMethod::SearchPaymentReferences,
+        GrpcMethod::SearchPaymentReferencesViaOutputHash,
         GrpcMethod::GetMergeMiningTemplate,
         GrpcMethod::SubmitMergeMining,
         GrpcMethod::GetMiningBlock,
@@ -118,7 +120,7 @@ impl GrpcMethod {
 }
 
 impl IntoIterator for GrpcMethod {
-    type IntoIter = std::array::IntoIter<GrpcMethod, 40>;
+    type IntoIter = std::array::IntoIter<GrpcMethod, 41>;
     type Item = GrpcMethod;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -170,6 +172,7 @@ impl FromStr for GrpcMethod {
             "get_template_registrations" => Ok(GrpcMethod::GetTemplateRegistrations),
             "get_side_chain_utxos" => Ok(GrpcMethod::GetSideChainUtxos),
             "search_payment_references" => Ok(GrpcMethod::SearchPaymentReferences),
+            "search_payment_references_via_output_hash" => Ok(GrpcMethod::SearchPaymentReferencesViaOutputHash),
             "get_merge_mining_template" => Ok(GrpcMethod::GetMergeMiningTemplate),
             "submit_merge_mining" => Ok(GrpcMethod::SubmitMergeMining),
             "get_mining_block" => Ok(GrpcMethod::GetMiningBlock),
@@ -270,6 +273,7 @@ mod tests {
                 GrpcMethod::GetTemplateRegistrations => count += 1,
                 GrpcMethod::GetSideChainUtxos => count += 1,
                 GrpcMethod::SearchPaymentReferences => count += 1,
+                GrpcMethod::SearchPaymentReferencesViaOutputHash => count += 1,
                 GrpcMethod::GetMergeMiningTemplate => count += 1,
                 GrpcMethod::SubmitMergeMining => count += 1,
                 GrpcMethod::GetMiningBlock => count += 1,
