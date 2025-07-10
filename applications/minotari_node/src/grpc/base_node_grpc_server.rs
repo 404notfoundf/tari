@@ -3418,7 +3418,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let target_difficulty = new_template.target_difficulty.as_u64();
         let total_fees = new_template.total_fees;
-        let block_reward: tari_core::transactions::tari_amount::MicroMinotari = new_template.reward;
+        let block_reward  = new_template.reward;
         let script_key_id = TariKeyId::default();
         let height = new_template.header.height;
 
