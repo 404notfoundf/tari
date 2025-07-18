@@ -133,7 +133,6 @@ pub trait TransactionBackend: Send + Sync + Clone {
         mined_height: u64,
         mined_in_block: BlockHash,
         mined_timestamp: u64,
-        num_confirmations: u64,
         must_be_confirmed: bool,
         status: &TransactionStatus,
     ) -> Result<(), TransactionStorageError>;
@@ -173,6 +172,8 @@ pub trait TransactionBackend: Send + Sync + Clone {
         &self,
         payref: &FixedHash,
     ) -> Result<Option<CompletedTransaction>, TransactionStorageError>;
+
+    fn get_last_scanned_height(&self) -> Result<Option<u64>, TransactionStorageError>;
 }
 
 #[derive(Clone, PartialEq)]
@@ -366,6 +367,10 @@ where T: TransactionBackend + 'static
             )))
     }
 
+    pub fn get_last_scanned_height(&self) -> Result<Option<u64>, TransactionStorageError> {
+        self.db.get_last_scanned_height()
+    }
+
     pub fn get_pending_outbound_transaction(
         &self,
         tx_id: TxId,
@@ -525,6 +530,26 @@ where T: TransactionBackend + 'static
     /// This method returns all completed transactions that must be broadcast
     pub fn get_transactions_to_be_broadcast(&self) -> Result<Vec<CompletedTransaction>, TransactionStorageError> {
         self.db.get_transactions_to_be_broadcast()
+    }
+
+    pub fn get_transaction_to_be_broadcast(
+        &self,
+        tx_id: TxId,
+    ) -> Result<CompletedTransaction, TransactionStorageError> {
+        let key = DbKey::CompletedTransaction(tx_id);
+        let t = match self.db.fetch(&DbKey::CompletedTransaction(tx_id)) {
+            Ok(None) => Err(TransactionStorageError::ValueNotFound(key)),
+            Ok(Some(DbValue::CompletedTransaction(pt))) => {
+                if pt.status == TransactionStatus::Completed && pt.status == TransactionStatus::Broadcast {
+                    Ok(pt)
+                } else {
+                    Err(TransactionStorageError::ValueNotFound(key))
+                }
+            },
+            Ok(Some(other)) => unexpected_result(key, other),
+            Err(e) => log_error(key, e),
+        }?;
+        Ok(*t)
     }
 
     pub fn get_completed_transaction_cancelled_or_not(
@@ -813,7 +838,6 @@ where T: TransactionBackend + 'static
         mined_height: u64,
         mined_in_block: BlockHash,
         mined_timestamp: u64,
-        num_confirmations: u64,
         must_be_confirmed: bool,
         status: &TransactionStatus,
     ) -> Result<(), TransactionStorageError> {
@@ -822,7 +846,6 @@ where T: TransactionBackend + 'static
             mined_height,
             mined_in_block,
             mined_timestamp,
-            num_confirmations,
             must_be_confirmed,
             status,
         )
@@ -885,7 +908,7 @@ fn log_error<T>(req: DbKey, err: TransactionStorageError) -> Result<T, Transacti
         target: LOG_TARGET,
         "Database access error on request: {}: {}",
         req,
-        err.to_string()
+        err
     );
     Err(err)
 }

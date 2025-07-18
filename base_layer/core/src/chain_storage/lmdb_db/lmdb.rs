@@ -61,7 +61,7 @@ pub fn lmdb_insert<K, V>(
 ) -> Result<(), ChainStorageError>
 where
     K: AsLmdbBytes + ?Sized + Debug,
-    V: Serialize + Debug,
+    V: Serialize + Debug + ?Sized,
 {
     let val_buf = serialize(val, None)?;
     match txn.access().put(db, key, &val_buf, put::NOOVERWRITE) {
@@ -268,7 +268,7 @@ where
             if e == Error::Code(error::NOTFOUND) {
                 return Ok(result);
             }
-            error!(target: LOG_TARGET, "Error in lmdb_get_multiple:{}", e.to_string());
+            error!(target: LOG_TARGET, "Error in lmdb_get_multiple:{}", e);
             // No matches
             return Err(e.into());
         },
