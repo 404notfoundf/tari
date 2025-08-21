@@ -438,6 +438,13 @@ impl tari_rpc::base_node_server::BaseNode for ReadinessGrpcServer {
         return Err(self.get_not_available_status());
     }
 
+    async fn get_random_x_mining_block(
+        &self,
+        _request: Request<tari_rpc::MiningRandomXBlockRequest>,
+    ) -> Result<Response<tari_rpc::MiningRandomXBlockResponse>, Status> {
+        return Err(self.get_not_available_status());
+    }
+
     async fn search_payment_references_via_output_hash(
         &self,
         _request: Request<tari_rpc::FetchMatchingUtxosRequest>,
