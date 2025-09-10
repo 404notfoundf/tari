@@ -26,9 +26,9 @@ use log::*;
 use minotari_node_wallet_client::BaseNodeWalletClient;
 use tari_common_types::{
     transaction::{TransactionStatus, TxId},
-    types::{BlockHash, Signature},
+    types::{BlockHash, CompressedSignature},
 };
-use tari_core::{self, base_node::rpc::models::TxLocation};
+use tari_transaction_components::{key_manager::TransactionKeyManagerInterface, rpc::models::TxLocation};
 use tari_utilities::{hex::Hex, ByteArray};
 
 use crate::{
@@ -50,20 +50,22 @@ use crate::{
 const LOG_TARGET: &str = "wallet::transaction_service::protocols::validation_protocol";
 
 #[derive(Clone)]
-pub struct TransactionValidationProtocol<TTransactionBackend, TWalletConnectivity> {
+pub struct TransactionValidationProtocol<TTransactionBackend, TWalletConnectivity, TKeyManagerInterface> {
     operation_id: OperationId,
     db: TransactionDatabase<TTransactionBackend>,
     connectivity: TWalletConnectivity,
     config: TransactionServiceConfig,
     event_publisher: TransactionEventSender,
-    output_manager: OutputManagerHandle,
+    output_manager: OutputManagerHandle<TKeyManagerInterface>,
 }
 
 #[allow(unused_variables)]
-impl<TTransactionBackend, TWalletConnectivity> TransactionValidationProtocol<TTransactionBackend, TWalletConnectivity>
+impl<TTransactionBackend, TWalletConnectivity, TKeyManagerInterface>
+    TransactionValidationProtocol<TTransactionBackend, TWalletConnectivity, TKeyManagerInterface>
 where
     TTransactionBackend: TransactionBackend + 'static,
     TWalletConnectivity: WalletConnectivityInterface,
+    TKeyManagerInterface: TransactionKeyManagerInterface,
 {
     pub fn new(
         operation_id: OperationId,
@@ -71,7 +73,7 @@ where
         connectivity: TWalletConnectivity,
         config: TransactionServiceConfig,
         event_publisher: TransactionEventSender,
-        output_manager: OutputManagerHandle,
+        output_manager: OutputManagerHandle<TKeyManagerInterface>,
     ) -> Self {
         Self {
             operation_id,
@@ -93,7 +95,7 @@ where
         );
         // Fetch completed but unconfirmed transactions that were not imported
         let (state_changed, tip) = self.check_unconfirmed(base_node_wallet_client).await?;
-        debug!(target: LOG_TARGET, "Using tip height {} for validation", tip);
+        debug!(target: LOG_TARGET, "Using tip height {tip} for validation");
         check_detected_transactions(
             self.output_manager.clone(),
             self.db.clone(),
@@ -102,7 +104,10 @@ where
         )
         .await;
         if state_changed {
-            self.publish_event(TransactionEvent::TransactionValidationStateChanged(self.operation_id));
+            self.publish_event(TransactionEvent::TransactionValidationStateChanged {
+                faux: false,
+                id: self.operation_id,
+            });
         }
         self.publish_event(TransactionEvent::TransactionValidationCompleted(self.operation_id));
         Ok(self.operation_id)
@@ -172,7 +177,7 @@ where
         if let Err(e) = self.event_publisher.send(Arc::new(event)) {
             debug!(
                 target: LOG_TARGET,
-                "Error sending event because there are no subscribers: {:?}", e
+                "Error sending event because there are no subscribers: {e:?}"
             );
         }
     }
@@ -244,7 +249,7 @@ where
                 );
                 self.update_transaction_as_unmined(last_mined_transaction.tx_id, &last_mined_transaction.status)
                     .await?;
-                self.publish_event(TransactionEvent::TransactionValidationStateChanged(op_id));
+                self.publish_event(TransactionEvent::TransactionValidationStateChanged { faux: false, id: op_id });
             } else {
                 debug!(
                     target: LOG_TARGET,
@@ -274,7 +279,7 @@ where
         let mut batch_signatures = HashMap::new();
         for tx_info in batch {
             // Imported transactions do not have a signature; this is represented by the default signature in info
-            if tx_info.signature != Signature::default() {
+            if tx_info.signature != CompressedSignature::default() {
                 batch_signatures.insert(tx_info.signature.clone(), tx_info);
             }
         }
@@ -315,7 +320,7 @@ where
                         (
                             height,
                             hash.try_into().map_err(|e| {
-                                TransactionServiceError::Other(format!("Could not convert best block hash: {}", e))
+                                TransactionServiceError::Other(format!("Could not convert best block hash: {e}"))
                             })?,
                             timestamp,
                         )
@@ -358,8 +363,7 @@ where
                     "Error asking base node for header:{} (Operation ID: {})", rpc_error, self.operation_id
                 );
                 return Err(TransactionServiceError::Other(format!(
-                    "Error asking base node for header at height {}: {}",
-                    height, rpc_error
+                    "Error asking base node for header at height {height}: {rpc_error}"
                 )));
             },
         };

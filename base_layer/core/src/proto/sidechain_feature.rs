@@ -26,7 +26,7 @@ use std::convert::{TryFrom, TryInto};
 
 use prost::Message;
 use tari_common::configuration::Network;
-use tari_common_types::types::{CompressedPublicKey, Signature};
+use tari_common_types::types::{CompressedPublicKey, CompressedSignature};
 use tari_max_size::MaxSizeString;
 use tari_sidechain::{
     ChainLink,
@@ -42,24 +42,21 @@ use tari_sidechain::{
     SidechainBlockHeader,
     ValidatorQcSignature,
 };
+use tari_transaction_components::transaction_components::{
+    BuildInfo,
+    CodeTemplateRegistration,
+    ConfidentialOutputData,
+    SideChainFeature,
+    SideChainFeatureData,
+    SideChainId,
+    TemplateType,
+    ValidatorNodeExit,
+    ValidatorNodeRegistration,
+    ValidatorNodeSignature,
+};
 use tari_utilities::ByteArray;
 
-use crate::{
-    proto,
-    transactions::transaction_components::{
-        BuildInfo,
-        CodeTemplateRegistration,
-        ConfidentialOutputData,
-        SideChainFeature,
-        SideChainFeatureData,
-        SideChainId,
-        TemplateType,
-        ValidatorNodeExit,
-        ValidatorNodeRegistration,
-        ValidatorNodeSignature,
-    },
-};
-
+use crate::proto;
 //---------------------------------- SideChainFeature --------------------------------------------//
 impl From<SideChainFeature> for proto::types::SideChainFeature {
     fn from(value: SideChainFeature) -> Self {
@@ -136,16 +133,16 @@ impl TryFrom<proto::types::ValidatorNodeRegistration> for ValidatorNodeRegistrat
 
     fn try_from(value: proto::types::ValidatorNodeRegistration) -> Result<Self, Self::Error> {
         let public_key =
-            CompressedPublicKey::from_canonical_bytes(&value.public_key).map_err(|e| format!("public_key: {}", e))?;
+            CompressedPublicKey::from_canonical_bytes(&value.public_key).map_err(|e| format!("public_key: {e}"))?;
         let claim_public_key = CompressedPublicKey::from_canonical_bytes(&value.claim_public_key)
-            .map_err(|e| format!("claim_public_key: {}", e))?;
+            .map_err(|e| format!("claim_public_key: {e}"))?;
 
         Ok(Self::new(
             ValidatorNodeSignature::new(
                 public_key,
                 value
                     .signature
-                    .map(Signature::try_from)
+                    .map(CompressedSignature::try_from)
                     .ok_or("signature not provided")??,
             ),
             claim_public_key,
@@ -171,14 +168,14 @@ impl TryFrom<proto::types::ValidatorNodeExit> for ValidatorNodeExit {
 
     fn try_from(value: proto::types::ValidatorNodeExit) -> Result<Self, Self::Error> {
         let public_key =
-            CompressedPublicKey::from_canonical_bytes(&value.public_key).map_err(|e| format!("public_key: {}", e))?;
+            CompressedPublicKey::from_canonical_bytes(&value.public_key).map_err(|e| format!("public_key: {e}"))?;
 
         Ok(Self::new(
             ValidatorNodeSignature::new(
                 public_key,
                 value
                     .signature
-                    .map(Signature::try_from)
+                    .map(CompressedSignature::try_from)
                     .ok_or("signature not provided")??,
             ),
             value.max_epoch.into(),
@@ -206,7 +203,7 @@ impl TryFrom<proto::types::TemplateRegistration> for CodeTemplateRegistration {
                 .map_err(|e| e.to_string())?,
             author_signature: value
                 .author_signature
-                .map(Signature::try_from)
+                .map(CompressedSignature::try_from)
                 .ok_or("author_signature not provided")??,
             template_name: MaxSizeString::try_from(value.template_name).map_err(|e| e.to_string())?,
             template_version: value
@@ -333,7 +330,7 @@ impl TryFrom<proto::types::SidechainId> for SideChainId {
         let public_key = CompressedPublicKey::from_canonical_bytes(&value.public_key).map_err(|e| e.to_string())?;
         let knowledge_proof = value
             .knowledge_proof
-            .map(Signature::try_from)
+            .map(CompressedSignature::try_from)
             .ok_or("knowledge_proof not provided")??;
         Ok(Self::new(public_key, knowledge_proof))
     }
@@ -450,7 +447,7 @@ impl TryFrom<proto::types::SidechainBlockHeader> for SidechainBlockHeader {
 
     fn try_from(value: proto::types::SidechainBlockHeader) -> Result<Self, Self::Error> {
         let network_byte = u8::try_from(value.network).map_err(|_| "Invalid network byte: overflows u8".to_string())?;
-        Network::try_from(network_byte).map_err(|err| format!("Invalid network byte: {}", err))?;
+        Network::try_from(network_byte).map_err(|err| format!("Invalid network byte: {err}"))?;
         Ok(Self {
             network: network_byte,
             parent_id: value.parent_id.try_into().map_err(|_| "Invalid parent id")?,

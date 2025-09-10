@@ -182,14 +182,14 @@ impl FromStr for GrpcMethod {
             "submit_merge_mining" => Ok(GrpcMethod::SubmitMergeMining),
             "get_mining_block" => Ok(GrpcMethod::GetMiningBlock),
             "get_random_x_mining_block" => Ok(GrpcMethod::GetRandomXMiningBlock),
-            _ => Err(format!("'{}' not supported", s)),
+            _ => Err(format!("'{s}' not supported")),
         }
     }
 }
 
 impl fmt::Display for GrpcMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 

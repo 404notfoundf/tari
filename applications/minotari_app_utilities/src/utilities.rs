@@ -28,7 +28,7 @@ use tari_common::exit_codes::{ExitCode, ExitError};
 use tari_common_types::{
     emoji::EmojiId,
     tari_address::TariAddress,
-    types::{BlockHash, CompressedPublicKey, PrivateKey, Signature},
+    types::{BlockHash, CompressedPublicKey, CompressedSignature, PrivateKey},
 };
 use tari_comms::{peer_manager::NodeId, types::CommsPublicKey};
 use tari_utilities::hex::{Hex, HexError};
@@ -40,7 +40,7 @@ pub const LOG_TARGET: &str = "minotari::application";
 pub fn setup_runtime() -> Result<Runtime, ExitError> {
     let mut builder = runtime::Builder::new_multi_thread();
     builder.enable_all().build().map_err(|e| {
-        let msg = format!("There was an error while building the node runtime. {}", e);
+        let msg = format!("There was an error while building the node runtime. {e}");
         ExitError::new(ExitCode::UnknownError, msg)
     })
 }
@@ -141,22 +141,22 @@ impl TryFrom<UniNodeId> for CompressedPublicKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct UniSignature(Signature);
+pub struct UniSignature(CompressedSignature);
 
 impl FromStr for UniSignature {
     type Err = HexError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let data = s.split(',').collect::<Vec<_>>();
-        let signature = PrivateKey::from_hex(data[0])?;
-        let public_nonce = CompressedPublicKey::from_hex(data[1])?;
+        let signature = PrivateKey::from_hex(data.first().ok_or(HexError::LengthError {})?)?;
+        let public_nonce = CompressedPublicKey::from_hex(data.get(1).ok_or(HexError::LengthError {})?)?;
 
-        let signature = Signature::new(public_nonce, signature);
+        let signature = CompressedSignature::new(public_nonce, signature);
         Ok(Self(signature))
     }
 }
 
-impl From<UniSignature> for Signature {
+impl From<UniSignature> for CompressedSignature {
     fn from(id: UniSignature) -> Self {
         id.0
     }

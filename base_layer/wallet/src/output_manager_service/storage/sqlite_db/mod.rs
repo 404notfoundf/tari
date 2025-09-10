@@ -38,12 +38,12 @@ use tari_common_types::{
     transaction::TxId,
     types::{CompressedCommitment, FixedHash},
 };
-use tari_core::transactions::{
-    transaction_components::{OutputType, TransactionOutput},
-    transaction_key_manager::TariKeyId,
-};
 use tari_crypto::tari_utilities::{hex::Hex, ByteArray};
 use tari_script::{ExecutionStack, TariScript};
+use tari_transaction_components::{
+    key_manager::TariKeyId,
+    transaction_components::{OutputType, TransactionOutput},
+};
 use tokio::time::Instant;
 
 use crate::{
@@ -583,7 +583,7 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
             ))
             .execute(&mut conn)?;
 
-        trace!(target: LOG_TARGET, "rows updated: {:?}", result);
+        trace!(target: LOG_TARGET, "rows updated: {result:?}");
         if start.elapsed().as_millis() > 0 {
             trace!(
                 target: LOG_TARGET,
@@ -837,7 +837,7 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
                     count,
                     outputs_to_send.len()
                 );
-                error!(target: LOG_TARGET, "{}", msg,);
+                error!(target: LOG_TARGET, "{msg}");
                 return Err(OutputManagerStorageError::UnexpectedResult(msg));
             }
 
@@ -869,11 +869,18 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
     fn confirm_encumbered_outputs(
         &self,
         tx_id: TxId,
-        change_outputs_to_update: &[DbWalletOutput],
+        change_outputs_to_add: &[DbWalletOutput],
     ) -> Result<(), OutputManagerStorageError> {
         let start = Instant::now();
         let mut conn = self.database_connection.get_pooled_connection()?;
         let acquire_lock = start.elapsed();
+
+        // Add the change outputs to be correct
+        for output in change_outputs_to_add {
+            let new_output =
+                NewOutputSql::new(output.clone(), Some(OutputStatus::EncumberedToBeReceived), Some(tx_id))?;
+            new_output.commit(&mut conn)?;
+        }
 
         conn.transaction::<_, _, _>(|conn| {
             update_outputs_with_tx_id_and_status_to_new_status(
@@ -882,29 +889,6 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
                 OutputStatus::ShortTermEncumberedToBeReceived,
                 OutputStatus::EncumberedToBeReceived,
             )?;
-            // Update the change outputs to be correct
-            for output in change_outputs_to_update {
-                let db_output = OutputSql::find_by_commitment_and_cancelled(&output.commitment.to_vec(), false, conn)?;
-                db_output.update(
-                    // Note: Only the `ephemeral_pubkey` and `u_y` portion needs to be updated at this time as the rest
-                    // was already correct
-                    UpdateOutput {
-                        metadata_signature_ephemeral_commitment: Some(
-                            output.wallet_output.metadata_signature.ephemeral_commitment().to_vec(),
-                        ),
-                        metadata_signature_ephemeral_pubkey: Some(
-                            output.wallet_output.metadata_signature.ephemeral_pubkey().to_vec(),
-                        ),
-                        metadata_signature_u_a: Some(output.wallet_output.metadata_signature.u_a().to_vec()),
-                        metadata_signature_u_x: Some(output.wallet_output.metadata_signature.u_x().to_vec()),
-                        metadata_signature_u_y: Some(output.wallet_output.metadata_signature.u_y().to_vec()),
-                        encrypted_data: Some(output.wallet_output.encrypted_data.to_byte_vec()),
-                        hash: Some(output.hash.to_vec()),
-                        ..Default::default()
-                    },
-                    conn,
-                )?;
-            }
 
             update_outputs_with_tx_id_and_status_to_new_status(
                 conn,
@@ -1273,12 +1257,11 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
             .into_iter()
             .filter_map(|x| {
                 x.to_db_wallet_output()
-                    .map_err(|e| {
+                    .inspect_err(|e| {
                         error!(
                             target: LOG_TARGET,
-                            "failed to convert `OutputSql` to `DbWalletOutput`: {:#?}", e
+                            "failed to convert `OutputSql` to `DbWalletOutput`: {e:#?}"
                         );
-                        e
                     })
                     .ok()
             })
@@ -1521,18 +1504,19 @@ impl KnownOneSidedPaymentScriptSql {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::indexing_slicing)]
 
     use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     use rand::{rngs::OsRng, RngCore};
-    use tari_core::transactions::{
-        tari_amount::MicroMinotari,
-        test_helpers::{create_wallet_output_with_data, TestParams},
-        transaction_components::{OutputFeatures, TransactionInput, WalletOutput},
-        transaction_key_manager::{create_memory_db_key_manager, MemoryDbKeyManager},
-    };
     use tari_script::script;
     use tari_test_utils::random;
+    use tari_transaction_components::{
+        test_helpers::{create_wallet_output_with_data, TestParams},
+        transaction_components::{OutputFeatures, TransactionInput, WalletOutput},
+        MicroMinotari,
+    };
+    use tari_transaction_key_manager::{create_memory_db_key_manager, MemoryDbKeyManager};
     use tempfile::tempdir;
 
     use crate::output_manager_service::storage::{
@@ -1564,21 +1548,18 @@ mod test {
         let db_name = format!("{}.sqlite3", random::string(8).as_str());
         let temp_dir = tempdir().unwrap();
         let db_folder = temp_dir.path().to_str().unwrap().to_string();
-        let db_path = format!("{}{}", db_folder, db_name);
+        let db_path = format!("{db_folder}{db_name}");
 
         const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
         let mut conn =
-            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         conn.run_pending_migrations(MIGRATIONS)
             .map(|v| {
                 v.into_iter()
                     .map(|b| {
-                        let m = format!("Running migration {}", b);
-                        // std::io::stdout()
-                        //     .write_all(m.as_ref())
-                        //     .expect("Couldn't write migration number to stdout");
+                        let m = format!("Running migration {b}");
                         m
                     })
                     .collect::<Vec<String>>()
@@ -1591,7 +1572,7 @@ mod test {
         let mut outputs_spent = Vec::new();
         let mut outputs_unspent = Vec::new();
 
-        let key_manager = create_memory_db_key_manager().unwrap();
+        let key_manager = create_memory_db_key_manager().await.unwrap();
         for _i in 0..2 {
             let (_, uo) = make_input(MicroMinotari::from(100 + OsRng.next_u64() % 1000), &key_manager).await;
             let uo = DbWalletOutput::from_wallet_output(uo, &key_manager, None, OutputSource::Standard, None, None)

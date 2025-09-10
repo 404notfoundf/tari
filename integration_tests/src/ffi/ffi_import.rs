@@ -29,7 +29,6 @@ pub type TariSeedWords = c_void;
 pub type TariPendingInboundTransaction = c_void;
 pub type TariCompletedTransaction = c_void;
 pub type TariTransactionSendStatus = c_void;
-pub type TariContactsLivenessData = c_void;
 pub type TariBalance = c_void;
 pub type TariWallet = c_void;
 pub type TariWalletAddress = c_void;
@@ -58,8 +57,6 @@ pub type TariEncryptedOpenings = c_void;
 pub type TariUnblindedOutput = c_void;
 #[allow(dead_code)]
 pub type TariUnblindedOutputs = c_void;
-pub type TariContact = c_void;
-pub type TariContacts = c_void;
 pub type TariCompletedTransactions = c_void;
 pub type TariPendingOutboundTransactions = c_void;
 pub type TariPendingOutboundTransaction = c_void;
@@ -208,34 +205,6 @@ extern "C" {
         error_out: *mut c_int,
     ) -> c_uchar;
     pub fn seed_words_destroy(seed_words: *mut TariSeedWords);
-    pub fn contact_create(
-        alias: *const c_char,
-        address: *mut TariWalletAddress,
-        favourite: bool,
-        error_out: *mut c_int,
-    ) -> *mut TariContact;
-    pub fn contact_get_alias(contact: *mut TariContact, error_out: *mut c_int) -> *mut c_char;
-    pub fn contact_get_tari_address(contact: *mut TariContact, error_out: *mut c_int) -> *mut TariWalletAddress;
-    pub fn contact_destroy(contact: *mut TariContact);
-    pub fn contacts_get_length(contacts: *mut TariContacts, error_out: *mut c_int) -> c_uint;
-    pub fn contacts_get_at(contacts: *mut TariContacts, position: c_uint, error_out: *mut c_int) -> *mut TariContact;
-    pub fn contacts_destroy(contacts: *mut TariContacts);
-    pub fn liveness_data_get_public_key(
-        liveness_data: *mut TariContactsLivenessData,
-        error_out: *mut c_int,
-    ) -> *mut TariWalletAddress;
-    pub fn liveness_data_get_latency(liveness_data: *mut TariContactsLivenessData, error_out: *mut c_int) -> c_int;
-    pub fn liveness_data_get_last_seen(
-        liveness_data: *mut TariContactsLivenessData,
-        error_out: *mut c_int,
-    ) -> *mut c_char;
-    pub fn liveness_data_get_message_type(liveness_data: *mut TariContactsLivenessData, error_out: *mut c_int)
-        -> c_int;
-    pub fn liveness_data_get_online_status(
-        liveness_data: *mut TariContactsLivenessData,
-        error_out: *mut c_int,
-    ) -> *const c_char;
-    pub fn liveness_data_destroy(liveness_data: *mut TariContactsLivenessData);
     pub fn completed_transactions_get_length(
         transactions: *mut TariCompletedTransactions,
         error_out: *mut c_int,
@@ -379,27 +348,9 @@ extern "C" {
     pub fn pending_inbound_transaction_destroy(transaction: *mut TariPendingInboundTransaction);
     pub fn transaction_send_status_decode(status: *const TariTransactionSendStatus, error_out: *mut c_int) -> c_uint;
     pub fn transaction_send_status_destroy(status: *mut TariTransactionSendStatus);
-    pub fn transport_memory_create() -> *mut TariTransportConfig;
-    pub fn transport_tcp_create(listener_address: *const c_char, error_out: *mut c_int) -> *mut TariTransportConfig;
-    pub fn transport_tor_create(
-        control_server_address: *const c_char,
-        tor_cookie: *const ByteVector,
-        tor_port: c_ushort,
-        tor_proxy_bypass_for_outbound: bool,
-        socks_username: *const c_char,
-        socks_password: *const c_char,
-        error_out: *mut c_int,
-    ) -> *mut TariTransportConfig;
-    pub fn transport_memory_get_address(transport: *const TariTransportConfig, error_out: *mut c_int) -> *mut c_char;
-    pub fn transport_type_destroy(transport: *mut TariTransportConfig);
-    pub fn transport_config_destroy(transport: *mut TariTransportConfig);
     pub fn comms_config_create(
-        public_address: *const c_char,
-        transport: *const TariTransportConfig,
         database_name: *const c_char,
         datastore_path: *const c_char,
-        discovery_timeout_in_secs: c_ulonglong,
-        exclude_dial_test_addresses: bool,
         error_out: *mut c_int,
     ) -> *mut TariCommsConfig;
     pub fn comms_config_destroy(wc: *mut TariCommsConfig);
@@ -424,7 +375,8 @@ extern "C" {
         dns_seeds_str: *const c_char,
         dns_seed_name_servers_str: *const c_char,
         use_dns_sec: bool,
-
+        http_base_node: *const c_char,
+        wallet_birthday_offset: c_int,
         callback_received_transaction: unsafe extern "C" fn(context: *mut c_void, *mut TariPendingInboundTransaction),
         callback_received_transaction_reply: unsafe extern "C" fn(context: *mut c_void, *mut TariCompletedTransaction),
         callback_received_finalized_transaction: unsafe extern "C" fn(
@@ -455,10 +407,6 @@ extern "C" {
             u64,
         ),
         callback_txo_validation_complete: unsafe extern "C" fn(context: *mut c_void, u64, u64),
-        callback_contacts_liveness_data_updated: unsafe extern "C" fn(
-            context: *mut c_void,
-            *mut TariContactsLivenessData,
-        ),
         callback_balance_updated: unsafe extern "C" fn(context: *mut c_void, *mut TariBalance),
         callback_transaction_validation_complete: unsafe extern "C" fn(context: *mut c_void, u64, u64),
         callback_saf_messages_received: unsafe extern "C" fn(context: *mut c_void),
@@ -513,8 +461,6 @@ extern "C" {
         msg: *const c_char,
         error_out: *mut c_int,
     ) -> bool;
-    pub fn wallet_upsert_contact(wallet: *mut TariWallet, contact: *mut TariContact, error_out: *mut c_int) -> bool;
-    pub fn wallet_remove_contact(wallet: *mut TariWallet, contact: *mut TariContact, error_out: *mut c_int) -> bool;
     pub fn balance_get_available(balance: *mut TariBalance, error_out: *mut c_int) -> c_ulonglong;
     pub fn balance_get_time_locked(balance: *mut TariBalance, error_out: *mut c_int) -> c_ulonglong;
     pub fn balance_get_pending_incoming(balance: *mut TariBalance, error_out: *mut c_int) -> c_ulonglong;
@@ -541,7 +487,6 @@ extern "C" {
     ) -> c_ulonglong;
     pub fn wallet_get_num_confirmations_required(wallet: *mut TariWallet, error_out: *mut c_int) -> c_ulonglong;
     pub fn wallet_set_num_confirmations_required(wallet: *mut TariWallet, num: c_ulonglong, error_out: *mut c_int);
-    pub fn wallet_get_contacts(wallet: *mut TariWallet, error_out: *mut c_int) -> *mut TariContacts;
     pub fn wallet_get_completed_transactions(
         wallet: *mut TariWallet,
         error_out: *mut c_int,
@@ -649,5 +594,4 @@ extern "C" {
         error_out: *mut c_int,
     ) -> c_ulonglong;
     pub fn fee_per_gram_stat_destroy(fee_per_gram_stat: *mut TariFeePerGramStat);
-    pub fn contacts_handle(wallet: *mut TariWallet, error_out: *mut c_int) -> *mut c_void;
 }

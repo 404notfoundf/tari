@@ -60,7 +60,10 @@ use tari_common::{
 use tari_common_types::grpc_authentication::GrpcAuthentication;
 use tari_comms::{multiaddr::Multiaddr, utils::multiaddr::multiaddr_to_socketaddr, NodeIdentity};
 use tari_shutdown::{Shutdown, ShutdownSignal};
-use tokio::{task, time::timeout};
+use tokio::{
+    task::{self, JoinHandle},
+    time::timeout,
+};
 use tonic::{
     codegen::InterceptedService,
     transport::{Identity, Server, ServerTlsConfig},
@@ -98,10 +101,9 @@ pub async fn run_base_node(
         non_interactive_mode: true,
         watch: None,
         profile_with_tokio_console: false,
-        grpc_enabled: false,
         mining_enabled: false,
         second_layer_grpc_enabled: false,
-        disable_splash_screen: false,
+        disable_splash_screen: true,
         libtor_data_dir: None,
     };
 
@@ -129,13 +131,18 @@ pub async fn run_base_node_with_cli(
 
     let (readiness_grpc_server, readiness_handler) = ReadinessGrpcServer::new();
     let mut readiness_grpc_shutdown = Shutdown::new();
-    let readiness_task = task::spawn(run_grpc(
-        readiness_grpc_server,
-        grpc_address.clone(),
-        auth.clone(),
-        tls_identity.clone(),
-        readiness_grpc_shutdown.to_signal(),
-    ));
+    let mut readiness_task: Option<JoinHandle<Result<(), anyhow::Error>>> = None;
+    if config.base_node.grpc_enabled {
+        readiness_task = Some(task::spawn(run_grpc(
+            readiness_grpc_server,
+            grpc_address.clone(),
+            auth.clone(),
+            tls_identity.clone(),
+            readiness_grpc_shutdown.to_signal(),
+        )));
+    } else {
+        info!(target: LOG_TARGET, "base_node.grpc_enabled is set to false. gRPC server is disabled.");
+    }
     readiness_handler.send_readiness_status(ReadinessState::StartingUp);
 
     if cli.rebuild_db {
@@ -155,7 +162,7 @@ pub async fn run_base_node_with_cli(
             .await?;
 
     ctx.start()
-        .map_err(|e| ExitError::new(ExitCode::DatabaseError, format!("Could not start database.{:?}", e)))?;
+        .map_err(|e| ExitError::new(ExitCode::DatabaseError, format!("Could not start database.{e:?}")))?;
 
     // Run, node, run!
     let context = CommandContext::new(&ctx, shutdown.clone());
@@ -165,10 +172,15 @@ pub async fn run_base_node_with_cli(
     let grpc = grpc::base_node_grpc_server::BaseNodeGrpcServer::from_base_node_context(&ctx, config.base_node.clone());
 
     readiness_grpc_shutdown.trigger();
-    if let Err(e) = timeout(std::time::Duration::from_millis(500), readiness_task).await {
-        error!("Readiness task failed to shutdown: {}", e);
+    if let Some(task) = readiness_task {
+        if let Err(e) = timeout(std::time::Duration::from_millis(500), task).await {
+            error!("Readiness task failed to shutdown: {e}");
+        }
     }
-    task::spawn(run_grpc(grpc, grpc_address, auth, tls_identity, shutdown.to_signal()));
+
+    if config.base_node.grpc_enabled {
+        task::spawn(run_grpc(grpc, grpc_address, auth, tls_identity, shutdown.to_signal()));
+    }
 
     let main_loop = CliLoop::new(context, cli.watch, cli.non_interactive_mode);
     if cli.non_interactive_mode {
@@ -202,7 +214,7 @@ async fn run_grpc<T: tari_rpc::base_node_server::BaseNode>(
     tls_identity: Option<Identity>,
     interrupt_signal: ShutdownSignal,
 ) -> Result<(), anyhow::Error> {
-    info!(target: LOG_TARGET, "Starting GRPC on {}", grpc_address);
+    info!(target: LOG_TARGET, "Starting GRPC on {grpc_address}");
 
     let grpc_address = multiaddr_to_socketaddr(&grpc_address)?;
     let auth = ServerAuthenticationInterceptor::new(auth_config)
@@ -224,7 +236,7 @@ async fn run_grpc<T: tari_rpc::base_node_server::BaseNode>(
         .serve_with_shutdown(grpc_address, interrupt_signal.map(|_| ()))
         .await
         .map_err(|err| {
-            error!(target: LOG_TARGET, "GRPC encountered an error: {:?}", err);
+            error!(target: LOG_TARGET, "GRPC encountered an error: {err:?}");
             err
         })?;
 
@@ -238,7 +250,7 @@ async fn prepare_grpc_params(
 ) -> Result<(Multiaddr, GrpcAuthentication, Option<Identity>), ExitError> {
     let grpc_address = config.base_node.grpc_address.clone().unwrap_or_else(|| {
         let port = grpc_default_port(ApplicationType::BaseNode, config.base_node.network);
-        format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap()
+        format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap()
     });
 
     let auth = config.base_node.grpc_authentication.clone();

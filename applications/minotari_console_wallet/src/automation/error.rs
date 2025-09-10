@@ -35,13 +35,13 @@ use minotari_wallet::{
 };
 use tari_common::exit_codes::{ExitCode, ExitError};
 use tari_common_types::types::FixedHashSizeError;
-use tari_core::transactions::{
-    tari_amount::MicroMinotariError,
-    transaction_components::TransactionError,
-    transaction_key_manager::error::KeyManagerServiceError,
-};
 use tari_crypto::signatures::SchnorrSignatureError;
 use tari_script::ScriptError;
+use tari_transaction_components::{
+    key_manager::error::KeyManagerServiceError,
+    tari_amount::MicroMinotariError,
+    transaction_components::TransactionError,
+};
 use tari_utilities::{hex::HexError, ByteArrayError};
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -127,7 +127,7 @@ impl From<ByteArrayError> for CommandError {
 
 impl From<CommandError> for ExitError {
     fn from(err: CommandError) -> Self {
-        error!(target: LOG_TARGET, "{}", err);
+        error!(target: LOG_TARGET, "{err}");
         Self::new(ExitCode::CommandError, err.to_string())
     }
 }
@@ -160,8 +160,8 @@ pub enum ParseError {
 
 impl From<ParseError> for ExitError {
     fn from(err: ParseError) -> Self {
-        error!(target: LOG_TARGET, "{}", err);
-        let msg = format!("Failed to parse input file commands! {}", err);
+        error!(target: LOG_TARGET, "{err}");
+        let msg = format!("Failed to parse input file commands! {err}");
         Self::new(ExitCode::InputError, msg)
     }
 }

@@ -33,9 +33,9 @@ use tari_common_types::{
     transaction::{TransactionDirection, TransactionStatus, TxId},
     types::{BlockHash, FixedHash, PrivateKey},
 };
-use tari_core::transactions::{
-    tari_amount::MicroMinotari,
-    transaction_components::{payment_id::PaymentId, Transaction, TransactionOutput},
+use tari_transaction_components::{
+    transaction_components::{MemoField, Transaction, TransactionOutput},
+    MicroMinotari,
 };
 
 use crate::transaction_service::{
@@ -172,6 +172,13 @@ pub trait TransactionBackend: Send + Sync + Clone {
         &self,
         payref: &FixedHash,
     ) -> Result<Option<CompletedTransaction>, TransactionStorageError>;
+
+    fn find_completed_transactions_paginated(
+        &self,
+        offset: u64,
+        limit: u64,
+        status_filter: Option<u64>,
+    ) -> Result<Vec<CompletedTransaction>, TransactionStorageError>;
 
     fn get_last_scanned_height(&self) -> Result<Option<u64>, TransactionStorageError>;
 }
@@ -778,7 +785,7 @@ where T: TransactionBackend + 'static
         current_height: Option<u64>,
         mined_timestamp: Option<DateTime<Utc>>,
         scanned_output: TransactionOutput,
-        payment_id: PaymentId,
+        payment_id: MemoField,
         direction: TransactionDirection,
     ) -> Result<(), TransactionStorageError> {
         let hash = scanned_output.hash();
@@ -867,6 +874,16 @@ where T: TransactionBackend + 'static
     ) -> Result<Option<CompletedTransaction>, TransactionStorageError> {
         self.db.get_transaction_with_payref(payref)
     }
+
+    pub fn get_completed_transactions_paginated(
+        &self,
+        offset: u64,
+        limit: u64,
+        status_filter: Option<u64>,
+    ) -> Result<Vec<CompletedTransaction>, TransactionStorageError> {
+        self.db
+            .find_completed_transactions_paginated(offset, limit, status_filter)
+    }
 }
 
 impl Display for DbKey {
@@ -906,15 +923,13 @@ impl Display for DbValue {
 fn log_error<T>(req: DbKey, err: TransactionStorageError) -> Result<T, TransactionStorageError> {
     error!(
         target: LOG_TARGET,
-        "Database access error on request: {}: {}",
-        req,
-        err
+        "Database access error on request: {req}: {err}"
     );
     Err(err)
 }
 
 fn unexpected_result<T>(req: DbKey, res: DbValue) -> Result<T, TransactionStorageError> {
-    let msg = format!("Unexpected result for database query {}. Response: {}", req, res);
-    error!(target: LOG_TARGET, "{}", msg);
+    let msg = format!("Unexpected result for database query {req}. Respreqonse: {res}");
+    error!(target: LOG_TARGET, "{msg}");
     Err(TransactionStorageError::UnexpectedResult(msg))
 }

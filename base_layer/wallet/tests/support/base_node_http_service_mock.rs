@@ -27,20 +27,20 @@ use async_trait::async_trait;
 use itertools::Itertools;
 use minotari_node_wallet_client::BaseNodeWalletClient;
 use minotari_wallet::client::http_client_factory::HttpClientFactory;
-use tari_core::{
-    base_node::rpc::models::{
+use tari_shutdown::ShutdownSignal;
+use tari_transaction_components::{
+    rpc::models::{
         self,
         BlockHeader,
         BlockUtxoInfo,
+        FeePerGramStat,
         GetUtxosDeletedInfoResponse,
         GetUtxosMinedInfoResponse,
         SyncUtxosByBlockResponse,
         TxSubmissionResponse,
     },
-    mempool::FeePerGramStat,
-    transactions::transaction_components::{Transaction, TransactionOutput},
+    transaction_components::{Transaction, TransactionOutput},
 };
-use tari_shutdown::ShutdownSignal;
 use tari_utilities::ByteArray;
 use tokio::sync::{mpsc, RwLock};
 use url::Url;
@@ -50,7 +50,7 @@ use crate::support::comms_rpc::UtxosByBlock;
 #[derive(Default)]
 struct State {
     utxos_by_block: HashMap<u64, UtxosByBlock>,
-    blocks: HashMap<u64, tari_core::blocks::BlockHeader>,
+    blocks: HashMap<u64, tari_node_components::blocks::BlockHeader>,
     tip_info: Option<models::TipInfoResponse>,
 }
 
@@ -59,7 +59,7 @@ impl State {
         self.utxos_by_block = utxos_by_block.into_iter().map(|ub| (ub.height, ub)).collect();
     }
 
-    fn set_blocks(&mut self, blocks: HashMap<u64, tari_core::blocks::BlockHeader>) {
+    fn set_blocks(&mut self, blocks: HashMap<u64, tari_node_components::blocks::BlockHeader>) {
         self.blocks = blocks;
     }
 
@@ -80,7 +80,10 @@ impl HttpBaseNodeMock {
         Ok(())
     }
 
-    pub async fn set_blocks(&self, blocks: HashMap<u64, tari_core::blocks::BlockHeader>) -> Result<(), Error> {
+    pub async fn set_blocks(
+        &self,
+        blocks: HashMap<u64, tari_node_components::blocks::BlockHeader>,
+    ) -> Result<(), Error> {
         let mut state = self.state.write().await;
         state.set_blocks(blocks);
 
@@ -201,7 +204,6 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
     async fn sync_utxos_by_block(
         &self,
         start_header_hash: Vec<u8>,
-        end_header_hash: Vec<u8>,
         shutdown: ShutdownSignal,
     ) -> Result<mpsc::Receiver<Result<SyncUtxosByBlockResponse, Error>>, Error> {
         let (tx, rx) = mpsc::channel(100);
@@ -213,11 +215,9 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
             .find(|b| b.hash().to_vec() == start_header_hash)
             .map_or(0, |b| b.height);
 
-        let end_height = state2
-            .blocks
-            .values()
-            .find(|b| b.hash().to_vec() == end_header_hash)
-            .map_or(0, |b| b.height);
+        let end_height = state2.tip_info.as_ref().map_or(0, |tip| {
+            tip.metadata.as_ref().map_or(0, |meta| meta.best_block_height())
+        });
         let state = self.state.clone();
         tokio::spawn(async move {
             let state = state.read().await;
@@ -244,6 +244,7 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
                                     sender_offset_public_key: o.sender_offset_public_key.to_vec(),
                                 })
                                 .collect(),
+                            inputs: Vec::new(),
                             mined_timestamp: header.timestamp.as_u64(),
                         });
                     }
@@ -253,6 +254,7 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
                     let response = SyncUtxosByBlockResponse {
                         blocks: blocks.clone(),
                         has_next_page,
+                        next_header_to_scan: vec![],
                     };
                     blocks.clear();
 

@@ -28,11 +28,11 @@ use tari_common_types::{
     transaction::TxId,
     types::{BlockHash, CompressedCommitment, HashOutput},
 };
-use tari_core::transactions::{
-    transaction_components::{payment_id::PaymentId, WalletOutput},
-    transaction_key_manager::{TariKeyId, TransactionKeyManagerInterface},
-};
 use tari_script::{ExecutionStack, TariScript};
+use tari_transaction_components::{
+    key_manager::{TariKeyId, TransactionKeyManagerInterface},
+    transaction_components::{MemoField, WalletOutput},
+};
 
 use crate::output_manager_service::{
     error::OutputManagerStorageError,
@@ -56,7 +56,7 @@ pub struct DbWalletOutput {
     pub source: OutputSource,
     pub received_in_tx_id: Option<TxId>,
     pub spent_in_tx_id: Option<TxId>,
-    pub payment_id: PaymentId,
+    pub payment_id: MemoField,
 }
 
 impl DbWalletOutput {
@@ -130,7 +130,7 @@ impl TryFrom<u32> for SpendingPriority {
         match value {
             0 => Ok(SpendingPriority::Normal),
             1 => Ok(SpendingPriority::HtlcSpendAsap),
-            _ => Err(format!("Invalid spending priority value: {}", value)),
+            _ => Err(format!("Invalid spending priority value: {value}")),
         }
     }
 }

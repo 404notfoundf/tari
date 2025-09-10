@@ -31,20 +31,19 @@ use tari_common_types::{
     payment_reference::{generate_payment_reference, PaymentReference},
     tari_address::TariAddress,
     transaction::{TransactionConversionError, TransactionDirection, TransactionStatus, TxId},
-    types::{BlockHash, CompressedCommitment, FixedHash, PrivateKey, Signature},
+    types::{BlockHash, CompressedCommitment, CompressedSignature, FixedHash, PrivateKey},
 };
-use tari_core::{
+use tari_transaction_components::{
     consensus::ConsensusConstants,
-    transactions::{
-        fee::Fee,
-        tari_amount::MicroMinotari,
-        transaction_components::{payment_id::PaymentId, Transaction},
-        ReceiverTransactionProtocol,
-        SenderTransactionProtocol,
-    },
+    fee::Fee,
+    transaction_components::{MemoField, Transaction},
+    MicroMinotari,
 };
 
-use crate::transaction_service::error::TransactionStorageError;
+use crate::{
+    legacy_transaction_protocol::{ReceiverTransactionProtocol, SenderTransactionProtocol},
+    transaction_service::error::TransactionStorageError,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InboundTransaction {
@@ -53,7 +52,7 @@ pub struct InboundTransaction {
     pub amount: MicroMinotari,
     pub receiver_protocol: ReceiverTransactionProtocol,
     pub status: TransactionStatus,
-    pub payment_id: PaymentId,
+    pub payment_id: MemoField,
     pub timestamp: DateTime<Utc>,
     pub cancelled: bool,
     pub direct_send_success: bool,
@@ -70,7 +69,7 @@ impl InboundTransaction {
         amount: MicroMinotari,
         receiver_protocol: ReceiverTransactionProtocol,
         status: TransactionStatus,
-        payment_id: PaymentId,
+        payment_id: MemoField,
         timestamp: DateTime<Utc>,
     ) -> Self {
         Self {
@@ -98,7 +97,7 @@ pub struct OutboundTransaction {
     pub fee: MicroMinotari,
     pub sender_protocol: SenderTransactionProtocol,
     pub status: TransactionStatus,
-    pub payment_id: PaymentId,
+    pub payment_id: MemoField,
     pub timestamp: DateTime<Utc>,
     pub cancelled: bool,
     pub direct_send_success: bool,
@@ -116,7 +115,7 @@ impl OutboundTransaction {
         fee: MicroMinotari,
         sender_protocol: SenderTransactionProtocol,
         status: TransactionStatus,
-        payment_id: PaymentId,
+        payment_id: MemoField,
         timestamp: DateTime<Utc>,
         direct_send_success: bool,
     ) -> Self {
@@ -144,7 +143,7 @@ impl OutboundTransaction {
         fee: MicroMinotari,
         sender_protocol: SenderTransactionProtocol,
         status: TransactionStatus,
-        payment_id: PaymentId,
+        payment_id: MemoField,
         timestamp: DateTime<Utc>,
         direct_send_success: bool,
         sent_output_hashes: Vec<FixedHash>,
@@ -181,11 +180,11 @@ pub struct CompletedTransaction {
     pub direction: TransactionDirection,
     pub send_count: u32,
     pub last_send_timestamp: Option<DateTime<Utc>>,
-    pub transaction_signature: Signature,
+    pub transaction_signature: CompressedSignature,
     pub mined_height: Option<u64>,
     pub mined_in_block: Option<BlockHash>,
     pub mined_timestamp: Option<DateTime<Utc>>,
-    pub payment_id: PaymentId,
+    pub payment_id: MemoField,
     /// Hashes of outputs being sent to others (excluding change)
     pub sent_output_hashes: Vec<FixedHash>,
     /// Hashes of outputs received from others (excluding change)
@@ -207,7 +206,7 @@ impl CompletedTransaction {
         direction: TransactionDirection,
         mined_height: Option<u64>,
         mined_timestamp: Option<DateTime<Utc>>,
-        payment_id: PaymentId,
+        payment_id: MemoField,
     ) -> Result<Self, TransactionStorageError> {
         if status == TransactionStatus::Coinbase {
             return Err(TransactionStorageError::CoinbaseNotSupported);
@@ -215,7 +214,7 @@ impl CompletedTransaction {
         let transaction_signature = if let Some(excess_sig) = transaction.first_kernel_excess_sig() {
             excess_sig.clone()
         } else {
-            Signature::default()
+            CompressedSignature::default()
         };
         Ok(Self {
             tx_id,
@@ -310,8 +309,7 @@ impl CompletedTransaction {
 
         let total_features_and_scripts_size = total_features_and_scripts_size.map_err(|e| {
             TransactionStorageError::FailedToCalculateTransactionFee(format!(
-                "Failed to calculate features and scripts size from original transaction: {}",
-                e
+                "Failed to calculate features and scripts size from original transaction: {e}"
             ))
         })?;
 
@@ -379,7 +377,7 @@ impl CompletedTransaction {
         direction: TransactionDirection,
         mined_height: Option<u64>,
         mined_timestamp: Option<DateTime<Utc>>,
-        payment_id: PaymentId,
+        payment_id: MemoField,
         sent_output_hashes: Vec<FixedHash>,
         received_output_hashes: Vec<FixedHash>,
         change_output_hashes: Vec<FixedHash>,
@@ -390,7 +388,7 @@ impl CompletedTransaction {
         let transaction_signature = if let Some(excess_sig) = transaction.first_kernel_excess_sig() {
             excess_sig.clone()
         } else {
-            Signature::default()
+            CompressedSignature::default()
         };
         Ok(Self {
             tx_id,
@@ -417,6 +415,9 @@ impl CompletedTransaction {
     }
 
     pub fn calculate_received_payment_references(&self) -> Vec<PaymentReference> {
+        if !self.status.is_confirmed() {
+            return vec![];
+        }
         if let Some(block_hash) = self.mined_in_block.as_ref() {
             return self
                 .received_output_hashes
@@ -428,6 +429,9 @@ impl CompletedTransaction {
     }
 
     pub fn calculate_sent_payment_references(&self) -> Vec<PaymentReference> {
+        if !self.status.is_confirmed() {
+            return vec![];
+        }
         if let Some(block_hash) = self.mined_in_block.as_ref() {
             return self
                 .sent_output_hashes
@@ -439,6 +443,9 @@ impl CompletedTransaction {
     }
 
     pub fn calculate_change_payment_references(&self) -> Vec<PaymentReference> {
+        if !self.status.is_confirmed() {
+            return vec![];
+        }
         if let Some(block_hash) = self.mined_in_block.as_ref() {
             return self
                 .change_output_hashes
@@ -461,7 +468,7 @@ impl CompletedTransaction {
         let transaction_signature = if let Some(excess_sig) = transaction.first_kernel_excess_sig() {
             excess_sig.clone()
         } else {
-            Signature::default()
+            CompressedSignature::default()
         };
         Self {
             tx_id: tx.tx_id,
@@ -550,7 +557,7 @@ impl From<InboundTransaction> for CompletedTransaction {
             direction: TransactionDirection::Inbound,
             send_count: 0,
             last_send_timestamp: None,
-            transaction_signature: Signature::default(),
+            transaction_signature: CompressedSignature::default(),
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
@@ -576,6 +583,30 @@ impl WalletTransaction {
             WalletTransaction::PendingInbound(tx) => Some(tx.source_address.clone()),
             WalletTransaction::PendingOutbound(_) => None,
             WalletTransaction::Completed(tx) => Some(tx.source_address.clone()),
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        match self {
+            WalletTransaction::PendingInbound(_) => true,
+            WalletTransaction::PendingOutbound(_) => true,
+            WalletTransaction::Completed(_) => false,
+        }
+    }
+
+    pub fn is_mined(&self) -> bool {
+        match self {
+            WalletTransaction::PendingInbound(_) => false,
+            WalletTransaction::PendingOutbound(_) => false,
+            WalletTransaction::Completed(tx) => tx.status.is_mined(),
+        }
+    }
+
+    pub fn status(&self) -> TransactionStatus {
+        match self {
+            WalletTransaction::PendingInbound(tx) => tx.status,
+            WalletTransaction::PendingOutbound(tx) => tx.status,
+            WalletTransaction::Completed(tx) => tx.status,
         }
     }
 }
@@ -645,23 +676,21 @@ mod test {
     use tari_common_types::{
         tari_address::TariAddress,
         transaction::{TransactionDirection, TransactionStatus, TxId},
-        types::{PrivateKey, RangeProof, Signature},
-    };
-    use tari_core::{
-        consensus::ConsensusManager,
-        covenants::Covenant,
-        transactions::{
-            tari_amount::MicroMinotari,
-            transaction_components::{
-                payment_id::PaymentId,
-                EncryptedData,
-                OutputFeatures,
-                Transaction,
-                TransactionOutput,
-            },
-        },
+        types::{CompressedSignature, PrivateKey, RangeProof},
     };
     use tari_script::TariScript;
+    use tari_transaction_components::{
+        consensus::ConsensusManager,
+        transaction_components::{
+            covenants::Covenant,
+            EncryptedData,
+            MemoField,
+            OutputFeatures,
+            Transaction,
+            TransactionOutput,
+        },
+        MicroMinotari,
+    };
 
     use super::*;
 
@@ -705,11 +734,11 @@ mod test {
             direction: TransactionDirection::Outbound,
             send_count: 0,
             last_send_timestamp: None,
-            transaction_signature: Signature::default(),
+            transaction_signature: CompressedSignature::default(),
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
-            payment_id: PaymentId::default(),
+            payment_id: MemoField::default(),
             sent_output_hashes: vec![],
             received_output_hashes: vec![],
             change_output_hashes: vec![],
@@ -718,7 +747,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_basic_cases() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(2);
 
         // Test case 1: Exact division (400 / 200 = 2)
@@ -741,7 +770,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_rounding_up() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(2);
 
         // Test case 2: Should round up (134 / 200 = 0.67, should become 1)
@@ -773,7 +802,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_small_amounts() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(1);
 
         // Test case 3: Very small fee
@@ -799,7 +828,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_large_amounts() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(3);
 
         // Test case 4: Large fee
@@ -823,15 +852,13 @@ mod test {
         let overpayment = calculated_fee - total_fee.0;
         assert!(
             overpayment < weight,
-            "Overpayment {} should be less than weight {} for efficiency",
-            overpayment,
-            weight
+            "Overpayment {overpayment} should be less than weight {weight} for efficiency"
         );
     }
 
     #[test]
     fn test_calculate_fee_per_gram_edge_cases() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(1);
 
         // Test case 5: Fractional result that needs rounding
@@ -854,7 +881,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_error_cases() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(1);
 
         // Test case 6: Zero fee should fail
@@ -890,7 +917,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_consistency() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(2);
 
         // Test case 9: Multiple calls with same parameters should return same result
@@ -908,7 +935,7 @@ mod test {
 
     #[test]
     fn test_calculate_fee_per_gram_no_overpayment() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(1);
         let tip_height = 100; // Ordinary number, doesn't matter in this case
 
@@ -940,17 +967,14 @@ mod test {
             let overpayment = calculated_fee - total_fee.0;
             assert!(
                 overpayment < weight,
-                "Overpayment {} should be less than weight {} for fee amount {}",
-                overpayment,
-                weight,
-                fee_amount
+                "Overpayment {overpayment} should be less than weight {weight} for fee amount {fee_amount}"
             );
         }
     }
 
     #[test]
     fn test_calculate_fee_per_gram_user_example_134_200() {
-        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let consensus_manager = ConsensusManager::builder(Network::LocalNet).build();
         let completed_tx = create_test_completed_transaction(1);
 
         // Test the specific user example: 134 / 200 should round up to at least 1

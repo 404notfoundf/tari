@@ -46,7 +46,13 @@ pub struct DnsClient {
 impl DnsClient {
     pub fn connect_secure(name_server: DnsNameServer) -> Result<Self, DnsClientError> {
         let resolver = match name_server {
-            DnsNameServer::System => TokioResolver::builder_tokio()?.build(),
+            DnsNameServer::System => {
+                let mut opts = ResolverOpts::default();
+                opts.edns0 = true;
+                opts.try_tcp_on_error = true;
+                opts.timeout = std::time::Duration::from_secs(1);
+                TokioResolver::builder_tokio()?.with_options(opts).build()
+            },
             DnsNameServer::Custom { addr, dns_name } => Self::create_resolver(addr, ProtocolConfig::Tls {
                 server_name: Arc::from(dns_name.as_str()),
             }),
@@ -57,7 +63,13 @@ impl DnsClient {
 
     pub fn connect(name_server: DnsNameServer) -> Result<Self, DnsClientError> {
         let resolver = match name_server {
-            DnsNameServer::System => TokioResolver::builder_tokio()?.build(),
+            DnsNameServer::System => {
+                let mut opts = ResolverOpts::default();
+                opts.edns0 = true;
+                opts.try_tcp_on_error = true;
+                opts.timeout = std::time::Duration::from_secs(1);
+                TokioResolver::builder_tokio()?.with_options(opts).build()
+            },
             DnsNameServer::Custom { addr, dns_name: _ } => Self::create_resolver(addr, ProtocolConfig::Udp),
         };
 
@@ -96,10 +108,7 @@ impl DnsClient {
             })
             .filter_map(|txt| {
                 txt.map(|txt| {
-                    if txt.is_empty() {
-                        return None;
-                    }
-                    let len = txt[0] as usize;
+                    let len = *txt.first()? as usize;
                     if len == 0 {
                         return None;
                     }
@@ -113,12 +122,12 @@ impl DnsClient {
                         return None;
                     }
                     // Exclude the first length byte from the string result
-                    Some(String::from_utf8_lossy(&txt[1..=len]).to_string())
+                    Some(String::from_utf8_lossy(txt.get(1..=len)?).to_string())
                 })
                 .inspect_err(|e| {
                     warn!(
                         target: LOG_TARGET,
-                        "Failed to parse DNS TXT record. Error: {}", e
+                        "Failed to parse DNS TXT record. Error: {e}"
                     );
                 })
                 .transpose()

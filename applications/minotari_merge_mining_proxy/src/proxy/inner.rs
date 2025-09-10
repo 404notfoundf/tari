@@ -20,6 +20,7 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#![allow(clippy::indexing_slicing)]
 use std::{
     convert::TryInto,
     sync::{
@@ -42,7 +43,7 @@ use serde_json as json;
 use serde_json::json;
 use tari_common_types::tari_address::TariAddress;
 use tari_core::{
-    consensus::ConsensusManager,
+    consensus::BaseNodeConsensusManager,
     proof_of_work::{monero_randomx_difficulty, monero_rx, monero_rx::FixedByteArray, randomx_factory::RandomXFactory},
 };
 use tari_utilities::hex::Hex;
@@ -78,12 +79,13 @@ pub struct InnerService {
     pub(crate) current_monerod_server: Arc<RwLock<Option<String>>>,
     pub(crate) last_assigned_monerod_url: Arc<RwLock<Option<String>>>,
     pub(crate) randomx_factory: RandomXFactory,
-    pub(crate) consensus_manager: ConsensusManager,
+    pub(crate) consensus_manager: BaseNodeConsensusManager,
     pub(crate) wallet_payment_address: TariAddress,
 }
 
 impl InnerService {
     #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::indexing_slicing)]
     async fn handle_get_height(&self, monerod_resp: Response<json::Value>) -> Result<Response<Body>, MmProxyError> {
         trace!(target: LOG_TARGET, "handle_get_height monerod_resp body: {}", monerod_resp.body());
         let (parts, mut json) = monerod_resp.into_parts();
@@ -375,8 +377,8 @@ impl InnerService {
                     "Initial base node sync achieved. Ready to mine at height #{}",
                     metadata.as_ref().map(|h| h.best_block_height).unwrap_or_default(),
                 );
-                debug!(target: LOG_TARGET, "{}", msg);
-                println!("{}", msg);
+                debug!(target: LOG_TARGET, "{msg}");
+                println!("{msg}");
                 println!("Listening on {}...", self.config.listener_address);
             } else {
                 let msg = format!(
@@ -384,8 +386,8 @@ impl InnerService {
                     metadata.as_ref().map(|h| h.best_block_height).unwrap_or_default(),
                     self.config.wait_for_initial_sync_at_startup,
                 );
-                debug!(target: LOG_TARGET, "{}", msg);
-                println!("{}", msg);
+                debug!(target: LOG_TARGET, "{msg}");
+                println!("{msg}");
                 if self.config.wait_for_initial_sync_at_startup {
                     return Err(MmProxyError::MissingDataError(msg));
                 }
@@ -398,10 +400,11 @@ impl InnerService {
             self.config.clone(),
             self.consensus_manager.clone(),
             self.wallet_payment_address.clone(),
-        )?;
+        )
+        .await?;
 
         let seed_hash = FixedByteArray::from_hex(&monerod_resp["result"]["seed_hash"].to_string().replace('\"', ""))
-            .map_err(|err| MmProxyError::InvalidMonerodResponse(format!("seed hash hex is invalid: {}", err)))?;
+            .map_err(|err| MmProxyError::InvalidMonerodResponse(format!("seed hash hex is invalid: {err}")))?;
         let blocktemplate_blob = monerod_resp["result"]["blocktemplate_blob"]
             .to_string()
             .replace('\"', "");
@@ -655,7 +658,7 @@ impl InnerService {
                 match format!("{}{}", server, request_uri.path()).parse::<Url>() {
                     Ok(url) => return Ok(Some(url)),
                     Err(err) => {
-                        return if format!("{}/getheight", server).parse::<Url>().is_ok() {
+                        return if format!("{server}/getheight").parse::<Url>().is_ok() {
                             Err(MmProxyError::InvalidMonerodRequest(request_uri.path().to_string()))
                         } else {
                             self.clear_current_monerod_server_lock(None, None);
@@ -702,7 +705,7 @@ impl InnerService {
                 Ok(val) => val,
                 Err(e) => {
                     self.clear_current_monerod_server_lock(Some(server), None);
-                    return if format!("{}/getheight", server).parse::<Url>().is_ok() {
+                    return if format!("{server}/getheight").parse::<Url>().is_ok() {
                         Err(MmProxyError::InvalidMonerodRequest(request_uri.path().to_string()))
                     } else {
                         Err(e.into())
@@ -778,14 +781,13 @@ impl InnerService {
             // The mmproxy is the direct client of monerod and so is responsible for setting this header.
             if let Some(host) = monerod_url.host_str() {
                 let host: HeaderValue = match monerod_url.port_or_known_default() {
-                    Some(port) => format!("{}:{}", host, port).parse()?,
+                    Some(port) => format!("{host}:{port}").parse()?,
                     None => host.parse()?,
                 };
                 headers.insert("host", host);
                 debug!(
                     target: LOG_TARGET,
-                    "Host header updated to match monerod_uri. Request headers: {:?} (trace_id: {})",
-                    headers, trace_id
+                    "Host header updated to match monerod_uri. Request headers: {headers:?} (trace_id: {trace_id})"
                 );
             }
             let mut builder = self

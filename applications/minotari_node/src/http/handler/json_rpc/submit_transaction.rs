@@ -24,14 +24,13 @@ use std::sync::Arc;
 
 use log::{debug, error};
 use tari_core::{
-    base_node::rpc::{
-        models::{TxSubmissionRejectionReason, TxSubmissionResponse},
-        query_service,
-        BaseNodeWalletQueryService,
-    },
+    base_node::rpc::{query_service, BaseNodeWalletQueryService},
     chain_storage::BlockchainBackend,
     mempool::{service::MempoolHandle, TxStorageResponse},
-    transactions::transaction_components::Transaction,
+};
+use tari_transaction_components::{
+    rpc::models::{TxSubmissionRejectionReason, TxSubmissionResponse},
+    transaction_components::Transaction,
 };
 
 const LOG_TARGET: &str = "c::base_node::rpc::http::handler::json_rpc::submit_transaction";
@@ -45,13 +44,13 @@ pub async fn handle<T: BlockchainBackend + 'static>(
         .get_tip_info()
         .await
         .map_err(|e| {
-            error!(target: LOG_TARGET, "Failed to get tip info: {}", e);
-            anyhow::anyhow!("Failed to get tip info: {}", e)
+            error!(target: LOG_TARGET, "Failed to get tip info: {e}");
+            anyhow::anyhow!("Failed to get tip info: {e}")
         })?
         .is_synced;
     let res = match mempool_service.submit_transaction(transaction).await {
         Ok(response) => {
-            debug!(target: LOG_TARGET, "Transaction submitted successfully: {:?}", response);
+            debug!(target: LOG_TARGET, "Transaction submitted successfully: {response:?}");
             match response {
                 TxStorageResponse::UnconfirmedPool => TxSubmissionResponse {
                     accepted: true,
@@ -89,7 +88,7 @@ pub async fn handle<T: BlockchainBackend + 'static>(
             }
         },
         Err(e) => {
-            return Err(anyhow::anyhow!("Failed to submit transaction: {}", e));
+            return Err(anyhow::anyhow!("Failed to submit transaction: {e}"));
         },
     };
     Ok(res)

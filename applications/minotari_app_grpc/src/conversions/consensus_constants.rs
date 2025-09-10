@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, convert::TryFrom, iter::FromIterator};
 
-use tari_core::{consensus::ConsensusConstants, proof_of_work::PowAlgorithm};
+use tari_transaction_components::{consensus::ConsensusConstants, tari_proof_of_work::PowAlgorithm};
 
 use crate::tari_rpc as grpc;
 
@@ -110,7 +110,7 @@ impl From<ConsensusConstants> for grpc::ConsensusConstants {
         #[allow(deprecated)]
         Self {
             coinbase_min_maturity: cc.coinbase_min_maturity(),
-            blockchain_version: cc.blockchain_version().into(),
+            blockchain_version: u16::from(cc.blockchain_version()).into(),
             future_time_limit: cc.ftl().as_u64(),
             difficulty_block_window: cc.difficulty_block_window(),
             max_block_transaction_weight: cc.max_block_transaction_weight(),

@@ -20,6 +20,7 @@
 //   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#![allow(clippy::indexing_slicing)]
 use std::{convert::TryFrom, path::PathBuf, str::FromStr, time::Duration};
 
 use cucumber::{then, when};
@@ -33,16 +34,14 @@ use minotari_console_wallet::{
     ExportUtxosArgs,
     ExportViewKeyAndSpendKeyArgs,
     MakeItRainArgs,
-    SendMinotariArgs,
     WhoisArgs,
 };
-use tari_common_types::tari_address::TariAddress;
-use tari_core::transactions::tari_amount::MicroMinotari;
+use tari_common_types::{seeds::seed_words::SeedWords, tari_address::TariAddress};
 use tari_integration_tests::{
     wallet_process::{create_wallet_client, get_default_cli, spawn_wallet},
     TariWorld,
 };
-use tari_key_manager::SeedWords;
+use tari_transaction_components::MicroMinotari;
 use tari_utilities::hex::Hex;
 
 use crate::steps::get_saved_seed_words;
@@ -70,38 +69,6 @@ async fn get_balance_of_wallet(world: &mut TariWorld, wallet: String, _amount: u
     spawn_wallet(world, wallet, Some(base_node.clone()), seed_nodes, None, Some(cli)).await
 }
 
-#[when(expr = "I send {int} uT from {word} to {word} via command line")]
-async fn send_from_cli(world: &mut TariWorld, amount: u64, wallet_a: String, wallet_b: String) {
-    let wallet_ps = world.wallets.get_mut(&wallet_a).unwrap();
-    wallet_ps.kill();
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let mut wallet_b_client = create_wallet_client(world, wallet_b.clone()).await.unwrap();
-    let wallet_b_address = wallet_b_client
-        .get_address(Empty {})
-        .await
-        .unwrap()
-        .into_inner()
-        .interactive_address
-        .to_hex();
-    let wallet_b_address = TariAddress::from_base58(wallet_b_address.as_str()).unwrap();
-
-    let mut cli = get_default_cli();
-
-    let args = SendMinotariArgs {
-        amount: MicroMinotari(amount),
-        destination: wallet_b_address,
-        payment_id: format!("Send amount {} from {} to {}", amount, wallet_a, wallet_b),
-    };
-    cli.command2 = Some(CliCommands::SendMinotari(args));
-
-    let base_node = world.wallet_connected_to_base_node.get(&wallet_a).unwrap();
-    let seed_nodes = world.base_nodes.get(base_node).unwrap().seed_nodes.clone();
-
-    spawn_wallet(world, wallet_a, Some(base_node.clone()), seed_nodes, None, Some(cli)).await;
-}
-
 #[when(expr = "I create a burn transaction of {int} uT from {word} via command line")]
 async fn create_burn_tx_via_cli(world: &mut TariWorld, amount: u64, wallet: String) {
     let wallet_ps = world.wallets.get_mut(&wallet).unwrap();
@@ -113,7 +80,7 @@ async fn create_burn_tx_via_cli(world: &mut TariWorld, amount: u64, wallet: Stri
 
     let args = BurnMinotariArgs {
         amount: MicroMinotari(amount),
-        payment_id: format!("Burn, burn amount {} !!!", amount),
+        payment_id: format!("Burn, burn amount {amount} !!!"),
     };
     cli.command2 = Some(CliCommands::BurnMinotari(args));
 
@@ -162,10 +129,7 @@ async fn make_it_rain(
         start_time: None,
         one_sided: false,
         burn_tari: false,
-        payment_id: format!(
-            "Make it raing amount {} from {} to {}",
-            start_amount, wallet_a, wallet_b
-        ),
+        payment_id: format!("Make it raing amount {start_amount} from {wallet_a} to {wallet_b}"),
     };
 
     cli.command2 = Some(CliCommands::MakeItRain(args));
@@ -189,7 +153,7 @@ async fn coin_split_via_cli(world: &mut TariWorld, wallet: String, amount: u64, 
         amount_per_split: MicroMinotari(amount),
         num_splits: usize::try_from(splits).unwrap(),
         fee_per_gram: MicroMinotari(20),
-        payment_id: format!("coin split amount {} with splits {}", amount, splits),
+        payment_id: format!("coin split amount {amount} with splits {splits}"),
     };
 
     cli.command2 = Some(CliCommands::CoinSplit(args));
@@ -335,7 +299,7 @@ async fn export_wallet_view_and_spend_keys_via_cli(
         tokio::time::sleep(Duration::from_secs(5)).await;
         wallet_ps.clone()
     } else {
-        panic!("Wallet '{}' not found", wallet_name);
+        panic!("Wallet '{wallet_name}' not found");
     };
 
     let mut cli = get_default_cli();
@@ -380,11 +344,11 @@ async fn recover_wallet_from_view_and_spend_keys_via_cli(
     let keys_file = if let Some(file) = keys_file {
         file
     } else {
-        panic!("View and spend keys file not found for '{}'", view_and_spend_key);
+        panic!("View and spend keys file not found for '{view_and_spend_key}'");
     };
-    let keys_content = std::fs::read_to_string(keys_file).unwrap_or_else(|e| panic!("Failed to read keys file: {}", e));
+    let keys_content = std::fs::read_to_string(keys_file).unwrap_or_else(|e| panic!("Failed to read keys file: {e}"));
     let keys_json: serde_json::Value =
-        serde_json::from_str(&keys_content).unwrap_or_else(|e| panic!("Failed to parse keys JSON: {}", e));
+        serde_json::from_str(&keys_content).unwrap_or_else(|e| panic!("Failed to parse keys JSON: {e}"));
     let view_key = keys_json["view_key"]
         .as_str()
         .unwrap_or_else(|| panic!("Missing 'view_key' in keys file"));

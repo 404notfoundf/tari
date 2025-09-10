@@ -42,9 +42,10 @@ use crate::{
         sync::{BlockchainSyncConfig, SyncValidators},
     },
     chain_storage::{async_db::AsyncBlockchainDb, BlockchainBackend},
-    consensus::ConsensusManager,
+    consensus::BaseNodeConsensusManager,
     proof_of_work::randomx_factory::RandomXFactory,
 };
+
 const LOG_TARGET: &str = "c::bn::base_node";
 
 /// Configuration for the BaseNodeStateMachine.
@@ -96,7 +97,7 @@ pub struct BaseNodeStateMachine<B: BlockchainBackend> {
     pub(super) config: BaseNodeStateMachineConfig,
     pub(super) info: StateInfo,
     pub(super) sync_validators: SyncValidators<B>,
-    pub(super) consensus_rules: ConsensusManager,
+    pub(super) consensus_rules: BaseNodeConsensusManager,
     pub(super) status_event_sender: Arc<watch::Sender<StatusInfo>>,
     pub(super) randomx_factory: RandomXFactory,
     is_bootstrapped: bool,
@@ -120,7 +121,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
         status_event_sender: watch::Sender<StatusInfo>,
         event_publisher: broadcast::Sender<Arc<StateEvent>>,
         randomx_factory: RandomXFactory,
-        consensus_rules: ConsensusManager,
+        consensus_rules: BaseNodeConsensusManager,
         interrupt_signal: ShutdownSignal,
     ) -> Self {
         Self {
@@ -199,7 +200,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
             (s, e) => {
                 warn!(
                     target: LOG_TARGET,
-                    "No state transition occurs for event {:?} in state {}", e, s
+                    "No state transition occurs for event {e:?} in state {s}"
                 );
                 s
             },
@@ -216,7 +217,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
         };
 
         if let Err(e) = self.status_event_sender.send(status) {
-            debug!(target: LOG_TARGET, "Error broadcasting a StatusEvent update: {}", e);
+            debug!(target: LOG_TARGET, "Error broadcasting a StatusEvent update: {e}");
         }
     }
 
@@ -250,7 +251,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
             if let Shutdown(reason) = &state {
                 info!(
                     target: LOG_TARGET,
-                    "Base Node state machine is shutting down because {}", reason
+                    "Base Node state machine is shutting down because {reason}"
                 );
                 break;
             }
@@ -264,9 +265,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
             let _size = self.event_publisher.send(Arc::new(next_event.clone()));
             trace!(
                 target: LOG_TARGET,
-                "Base Node event in State [{}]:  {}",
-                state,
-                next_event
+                "Base Node event in State [{state}]:  {next_event}"
             );
             state = self.transition(state, next_event);
         }
@@ -309,8 +308,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeStateMachine<B> {
 
             info!(
                 target: LOG_TARGET,
-                "[BN SM UPDATE] Updated Listening state. Removed bootstrap_phase: {}. Console should now show 'Listening'",
-                had_bootstrap_phase
+                "[BN SM UPDATE] Updated Listening state. Removed bootstrap_phase: {had_bootstrap_phase}. Console should now show 'Listening'"
             );
         } else {
             debug!(

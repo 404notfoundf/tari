@@ -32,9 +32,9 @@ use tari_common_types::{
     transaction::TxId,
     types::{CompressedCommitment, FixedHash, HashOutput},
 };
-use tari_core::transactions::{
-    tari_amount::MicroMinotari,
+use tari_transaction_components::{
     transaction_components::{OutputType, TransactionOutput},
+    MicroMinotari,
 };
 use tari_utilities::hex::Hex;
 
@@ -463,8 +463,8 @@ where T: OutputManagerBackend + 'static
 }
 
 fn unexpected_result<T>(req: DbKey, res: DbValue) -> Result<T, OutputManagerStorageError> {
-    let msg = format!("Unexpected result for database query {}. Response: {}", req, res);
-    error!(target: LOG_TARGET, "{}", msg);
+    let msg = format!("Unexpected result for database query {req}. Response: {res}");
+    error!(target: LOG_TARGET, "{msg}");
     Err(OutputManagerStorageError::UnexpectedResult(msg))
 }
 
@@ -503,9 +503,7 @@ impl Display for DbValue {
 fn log_error<T>(req: DbKey, err: OutputManagerStorageError) -> Result<T, OutputManagerStorageError> {
     error!(
         target: LOG_TARGET,
-        "Database access error on request: {}: {}",
-        req,
-        err
+        "Database access error on request: {req}: {err}"
     );
     Err(err)
 }

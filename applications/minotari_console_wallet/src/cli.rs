@@ -31,10 +31,9 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use minotari_app_utilities::{common_cli_args::CommonCliArgs, utilities::UniPublicKey};
 use tari_common::configuration::{ConfigOverrideProvider, Network};
-use tari_common_types::{epoch::VnEpoch, tari_address::TariAddress};
+use tari_common_types::{epoch::VnEpoch, seeds::seed_words::SeedWords, tari_address::TariAddress};
 use tari_comms::multiaddr::Multiaddr;
-use tari_core::transactions::tari_amount::{self, MicroMinotari};
-use tari_key_manager::SeedWords;
+use tari_transaction_components::tari_amount::{self, MicroMinotari};
 use tari_utilities::{
     hex::{Hex, HexError},
     SafePassword,
@@ -146,7 +145,6 @@ fn replace_or_add_override(overrides: &mut Vec<(String, String)>, key: &str, val
 #[derive(Debug, Subcommand, Clone)]
 pub enum CliCommands {
     GetBalance,
-    SendMinotari(SendMinotariArgs),
     BurnMinotari(BurnMinotariArgs),
     PreMineSpendGetOutputStatus,
     PreMineStart(PreMineStartSessionArgs),
@@ -278,22 +276,28 @@ impl FromStr for CliRecipientInfo {
         }
 
         // Parse output indexes
-        if !parts[0].starts_with('[') && !parts[0].ends_with(']') {
+        if !parts.first().expect("Already checked").starts_with('[') &&
+            !parts.first().expect("Already checked").ends_with(']')
+        {
             return Err("Invalid 'recipient-info' part 1; array bounds must be indicated with '[' and ']'".to_string());
         }
-        let binding = parts[0].replace("[", "").replace("]", "");
+        let binding = parts
+            .first()
+            .expect("Already checked")
+            .replace("[", "")
+            .replace("]", "");
         let parts_0 = binding.split(',').collect::<Vec<&str>>();
         let output_indexes = parts_0
             .iter()
             .map(|v| {
                 v.parse()
-                    .map_err(|e| format!("'recipient_info' - invalid output_index: {}", e))
+                    .map_err(|e| format!("'recipient_info' - invalid output_index: {e}"))
             })
             .collect::<Result<Vec<usize>, String>>()?;
 
         // Parse recipient address
-        let recipient_address = TariAddress::from_base58(parts[1])
-            .map_err(|e| format!("'recipient_info' - invalid recipient address: {}", e))?;
+        let recipient_address = TariAddress::from_base58(parts.get(1).expect("Already checked"))
+            .map_err(|e| format!("'recipient_info' - invalid recipient address: {e}"))?;
 
         Ok(CliRecipientInfo {
             output_indexes,
@@ -377,26 +381,23 @@ pub struct MakeItRainArgs {
 
 impl MakeItRainArgs {
     pub fn transaction_type(&self) -> MakeItRainTransactionType {
-        if self.one_sided {
-            MakeItRainTransactionType::StealthOneSided
-        } else if self.burn_tari {
+        if self.burn_tari {
             MakeItRainTransactionType::BurnTari
         } else {
-            MakeItRainTransactionType::Interactive
+            MakeItRainTransactionType::StealthOneSided
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum MakeItRainTransactionType {
-    Interactive,
     StealthOneSided,
     BurnTari,
 }
 
 impl Display for MakeItRainTransactionType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -493,7 +494,7 @@ pub struct FinaliseShaAtomicSwapArgs {
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>, CliParseError> {
-    Vec::<u8>::from_hex(s).map_err(|e| CliParseError::HexError(format!("{}", e)))
+    Vec::<u8>::from_hex(s).map_err(|e| CliParseError::HexError(format!("{e}")))
 }
 
 #[derive(Debug, Args, Clone)]

@@ -2,6 +2,188 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [5.0.1](https://github.com/tari-project/tari/compare/v5.0.0...v5.0.1) (2025-09-02)
+
+
+### Features
+
+* clear bad blocks on startup ([#7465](https://github.com/tari-project/tari/issues/7465)) ([39eb903](https://github.com/tari-project/tari/commit/39eb9030c9eb6d86b1649bc6d2004f597fbc6c27))
+
+## [5.0.0](https://github.com/tari-project/tari/compare/v5.0.0-rc.0...v5.0.0) (2025-09-01)
+
+
+### Features
+
+* update cuckaroo pow info for grpc methods ([#7443](https://github.com/tari-project/tari/issues/7443)) ([f1a8456](https://github.com/tari-project/tari/commit/f1a8456b415478672d6dfee5e9c0701ff4f89192))
+
+
+### Bug Fixes
+
+* grpc server not respecting base_node.grpc_enabled flag ([#7456](https://github.com/tari-project/tari/issues/7456)) ([19173e1](https://github.com/tari-project/tari/commit/19173e1ab27917617e19bdb292fe00db8efe0d5a))
+* set validator registration value to 1000uT ([#7457](https://github.com/tari-project/tari/issues/7457)) ([f1f702e](https://github.com/tari-project/tari/commit/f1f702ebbefc14a118d47a6c41b988f9ec18c13f))
+
+## [5.0.0-rc.0](https://github.com/tari-project/tari/compare/v5.0.0-pre.8...v5.0.0-rc.0) (2025-08-29)
+
+
+### Bug Fixes
+
+* ffi build .h file ([#7452](https://github.com/tari-project/tari/issues/7452)) ([e534e12](https://github.com/tari-project/tari/commit/e534e12dda904981b94fc6466a46fd6e892723c9))
+* unwrap when sending readiness status ([#7449](https://github.com/tari-project/tari/issues/7449)) ([1d28d2b](https://github.com/tari-project/tari/commit/1d28d2bebb1d8a3f99c49f107e462d4a15ff59a9))
+
+## [5.0.0-pre.8](https://github.com/tari-project/tari/compare/v5.0.0-pre.7...v5.0.0-pre.8) (2025-08-27)
+
+
+### Features
+
+* cleanup base node and grpc ([#7444](https://github.com/tari-project/tari/issues/7444)) ([6f2a5ec](https://github.com/tari-project/tari/commit/6f2a5ec7f32b9112efd56e6b9fbb231181c1c59b))
+
+
+### Bug Fixes
+
+* offline signing 0 fees ([#7445](https://github.com/tari-project/tari/issues/7445)) ([2644305](https://github.com/tari-project/tari/commit/264430518e393dc2982aa5f672508ffcd870508b))
+
+## [5.0.0-pre.7](https://github.com/tari-project/tari/compare/v5.0.0-pre.6a...v5.0.0-pre.7) (2025-08-25)
+
+
+### Features
+
+* remove ledger from ffi builds ([#7441](https://github.com/tari-project/tari/issues/7441)) ([148072d](https://github.com/tari-project/tari/commit/148072dff4aaf42cdc21e125547986f3feed0f07))
+
+## [5.0.0-pre.6](https://github.com/tari-project/tari/compare/v5.0.0-pre.5...v5.0.0-pre.6) (2025-08-25)
+
+
+### Features
+
+* make key manager backend async ([#7435](https://github.com/tari-project/tari/issues/7435)) ([743939f](https://github.com/tari-project/tari/commit/743939febd0f6cb4142fe01d5562cf26e5c9528b))
+
+
+### Bug Fixes
+
+* bad merge, add missing c29 constants ([6e5f624](https://github.com/tari-project/tari/commit/6e5f62469ee7defc2bd3ede3446c6b5dee770ae0))
+
+## [5.0.0-pre.5](https://github.com/tari-project/tari/compare/v5.0.0-pre.4...v5.0.0-pre.5) (2025-08-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* update c29 fork block (#7434)
+
+### Features
+
+* update c29 fork block ([#7434](https://github.com/tari-project/tari/issues/7434)) ([344dde7](https://github.com/tari-project/tari/commit/344dde703fbb06314a39566c425a8f6715810783))
+
+
+### Bug Fixes
+
+* siphash calcs for c29 ([#7433](https://github.com/tari-project/tari/issues/7433)) ([80e0528](https://github.com/tari-project/tari/commit/80e0528bfecc602132d531af3e0e755a632bd63e))
+* tari address serialization ([#7424](https://github.com/tari-project/tari/issues/7424)) ([e5e40ab](https://github.com/tari-project/tari/commit/e5e40abea087053bd1f36b98f512f9cb1050168f))
+
+## [5.0.0-pre.4](https://github.com/tari-project/tari/compare/v5.0.0-pre.3...v5.0.0-pre.4) (2025-08-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove contacts service (#7423)
+
+### Features
+
+* add cli payref search for minotari node ([#7422](https://github.com/tari-project/tari/issues/7422)) ([ca6eb97](https://github.com/tari-project/tari/commit/ca6eb97ffeb71747769b1242a2c6fe400855704d))
+* add seed peer exclusion to liveness if other peers are available ([#7418](https://github.com/tari-project/tari/issues/7418)) ([8c6f8b5](https://github.com/tari-project/tari/commit/8c6f8b528b1519c84d08f70288ab48e941f0a3d5))
+* remove contacts service ([#7423](https://github.com/tari-project/tari/issues/7423)) ([2f14dda](https://github.com/tari-project/tari/commit/2f14ddaf9254aa56a45c06750b5c71325cf617e9))
+
+
+### Bug Fixes
+
+* add c29 test parameters ([#7427](https://github.com/tari-project/tari/issues/7427)) ([2faf76d](https://github.com/tari-project/tari/commit/2faf76d6cb6795490f26104ea1a84e59997ddc7c))
+* allow network discovery to exit Waiting state on Ready event ([#7417](https://github.com/tari-project/tari/issues/7417)) ([336dc2a](https://github.com/tari-project/tari/commit/336dc2a9957e63fd77622c5218ed34026381c8ea))
+* set cuckoo cycle params for esme ([5610dff](https://github.com/tari-project/tari/commit/5610dffb08bb8b0f312e5b0883c65fcd35ad6ae4))
+
+## [5.0.0-pre.3](https://github.com/tari-project/tari/compare/v5.0.0-pre.2...v5.0.0-pre.3) (2025-08-14)
+
+
+### Bug Fixes
+
+* add missing c29 parsers ([#7414](https://github.com/tari-project/tari/issues/7414)) ([96cf673](https://github.com/tari-project/tari/commit/96cf67352f68090d90bdd6eedfcb01b731722fe8))
+* fix esme valid versions ([#7415](https://github.com/tari-project/tari/issues/7415)) ([bfca423](https://github.com/tari-project/tari/commit/bfca423583f8a819d4b1d270d88bdfffac03bf12))
+
+## [5.0.0-pre.2](https://github.com/tari-project/tari/compare/v5.0.0-pre.1...v5.0.0-pre.2) (2025-08-13)
+
+
+### Bug Fixes
+
+* migration panic ([#7409](https://github.com/tari-project/tari/issues/7409)) ([308e87b](https://github.com/tari-project/tari/commit/308e87baf9f053e927e76e2f827c456a662cf1bd))
+
+## [5.0.0-pre.1](https://github.com/tari-project/tari/compare/v5.0.0-pre.0...v5.0.0-pre.1) (2025-08-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* add c29 pow algorithm (#7398)
+
+### Features
+
+* add c29 pow algorithm ([#7398](https://github.com/tari-project/tari/issues/7398)) ([86286c7](https://github.com/tari-project/tari/commit/86286c7503829ac92a1e5d60e2d622fadc895f29))
+* add migration to verify and fix embedded accumulated difficulty error ([#7387](https://github.com/tari-project/tari/issues/7387)) ([db09620](https://github.com/tari-project/tari/commit/db0962074349872cc4d60a0ff5c97c61a15a0f30))
+* add network discovery timeouts ([#7377](https://github.com/tari-project/tari/issues/7377)) ([5a711cc](https://github.com/tari-project/tari/commit/5a711ccf8f982df8133ec461d9b35450c1b31a54))
+* add seed peer exclusion to network discovery ([#7395](https://github.com/tari-project/tari/issues/7395)) ([2a2563a](https://github.com/tari-project/tari/commit/2a2563acc1a960fc316edd5c0f93b33c7dc25f6d))
+* add seed peer exclusion to the proactive dialer ([#7396](https://github.com/tari-project/tari/issues/7396)) ([6ed21d9](https://github.com/tari-project/tari/commit/6ed21d933df9ac0810aa9b9987a59621925674a1))
+* enhance wallet connectivity monitoring ([#7372](https://github.com/tari-project/tari/issues/7372)) ([bb0b2fa](https://github.com/tari-project/tari/commit/bb0b2fa951c7df28775455b8d088082879d44839))
+* extend cancel transaction wallet grpc call to also cancel pending one sided transactions ([#7384](https://github.com/tari-project/tari/issues/7384)) ([e955456](https://github.com/tari-project/tari/commit/e955456138ab7724f983af1ba1a1fd8e5dd25e78))
+* improve scanning performance ([#7371](https://github.com/tari-project/tari/issues/7371)) ([8809224](https://github.com/tari-project/tari/commit/8809224b689325a45fe0c645517a74ab71695e85))
+* only update state if changed ([#7362](https://github.com/tari-project/tari/issues/7362)) ([e55ec08](https://github.com/tari-project/tari/commit/e55ec08bea5bb114ab3e3838097cdb689bf6ac32))
+* prevent sync peers sending local addresses ([#7359](https://github.com/tari-project/tari/issues/7359)) ([eb87fc2](https://github.com/tari-project/tari/commit/eb87fc2171db872db2609bb5b97e975316c4804a))
+* refresh the peer_db ([#7382](https://github.com/tari-project/tari/issues/7382)) ([fb29b4d](https://github.com/tari-project/tari/commit/fb29b4d0323af861866e4da81369062a7c299217))
+* remove index tracking from commitment mask index ([#7373](https://github.com/tari-project/tari/issues/7373)) ([5c4757c](https://github.com/tari-project/tari/commit/5c4757c96d9679cfde36ba6507d129eb9dc1ae68))
+
+
+### Bug Fixes
+
+* ci integration tests workflow ([#7389](https://github.com/tari-project/tari/issues/7389)) ([b27dab3](https://github.com/tari-project/tari/commit/b27dab3a73e2c89bd90e765d23e1361244149781))
+* corruption of peer db when updating peers ([#7374](https://github.com/tari-project/tari/issues/7374)) ([d6d9287](https://github.com/tari-project/tari/commit/d6d9287a11453e1472f5b5ab6ec2a709ceddeb43))
+* memo naming from payment_id ([#7385](https://github.com/tari-project/tari/issues/7385)) ([d219520](https://github.com/tari-project/tari/commit/d219520b4835f3c926eef730881bf273a634ba81))
+* pagination for all completed transactions gRPC method ([#7366](https://github.com/tari-project/tari/issues/7366)) ([8b3bb29](https://github.com/tari-project/tari/commit/8b3bb29aaf4a9d50b430b534fbd29e9732a85652))
+* transaction cancellation ([#7402](https://github.com/tari-project/tari/issues/7402)) ([c1bb4c4](https://github.com/tari-project/tari/commit/c1bb4c421c2628f5d8f4a3f302fd2fc673427de4))
+
+### [5.0.0-pre.0](https://github.com/tari-project/tari/compare/v4.10.0-pre.0...v5.0.0-pre.0) (2025-07-23)
+
+### ⚠ BREAKING CHANGES
+
+Wallet config has changed. It needs to be recreated or all instances of `custom_base_node` must be removed
+
+### Features
+
+* remove old custom base node settings and update config ([#7353](https://github.com/tari-project/tari/issues/7353)) ([5a6d323](https://github.com/tari-project/tari/commit/5a6d32344c2d728e692741d8cc2aac6be73405c4))
+
+
+### Bug Fixes
+
+* add dns opts to system dns ([#7355](https://github.com/tari-project/tari/issues/7355)) ([ee171e1](https://github.com/tari-project/tari/commit/ee171e1b5c9cbc4b8f0463153a5dfb5038ca7b61))
+* prevent duplicate block insert ([#7357](https://github.com/tari-project/tari/issues/7357)) ([97d10d0](https://github.com/tari-project/tari/commit/97d10d001fbcc4fe23873521605b41b2b93b3c07))
+
+## [4.10.0-pre.0](https://github.com/tari-project/tari/compare/v4.9.1-pre.0...v4.10.0-pre.0) (2025-07-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* only scan in 100 block sections (#7344)
+* remove wallet ffi transport (#7347)
+* add birthday offset to wallet create (#7345)
+* add initial validation flag to wallet state (#7341)
+
+### Features
+
+* add birthday offset to wallet create ([#7345](https://github.com/tari-project/tari/issues/7345)) ([68c996e](https://github.com/tari-project/tari/commit/68c996e66c50022e4f05c35c11f909c77c834b17))
+* add initial validation flag to wallet state ([#7341](https://github.com/tari-project/tari/issues/7341)) ([323e308](https://github.com/tari-project/tari/commit/323e3080548e28961296b03050130a00b3aae8eb))
+* add output hash of inputs to scanning stream ([#7334](https://github.com/tari-project/tari/issues/7334)) ([3ceac84](https://github.com/tari-project/tari/commit/3ceac84bab363db69b98fd6563423f1d55e80ae0))
+* only scan in 10 block sections ([#7344](https://github.com/tari-project/tari/issues/7344)) ([d2e6df9](https://github.com/tari-project/tari/commit/d2e6df99d4b2330fe2131b2cea723cf43bbfa853))
+* remove wallet ffi transport ([#7347](https://github.com/tari-project/tari/issues/7347)) ([422af03](https://github.com/tari-project/tari/commit/422af038d6cc5ebec1ce8fa3a10b06ecdf7be70c))
+
+
+### Bug Fixes
+
+* coinbase detection ([#7337](https://github.com/tari-project/tari/issues/7337)) ([9eb66d4](https://github.com/tari-project/tari/commit/9eb66d40705cfd5024644abc84a8f581a316b185))
+* ffi callbacks ([#7340](https://github.com/tari-project/tari/issues/7340)) ([c83ff6a](https://github.com/tari-project/tari/commit/c83ff6acd3eb1fe77e10f3ee495cf6405be91376))
+
 ### [4.9.1-pre.0](https://github.com/tari-project/tari/compare/v4.9.0-pre.2...v4.9.1-pre.0) (2025-07-16)
 
 

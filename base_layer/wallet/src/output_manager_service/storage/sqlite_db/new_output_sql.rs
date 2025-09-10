@@ -79,7 +79,7 @@ impl NewOutputSql {
         let mut covenant = Vec::new();
         BorshSerialize::serialize(&output.wallet_output.covenant, &mut covenant)?;
 
-        let user_payment_id = output.payment_id.user_data_as_bytes();
+        let user_payment_id = output.payment_id.payment_id_as_bytes();
         let user_payment_id = if user_payment_id.is_empty() {
             None
         } else {
@@ -88,7 +88,7 @@ impl NewOutputSql {
 
         let output = Self {
             commitment: output.commitment.to_vec(),
-            spending_key: output.wallet_output.spending_key_id.to_string(),
+            spending_key: output.wallet_output.commitment_mask_key_id.to_string(),
             rangeproof: output.wallet_output.range_proof.map(|proof| proof.to_vec()),
             value: output.wallet_output.value.as_u64() as i64,
             output_type: i32::from(output.wallet_output.features.output_type.as_byte()),
@@ -112,7 +112,7 @@ impl NewOutputSql {
             metadata_signature_u_y: output.wallet_output.metadata_signature.u_y().to_vec(),
             features_json: serde_json::to_string(&output.wallet_output.features).map_err(|s| {
                 OutputManagerStorageError::ConversionError {
-                    reason: format!("Could not parse features from JSON:{}", s),
+                    reason: format!("Could not parse features from JSON:{s}"),
                 }
             })?,
             covenant,

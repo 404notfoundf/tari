@@ -23,7 +23,7 @@
 use std::convert::TryFrom;
 
 use tari_common_types::types::BlockHash;
-use tari_core::transactions::aggregated_body::AggregateBody;
+use tari_transaction_components::aggregated_body::AggregateBody;
 use tari_utilities::convert::try_convert_all;
 
 use crate::{conversions::transaction_output::grpc_output_with_payref, tari_rpc as grpc};
@@ -50,9 +50,9 @@ impl TryFrom<grpc::AggregateBody> for AggregateBody {
     type Error = String;
 
     fn try_from(body: grpc::AggregateBody) -> Result<Self, Self::Error> {
-        let inputs = try_convert_all(body.inputs).map_err(|err: String| format!("inputs {}", err))?;
-        let outputs = try_convert_all(body.outputs).map_err(|err: String| format!("outputs {}", err))?;
-        let kernels = try_convert_all(body.kernels).map_err(|err: String| format!("kernels {}", err))?;
+        let inputs = try_convert_all(body.inputs).map_err(|err: String| format!("inputs {err}"))?;
+        let outputs = try_convert_all(body.outputs).map_err(|err: String| format!("outputs {err}"))?;
+        let kernels = try_convert_all(body.kernels).map_err(|err: String| format!("kernels {err}"))?;
         let body = AggregateBody::new(inputs, outputs, kernels);
         Ok(body)
     }

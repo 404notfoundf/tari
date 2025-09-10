@@ -1,6 +1,7 @@
 // Copyright 2022 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
 
+#![allow(clippy::indexing_slicing)]
 use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
@@ -10,7 +11,7 @@ use tari_common_types::{
     tari_address::TariAddress,
     transaction::{TransactionDirection, TransactionStatus},
 };
-use tari_core::transactions::transaction_components::payment_id::{PaymentId, TxType};
+use tari_transaction_components::transaction_components::memo_field::TxType;
 use tokio::runtime::Handle;
 use tui::{
     backend::Backend,
@@ -155,7 +156,7 @@ impl TransactionsTab {
             )));
 
             column3_items.push(ListItem::new(Span::styled(
-                t.payment_id.clone().unwrap_or_default().user_data_as_string(),
+                t.payment_id.clone().unwrap_or_default().payment_id_as_string(),
                 Style::default().fg(text_color),
             )));
         }
@@ -220,12 +221,7 @@ impl TransactionsTab {
 
             let mut transaction_status = tx.status;
             let mut transaction_type = if tx.burn { TxType::Burn } else { TxType::PaymentToOther };
-            if let Some(
-                PaymentId::Open { tx_type, .. } |
-                PaymentId::AddressAndData { tx_type, .. } |
-                PaymentId::TransactionInfo { tx_type, .. },
-            ) = tx.payment_id.clone()
-            {
+            if let Some(tx_type) = tx.payment_id.as_ref().and_then(|p| p.get_tx_type()) {
                 match tx.status {
                     TransactionStatus::OneSidedUnconfirmed => transaction_status = TransactionStatus::MinedUnconfirmed,
                     TransactionStatus::OneSidedConfirmed => transaction_status = TransactionStatus::MinedConfirmed,
@@ -234,8 +230,11 @@ impl TransactionsTab {
                 transaction_type = tx_type;
             };
 
-            if let Some(PaymentId::Open { .. } | PaymentId::AddressAndData { .. }) = tx.payment_id.clone() {
-                if transaction_type == TxType::PaymentToSelf && tx.source_address != tx.destination_address {
+            if let Some(payment_id) = tx.payment_id.as_ref() {
+                if (payment_id.is_open() || payment_id.is_address_and_data()) &&
+                    transaction_type == TxType::PaymentToSelf &&
+                    tx.source_address != tx.destination_address
+                {
                     transaction_type = TxType::PaymentToOther;
                 }
                 if transaction_type == TxType::Burn && tx.destination_address != TariAddress::default() {
@@ -392,7 +391,7 @@ impl TransactionsTab {
             let excess_sig = Span::styled(format!("({})", tx.excess_signature), Style::default().fg(Color::White));
 
             let (status, direction, amount, fee, weight, inputs_count, outputs_count, payment_id, source, destination) =
-                if let Some(PaymentId::TransactionInfo { fee, .. }) = tx.payment_id.clone() {
+                if let Some(fee) = tx.payment_id.as_ref().and_then(|p| p.get_fee()) {
                     let status = match tx.status {
                         TransactionStatus::OneSidedUnconfirmed => TransactionStatus::MinedUnconfirmed,
                         TransactionStatus::OneSidedConfirmed => TransactionStatus::MinedConfirmed,
@@ -407,7 +406,7 @@ impl TransactionsTab {
                         tx.weight,
                         tx.inputs_count,
                         tx.outputs_count,
-                        tx.payment_id.clone().unwrap_or_default().user_data_as_string(),
+                        tx.payment_id.clone().unwrap_or_default().payment_id_as_string(),
                         tx.source_address.clone(),
                         tx.destination_address.clone(),
                     )
@@ -420,7 +419,7 @@ impl TransactionsTab {
                         tx.weight,
                         tx.inputs_count,
                         tx.outputs_count,
-                        tx.payment_id.clone().unwrap_or_default().user_data_as_string(),
+                        tx.payment_id.clone().unwrap_or_default().payment_id_as_string(),
                         tx.source_address.clone(),
                         tx.destination_address.clone(),
                     )
@@ -430,34 +429,31 @@ impl TransactionsTab {
                 if tx.status == TransactionStatus::Pending && direction == TransactionDirection::Outbound {
                     Span::raw("")
                 } else {
-                    Span::styled(format!("{}", source), Style::default().fg(Color::White))
+                    Span::styled(format!("{source}"), Style::default().fg(Color::White))
                 };
             let destination_address =
                 if tx.status == TransactionStatus::Pending && direction == TransactionDirection::Inbound {
                     Span::raw("")
                 } else {
-                    Span::styled(format!("{}", destination), Style::default().fg(Color::White))
+                    Span::styled(format!("{destination}"), Style::default().fg(Color::White))
                 };
 
-            let direction = Span::styled(format!("{}", direction), Style::default().fg(Color::White));
+            let direction = Span::styled(format!("{direction}"), Style::default().fg(Color::White));
             let amount = amount.to_string();
             let content = &amount;
             let amount = Span::styled(content, Style::default().fg(Color::White));
             let fee_details = {
                 Span::styled(
-                    format!(
-                        " (weight: {}g, #inputs: {}, #outputs: {})",
-                        weight, inputs_count, outputs_count
-                    ),
+                    format!(" (weight: {weight}g, #inputs: {inputs_count}, #outputs: {outputs_count})"),
                     Style::default().fg(Color::Gray),
                 )
             };
             let fee = Spans::from(vec![
-                Span::styled(format!("{}", fee), Style::default().fg(Color::White)),
+                Span::styled(format!("{fee}"), Style::default().fg(Color::White)),
                 fee_details,
             ]);
             let status_msg = if let Some(reason) = tx.cancelled {
-                format!("Cancelled: {}", reason)
+                format!("Cancelled: {reason}")
             } else {
                 status.to_string()
             };
@@ -491,14 +487,14 @@ impl TransactionsTab {
                 tx.status == TransactionStatus::CoinbaseConfirmed) &&
                 tx.cancelled.is_none()
             {
-                format!("{} required confirmations met", required_confirmations)
+                format!("{required_confirmations} required confirmations met")
             } else if (tx.status == TransactionStatus::MinedUnconfirmed ||
                 tx.status == TransactionStatus::OneSidedUnconfirmed ||
                 tx.status == TransactionStatus::CoinbaseUnconfirmed) &&
                 tx.cancelled.is_none()
             {
                 if let Some(count) = confirmation_count {
-                    format!("{} of {} required confirmations met", count, required_confirmations)
+                    format!("{count} of {required_confirmations} required confirmations met")
                 } else {
                     "N/A".to_string()
                 }
@@ -523,8 +519,8 @@ impl TransactionsTab {
 
             let payment_ref_content = {
                 let payref_text = match (&tx.payment_reference_hex, &tx.payment_reference_status) {
-                    (Some(hex), Some(status)) => format!("{} Status: {}", hex, status),
-                    (None, Some(status)) => format!("PayRef: N/A Status: {}", status),
+                    (Some(hex), Some(status)) => format!("{hex} Status: {status}"),
+                    (None, Some(status)) => format!("PayRef: N/A Status: {status}"),
                     (Some(hex), None) => hex.clone(),
                     (None, None) => "N/A".to_string(),
                 };
@@ -591,8 +587,7 @@ impl TransactionsTab {
 
         // If no match found, show error
         self.error_message = Some(format!(
-            "No transaction found with PayRef containing '{}'\nPress Enter to continue.",
-            search_term
+            "No transaction found with PayRef containing '{search_term}'\nPress Enter to continue."
         ));
     }
 }
@@ -695,8 +690,7 @@ impl<B: Backend> Component<B> for TransactionsTab {
                         if let Some(pending_tx) = app_state.get_pending_tx(i).cloned() {
                             if let Err(e) = Handle::current().block_on(app_state.cancel_transaction(pending_tx.tx_id)) {
                                 self.error_message = Some(format!(
-                                    "Could not cancel pending transaction.\n{}\nPress Enter to continue.",
-                                    e
+                                    "Could not cancel pending transaction.\n{e}\nPress Enter to continue."
                                 ));
                             }
                         }
@@ -746,9 +740,6 @@ impl<B: Backend> Component<B> for TransactionsTab {
                 self.payref_search.clear();
             },
             'p' => {
-                if let Err(e) = Handle::current().block_on(app_state.restart_transaction_protocols()) {
-                    error!(target: LOG_TARGET, "Error rebroadcasting transactions: {}", e);
-                }
                 self.completed_list_state.select(None);
                 self.selected_tx_list = SelectedTransactionList::PendingTxs;
                 self.pending_list_state.set_num_items(app_state.get_pending_txs().len());
@@ -783,7 +774,7 @@ impl<B: Backend> Component<B> for TransactionsTab {
             // Rebroadcast
             'r' => {
                 if let Err(e) = Handle::current().block_on(app_state.rebroadcast_all()) {
-                    error!(target: LOG_TARGET, "Error rebroadcasting transactions: {}", e);
+                    error!(target: LOG_TARGET, "Error rebroadcasting transactions: {e}");
                 }
             },
             'a' => app_state.toggle_abandoned_coinbase_filter(),

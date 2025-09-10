@@ -20,6 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#![allow(clippy::indexing_slicing)]
 use log::trace;
 use minotari_wallet::{error::WalletError, util::wallet_identity::WalletIdentity, WalletConfig, WalletSqlite};
 use tari_common::exit_codes::{ExitCode, ExitError};
@@ -36,7 +37,6 @@ use crate::{
         components::{
             base_node::BaseNode,
             burn_tab::BurnTab,
-            contacts_tab::ContactsTab,
             events_component::EventsComponent,
             log_tab::LogTab,
             menu::Menu,
@@ -105,7 +105,6 @@ impl<B: Backend> App<B> {
             .add("Receive".into(), Box::new(ReceiveTab::new()))
             .add("Burn".into(), Box::new(BurnTab::new(&app_state)))
             .add("Templates".into(), Box::new(RegisterTemplateTab::new(&app_state)))
-            .add("Contacts".into(), Box::new(ContactsTab::new()))
             .add("Events".into(), Box::new(EventsComponent::new()))
             .add("Log".into(), Box::new(LogTab::new()))
             .add("Notifications".into(), Box::new(NotificationTab::new()));
@@ -125,14 +124,14 @@ impl<B: Backend> App<B> {
     }
 
     pub fn on_control_key(&mut self, c: char) {
-        trace!(target: LOG_TARGET, "on_control_key: {}", c);
+        trace!(target: LOG_TARGET, "on_control_key: {c}");
         if c == 'q' {
             self.should_quit = true;
         }
     }
 
     pub fn on_key(&mut self, c: char) {
-        trace!(target: LOG_TARGET, "on_key: {}", c);
+        trace!(target: LOG_TARGET, "on_key: {c}");
         match c {
             '\t' => {
                 self.tabs.next();

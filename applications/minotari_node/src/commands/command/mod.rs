@@ -50,6 +50,7 @@ mod quit;
 mod reset_offline_peers;
 mod rewind_blockchain;
 mod search_kernel;
+mod search_payref;
 mod search_utxo;
 mod status;
 mod test_peer_liveness;
@@ -79,7 +80,7 @@ use tari_core::{
     base_node::{state_machine_service::states::StatusInfo, LocalNodeCommsInterface},
     blocks::ChainHeader,
     chain_storage::{async_db::AsyncBlockchainDb, LMDBDatabase},
-    consensus::ConsensusManager,
+    consensus::BaseNodeConsensusManager,
     mempool::service::LocalMempoolService,
 };
 use tari_p2p::{auto_update::SoftwareUpdaterHandle, services::liveness::LivenessHandle};
@@ -136,6 +137,7 @@ pub enum Command {
     DiscoverPeer(discover_peer::Args),
     GetBlock(get_block::Args),
     SearchUtxo(search_utxo::Args),
+    SearchPayref(search_payref::Args),
     SearchKernel(search_kernel::Args),
     GetMempoolStats(get_mempool_stats::Args),
     GetMempoolState(get_mempool_state::Args),
@@ -163,7 +165,7 @@ pub trait HandleCommand<T> {
 
 pub struct CommandContext {
     pub config: Arc<ApplicationConfig>,
-    consensus_rules: ConsensusManager,
+    consensus_rules: BaseNodeConsensusManager,
     blockchain_db: AsyncBlockchainDb<LMDBDatabase>,
     discovery_service: DhtDiscoveryRequester,
     dht_metrics_collector: MetricsCollectorHandle,
@@ -234,6 +236,7 @@ impl CommandContext {
                 Command::ListHeaders(_) |
                 Command::HeaderStats(_) |
                 Command::SearchUtxo(_) |
+                Command::SearchPayref(_) |
                 Command::SearchKernel(_) |
                 Command::GetMempoolStats(_) |
                 Command::GetMempoolState(_) |
@@ -251,7 +254,7 @@ impl CommandContext {
             };
             let fut = self.handle_command(args.command);
             if let Err(e) = time::timeout(Duration::from_secs(time_out), fut).await? {
-                return Err(Error::msg(format!("{} ({} s)", e, time_out)));
+                return Err(Error::msg(format!("{e} ({time_out} s)")));
             };
             Ok(None)
         }
@@ -301,6 +304,7 @@ impl HandleCommand<Command> for CommandContext {
             Command::DiscoverPeer(args) => self.handle_command(args).await,
             Command::GetBlock(args) => self.handle_command(args).await,
             Command::SearchUtxo(args) => self.handle_command(args).await,
+            Command::SearchPayref(args) => self.handle_command(args).await,
             Command::SearchKernel(args) => self.handle_command(args).await,
             Command::ListConnections(args) => self.handle_command(args).await,
             Command::GetMempoolStats(args) => self.handle_command(args).await,

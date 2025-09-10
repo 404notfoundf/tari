@@ -4,18 +4,18 @@ pub mod http;
 
 use anyhow::Error;
 use serde::{Deserialize, Serialize};
-use tari_core::{
-    base_node::rpc::models::{
+use tari_shutdown::ShutdownSignal;
+use tari_transaction_components::{
+    rpc::models::{
         self,
         BlockHeader,
+        FeePerGramStat,
         GetUtxosDeletedInfoResponse,
         GetUtxosMinedInfoResponse,
         SyncUtxosByBlockResponse,
     },
-    mempool::FeePerGramStat,
-    transactions::transaction_components::{Transaction, TransactionOutput},
+    transaction_components::{Transaction, TransactionOutput},
 };
-use tari_shutdown::ShutdownSignal;
 use tokio::sync::mpsc;
 
 use crate::client::models::TxSubmissionResponse;
@@ -36,7 +36,6 @@ pub trait BaseNodeWalletClient: Send + Sync + Clone + 'static {
     async fn sync_utxos_by_block(
         &self,
         start_header_hash: Vec<u8>,
-        end_header_hash: Vec<u8>,
         shutdown: ShutdownSignal,
     ) -> Result<mpsc::Receiver<Result<SyncUtxosByBlockResponse, Error>>, Error>;
 

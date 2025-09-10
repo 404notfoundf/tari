@@ -21,7 +21,7 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use log::*;
-use tari_comms::peer_manager::{PeerFeatures, STALE_PEER_THRESHOLD_DURATION};
+use tari_comms::peer_manager::{PeerFeatures, PeerFlags, STALE_PEER_THRESHOLD_DURATION};
 
 use super::{
     state_machine::{DiscoveryParams, NetworkDiscoveryContext, StateEvent},
@@ -37,7 +37,7 @@ pub(super) struct DiscoveryReady {
     last_discovery: Option<DhtNetworkDiscoveryRoundInfo>,
 }
 
-// New helper function to select peers for discovery
+// Helper function to select peers for discovery
 async fn select_peers_for_discovery_round(
     context: &NetworkDiscoveryContext,
     last_round_info: Option<&DhtNetworkDiscoveryRoundInfo>,
@@ -59,9 +59,11 @@ async fn select_peers_for_discovery_round(
                     config.network_discovery.max_sync_peers,
                     excluded_peers,
                     Some(PeerFeatures::COMMUNICATION_NODE),
+                    Some(PeerFlags::NONE),
                     Some(STALE_PEER_THRESHOLD_DURATION),
                     true,
                     None,
+                    true,
                 )
                 .await?
         },
@@ -76,7 +78,11 @@ async fn select_peers_for_discovery_round(
             );
             context
                 .peer_manager
-                .random_peers(config.network_discovery.max_sync_peers, excluded_peers)
+                .random_peers(
+                    config.network_discovery.max_sync_peers,
+                    excluded_peers,
+                    Some(PeerFlags::NONE),
+                )
                 .await?
         },
     };
@@ -108,9 +114,8 @@ impl DiscoveryReady {
         let num_peers = self.context.peer_manager.count().await;
         debug!(
             target: LOG_TARGET,
-            "NetworkDiscovery::Ready: Peer list contains {} entries. Current discovery rounds in this cycle: {}.",
-            num_peers,
-            current_num_rounds
+            "NetworkDiscovery::Ready: Peer list contains {num_peers} entries. Current discovery rounds in this cycle: {current_num_rounds}."
+
         );
 
         let min_desired_peers = self.config().network_discovery.min_desired_peers;
@@ -119,17 +124,13 @@ impl DiscoveryReady {
         if num_peers < min_desired_peers {
             debug!(
                 target: LOG_TARGET,
-                "Number of peers ({}) is less than min_desired_peers ({}). Attempting discovery.",
-                num_peers,
-                min_desired_peers
+                "Number of peers ({num_peers}) is less than min_desired_peers ({min_desired_peers}). Attempting discovery."
             );
 
             if current_num_rounds >= self.config().network_discovery.idle_after_num_rounds {
                 warn!(
                     target: LOG_TARGET,
-                    "Still unable to obtain minimum desired peers ({}) after {} rounds. Idling...",
-                    min_desired_peers,
-                    current_num_rounds,
+                    "Still unable to obtain minimum desired peers ({min_desired_peers}) after {current_num_rounds} rounds. Idling..."
                 );
                 self.context.reset_num_rounds();
                 return Ok(StateEvent::Idle);
@@ -156,8 +157,7 @@ impl DiscoveryReady {
         if current_num_rounds == 0 {
             debug!(
                 target: LOG_TARGET,
-                "First active round (current_num_rounds = 0) and num_peers ({}) >= min_desired_peers ({}). Forcing DHT discovery.",
-                num_peers, min_desired_peers
+                "First active round (current_num_rounds = 0) and num_peers ({num_peers}) >= min_desired_peers ({min_desired_peers}). Forcing DHT discovery."
             );
 
             let peers_for_discovery = {
@@ -186,8 +186,7 @@ impl DiscoveryReady {
         if let Some(ref info) = last_round_info_option {
             debug!(
                 target: LOG_TARGET,
-                "Processing after completed round #{}: {}",
-                current_num_rounds, info
+                "Processing after completed round #{current_num_rounds}: {info}"
             );
 
             // NEW: Special handling if this is the first actual discovery phase after SeedStrap
@@ -216,8 +215,7 @@ impl DiscoveryReady {
             if info.is_success() && !info.has_new_peers() {
                 debug!(
                     target: LOG_TARGET,
-                    "Round #{} was successful but found no new peers. num_peers ({}) >= min_desired ({}). Transitioning to OnConnectMode.",
-                    current_num_rounds, num_peers, min_desired_peers
+                    "Round #{current_num_rounds} was successful but found no new peers. num_peers ({num_peers}) >= min_desired ({min_desired_peers}). Transitioning to OnConnectMode."
                 );
                 self.context.reset_num_rounds();
                 return Ok(StateEvent::OnConnectMode);
@@ -245,8 +243,7 @@ impl DiscoveryReady {
         let last_round_info_exists = last_round_info_option.is_some();
         debug!(
             target: LOG_TARGET,
-            "Proceeding with further DHT discovery (num_rounds = {}, last_round_info_exists = {}).",
-            current_num_rounds, last_round_info_exists
+            "Proceeding with further DHT discovery (num_rounds = {current_num_rounds}, last_round_info_exists = {last_round_info_exists})."
         );
 
         let peers_for_discovery = select_peers_for_discovery_round(
@@ -258,7 +255,7 @@ impl DiscoveryReady {
         .await?;
 
         if peers_for_discovery.is_empty() {
-            debug!(target: LOG_TARGET, "No peers available to attempt discovery (after all checks in 'Ready' state). Idling. num_rounds = {}", current_num_rounds);
+            debug!(target: LOG_TARGET, "No peers available to attempt discovery (after all checks in 'Ready' state). Idling. num_rounds = {current_num_rounds}");
             self.context.reset_num_rounds();
             return Ok(StateEvent::Idle);
         }

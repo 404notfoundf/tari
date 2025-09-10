@@ -33,14 +33,6 @@ use crate::{
 
 const LOG_TARGET: &str = "comms::transports::hidden_service_transport";
 
-#[derive(thiserror::Error, Debug)]
-pub enum HiddenServiceTransportError {
-    #[error("Tor hidden service transport error: `{0}`")]
-    HiddenServiceControllerError(#[from] crate::tor::HiddenServiceControllerError),
-    #[error("Tor hidden service socks error: `{0}`")]
-    SocksTransportError(#[from] io::Error),
-}
-
 struct HiddenServiceTransportInner {
     socks_transport: Option<SocksTransport>,
     hidden_service_ctl: Option<HiddenServiceController>,
@@ -76,8 +68,7 @@ impl<F: Fn(TorIdentity)> HiddenServiceTransport<F> {
         let transport = hs_ctl.initialize_transport().await.map_err(|e| {
             error!(
                 target: LOG_TARGET,
-                "Error initializing hidden transport service stack{}",
-                e
+                "Error initializing hidden transport service stack{e}"
             );
             io::Error::other(e.to_string())
         })?;
@@ -97,8 +88,7 @@ impl<F: Fn(TorIdentity)> HiddenServiceTransport<F> {
         let hidden_service = hs_ctl.create_hidden_service().await.map_err(|err| {
             error!(
                 target: LOG_TARGET,
-                "Error creating hidden service: {}",
-                err
+                "Error creating hidden service: {err}"
             );
             io::Error::other(err.to_string())
         })?;

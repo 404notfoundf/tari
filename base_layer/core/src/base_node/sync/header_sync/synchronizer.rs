@@ -20,7 +20,6 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 use std::{
-    convert::TryFrom,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -35,9 +34,11 @@ use tari_comms::{
     protocol::rpc::{RpcClient, RpcError},
     PeerConnection,
 };
+use tari_node_components::blocks::BlockHeader;
+use tari_transaction_components::BanPeriod;
 use tari_utilities::hex::Hex;
 
-use super::{validator::BlockHeaderSyncValidator, BlockHeaderSyncError};
+pub(crate) use super::{validator::BlockHeaderSyncValidator, BlockHeaderSyncError};
 use crate::{
     base_node::sync::{
         ban::PeerBanManager,
@@ -47,10 +48,10 @@ use crate::{
         BlockchainSyncConfig,
         SyncPeer,
     },
-    blocks::{BlockHeader, ChainBlock, ChainHeader},
+    blocks::{ChainBlock, ChainHeader},
     chain_storage::{async_db::AsyncBlockchainDb, BlockchainBackend, ChainStorageError},
-    common::{rolling_avg::RollingAverageTime, BanPeriod},
-    consensus::ConsensusManager,
+    common::rolling_avg::RollingAverageTime,
+    consensus::BaseNodeConsensusManager,
     proof_of_work::randomx_factory::RandomXFactory,
     proto::{
         base_node::{FindChainSplitRequest, SyncHeadersRequest},
@@ -77,7 +78,7 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
     pub fn new(
         config: BlockchainSyncConfig,
         db: AsyncBlockchainDb<B>,
-        consensus_rules: ConsensusManager,
+        consensus_rules: BaseNodeConsensusManager,
         connectivity: ConnectivityRequester,
         sync_peers: &'a mut Vec<SyncPeer>,
         randomx_factory: RandomXFactory,
@@ -158,7 +159,7 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
                 Err(err) => {
                     let ban_reason = BlockHeaderSyncError::get_ban_reason(&err);
                     if let Some(reason) = ban_reason {
-                        warn!(target: LOG_TARGET, "{}", err);
+                        warn!(target: LOG_TARGET, "{err}");
                         let duration = match reason.ban_duration {
                             BanPeriod::Short => self.config.short_ban_period,
                             BanPeriod::Long => self.config.ban_period,
@@ -193,13 +194,13 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
         let peer_index = self
             .get_sync_peer_index(node_id)
             .ok_or(BlockHeaderSyncError::PeerNotFound)?;
-        let sync_peer = &self.sync_peers[peer_index];
+        let sync_peer = self.sync_peers.get(peer_index).expect("Already checked");
         self.hooks.call_on_starting_hook(sync_peer);
 
         let mut conn = self.dial_sync_peer(node_id).await?;
         debug!(
             target: LOG_TARGET,
-            "Attempting to synchronize headers with `{}`", node_id
+            "Attempting to synchronize headers with `{node_id}`"
         );
 
         let config = RpcClient::builder()
@@ -212,7 +213,10 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
         let latency = client
             .get_last_request_latency()
             .expect("unreachable panic: last request latency must be set after connect");
-        self.sync_peers[peer_index].set_latency(latency);
+        self.sync_peers
+            .get_mut(peer_index)
+            .ok_or(BlockHeaderSyncError::PeerNotFound)?
+            .set_latency(latency);
         if latency > max_latency {
             return Err(BlockHeaderSyncError::MaxLatencyExceeded {
                 peer: conn.peer_node_id().clone(),
@@ -221,15 +225,19 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
             });
         }
 
-        debug!(target: LOG_TARGET, "Sync peer latency is {:.2?}", latency);
-        let sync_peer = self.sync_peers[peer_index].clone();
+        debug!(target: LOG_TARGET, "Sync peer latency is {latency:.2?}");
+        let sync_peer = self
+            .sync_peers
+            .get(peer_index)
+            .ok_or(BlockHeaderSyncError::PeerNotFound)?
+            .clone();
         let sync_result = self.attempt_sync(&sync_peer, client, max_latency).await?;
         Ok((sync_peer, sync_result))
     }
 
     async fn dial_sync_peer(&self, node_id: &NodeId) -> Result<PeerConnection, BlockHeaderSyncError> {
         let timer = Instant::now();
-        debug!(target: LOG_TARGET, "Dialing {} sync peer", node_id);
+        debug!(target: LOG_TARGET, "Dialing {node_id} sync peer");
         let conn = self.connectivity.dial_peer(node_id.clone()).await?;
         info!(
             target: LOG_TARGET,
@@ -282,9 +290,7 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
             HeaderSyncStatus::InSyncOrAhead => {
                 debug!(
                     target: LOG_TARGET,
-                    "Headers are in sync at height {} but tip is {}. Proceeding to archival/pruned block sync",
-                    best_header_height,
-                    best_block_height
+                    "Headers are in sync at height {best_header_height} but tip is {best_block_height}. Proceeding to archival/pruned block sync"
                 );
 
                 Ok(AttemptSyncResult {
@@ -416,7 +422,12 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
                 ));
             }
             #[allow(clippy::cast_possible_truncation)]
-            if !resp.headers.is_empty() && resp.headers[0].prev_hash != block_hashes[resp.fork_hash_index as usize] {
+            if !resp.headers.is_empty() &&
+                *resp.headers.first().expect("Already checked").prev_hash !=
+                    *block_hashes
+                        .get(resp.fork_hash_index as usize)
+                        .expect("Already checked")
+            {
                 warn!(
                     target: LOG_TARGET,
                     "Peer `{}` sent hash an invalid protocol response, incorrect fork hash index {}. Peer will be banned.",
@@ -428,7 +439,9 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
                 ));
             }
             #[allow(clippy::cast_possible_truncation)]
-            let chain_split_hash = block_hashes[resp.fork_hash_index as usize];
+            let chain_split_hash = *block_hashes
+                .get(resp.fork_hash_index as usize)
+                .expect("Already checked");
 
             return Ok(FindChainSplitResult {
                 reorg_steps_back: resp.fork_hash_index.saturating_add(offset as u64),
@@ -501,7 +514,12 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
         // Do a cheap check to verify that we do not have these series of headers in the db already - if the 1st one is
         // not there most probably the rest are not either - the peer could still have returned old headers later on in
         // the list
-        if self.db.fetch_header_by_block_hash(headers[0].hash()).await?.is_some() {
+        if self
+            .db
+            .fetch_header_by_block_hash(headers.first().expect("Already checked").hash())
+            .await?
+            .is_some()
+        {
             return Err(BlockHeaderSyncError::ReceivedInvalidHeader(
                 "Header already in database".to_string(),
             ));
@@ -561,7 +579,7 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
         split_info: ChainSplitInfo,
         max_latency: Duration,
     ) -> Result<(), BlockHeaderSyncError> {
-        info!(target: LOG_TARGET, "Starting header sync from peer {}", sync_peer);
+        info!(target: LOG_TARGET, "Starting header sync from peer {sync_peer}");
         const COMMIT_EVERY_N_HEADERS: usize = 1000;
 
         let mut has_switched_to_new_chain = false;
@@ -648,8 +666,7 @@ impl<'a, B: BlockchainBackend + 'static> HeaderSynchronizer<'a, B> {
             );
             trace!(
                 target: LOG_TARGET,
-                "{}",
-                header
+                "{header}"
             );
             if let Some(prev_header_height) = prev_height {
                 if header.height != prev_header_height.saturating_add(1) {

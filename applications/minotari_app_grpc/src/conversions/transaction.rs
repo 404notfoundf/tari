@@ -26,8 +26,8 @@ use std::{
 };
 
 use tari_common_types::transaction::{TransactionDirection, TransactionStatus, TxId};
-use tari_core::transactions::transaction_components::Transaction;
 use tari_crypto::ristretto::RistrettoSecretKey;
+use tari_transaction_components::transaction_components::Transaction;
 use tari_utilities::ByteArray;
 
 use crate::{conversions::aggregate_body::grpc_aggregate_body_with_payrefs, tari_rpc as grpc};
@@ -65,13 +65,13 @@ impl TryFrom<grpc::Transaction> for Transaction {
     fn try_from(source: grpc::Transaction) -> Result<Self, Self::Error> {
         Ok(Self {
             offset: RistrettoSecretKey::from_canonical_bytes(&source.offset)
-                .map_err(|e| format!("Offset is not valid:{}", e))?,
+                .map_err(|e| format!("Offset is not valid:{e}"))?,
             body: source
                 .body
                 .ok_or_else(|| "Transaction body not provided".to_string())?
                 .try_into()?,
             script_offset: RistrettoSecretKey::from_canonical_bytes(&source.script_offset)
-                .map_err(|e| format!("Script offset is not valid:{}", e))?,
+                .map_err(|e| format!("Script offset is not valid:{e}"))?,
         })
     }
 }

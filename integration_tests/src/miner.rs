@@ -32,21 +32,20 @@ use minotari_node_grpc_client::BaseNodeGrpcClient;
 use minotari_wallet_grpc_client::{grpc, WalletGrpcClient};
 use tari_common::{configuration::Network, network_check::set_network_if_choice_valid};
 use tari_common_types::tari_address::TariAddress;
-use tari_core::{
-    consensus::ConsensusManager,
-    proof_of_work::PowAlgorithm,
-    transactions::{
-        generate_coinbase_with_wallet_output,
-        tari_amount::MicroMinotari,
-        transaction_components::{
-            payment_id::{PaymentId, TxType},
-            CoinBaseExtra,
-            RangeProofType,
-            WalletOutput,
-        },
-        transaction_key_manager::{MemoryDbKeyManager, TariKeyId},
+use tari_core::consensus::BaseNodeConsensusManager;
+use tari_transaction_components::{
+    generate_coinbase_with_wallet_output,
+    key_manager::TariKeyId,
+    tari_proof_of_work::PowAlgorithm,
+    transaction_components::{
+        memo_field::{MemoField, TxType},
+        CoinBaseExtra,
+        RangeProofType,
+        WalletOutput,
     },
+    MicroMinotari,
 };
+use tari_transaction_key_manager::MemoryDbKeyManager;
 use tonic::transport::Channel;
 
 use crate::TariWorld;
@@ -73,8 +72,8 @@ pub fn register_miner_process(
 ) {
     let pow_algo = PowAlgorithm::from_str(&pow_algo).unwrap();
     eprintln!(
-        "Registering miner process '{}' on '{}' and '{}' with pow algo '{:?}'",
-        miner_name, base_node_name, wallet_name, pow_algo
+        "Registering miner process '{miner_name}' on '{base_node_name}' and '{wallet_name}' with pow algo \
+         '{pow_algo:?}'"
     );
     let miner = MinerProcess {
         name: miner_name.clone(),
@@ -106,7 +105,7 @@ impl MinerProcess {
             },
             _ => serde_json::to_string(&self.pow_algo).unwrap(),
         };
-        eprintln!("Using pow algo: {}", pow_algo);
+        eprintln!("Using pow algo: {pow_algo}");
 
         let mut wallet_client = create_wallet_client(world, self.wallet_name.clone())
             .await
@@ -140,7 +139,7 @@ impl MinerProcess {
                 config_property_overrides: vec![
                     (
                         "miner.base_node_grpc_address".to_string(),
-                        format!("http://127.0.0.1:{}", node),
+                        format!("http://127.0.0.1:{node}"),
                     ),
                     ("miner.num_mining_threads".to_string(), "1".to_string()),
                     ("miner.mine_on_tip_only".to_string(), "false".to_string()),
@@ -164,9 +163,9 @@ impl MinerProcess {
 
 pub async fn create_wallet_client(world: &TariWorld, wallet_name: String) -> anyhow::Result<WalletGrpcClient<Channel>> {
     let wallet_grpc_port = world.wallets.get(&wallet_name).unwrap().grpc_port;
-    let wallet_addr = format!("http://127.0.0.1:{}", wallet_grpc_port);
+    let wallet_addr = format!("http://127.0.0.1:{wallet_grpc_port}");
 
-    eprintln!("Wallet GRPC at {}", wallet_addr);
+    eprintln!("Wallet GRPC at {wallet_addr}");
 
     Ok(WalletGrpcClient::connect(wallet_addr.as_str()).await?)
 }
@@ -179,7 +178,7 @@ pub async fn mine_blocks_without_wallet(
     script_key_id: &TariKeyId,
     wallet_payment_address: &TariAddress,
     stealth_payment: bool,
-    consensus_manager: &ConsensusManager,
+    consensus_manager: &BaseNodeConsensusManager,
 ) {
     for _ in 0..num_blocks {
         mine_block_without_wallet(
@@ -205,7 +204,7 @@ pub async fn mine_block(
     script_key_id: &TariKeyId,
     wallet_payment_address: &TariAddress,
     stealth_payment: bool,
-    consensus_manager: &ConsensusManager,
+    consensus_manager: &BaseNodeConsensusManager,
 ) {
     let (block_template, _wallet_output) = create_block_template_with_coinbase(
         base_client,
@@ -241,7 +240,7 @@ async fn mine_block_without_wallet(
     script_key_id: &TariKeyId,
     wallet_payment_address: &TariAddress,
     stealth_payment: bool,
-    consensus_manager: &ConsensusManager,
+    consensus_manager: &BaseNodeConsensusManager,
 ) {
     let (block_template, _wallet_output) = create_block_template_with_coinbase(
         base_client,
@@ -280,7 +279,7 @@ async fn create_block_template_with_coinbase(
     script_key_id: &TariKeyId,
     wallet_payment_address: &TariAddress,
     stealth_payment: bool,
-    consensus_manager: &ConsensusManager,
+    consensus_manager: &BaseNodeConsensusManager,
 ) -> (NewBlockTemplate, WalletOutput) {
     // get the block template from the base node
     let template_req = NewBlockTemplateRequest {
@@ -316,10 +315,7 @@ async fn create_block_template_with_coinbase(
         stealth_payment,
         consensus_manager.consensus_constants(height),
         RangeProofType::BulletProofPlus,
-        PaymentId::Open {
-            user_data: vec![],
-            tx_type: TxType::Coinbase,
-        },
+        MemoField::new_open(vec![], TxType::Coinbase).unwrap(),
     )
     .await
     .unwrap();
@@ -361,7 +357,7 @@ pub async fn mine_block_before_submit(
     script_key_id: &TariKeyId,
     wallet_payment_address: &TariAddress,
     stealth_payment: bool,
-    consensus_manager: &ConsensusManager,
+    consensus_manager: &BaseNodeConsensusManager,
 ) -> Block {
     let (template, _wallet_output) = create_block_template_with_coinbase(
         client,

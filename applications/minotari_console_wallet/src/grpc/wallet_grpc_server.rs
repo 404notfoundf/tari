@@ -19,7 +19,6 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 use std::{
     convert::{TryFrom, TryInto},
     str::FromStr,
@@ -116,8 +115,9 @@ use minotari_app_grpc::tari_rpc::{
     ValidateResponse,
 };
 use minotari_wallet::{
-    connectivity_service::WalletConnectivityInterface,
+    connectivity_service::{OnlineStatus, WalletConnectivityInterface},
     error::WalletStorageError,
+    legacy_transaction_protocol::recipient::RecipientState,
     output_manager_service::{handle::OutputManagerHandle, UtxoSelectionCriteria},
     transaction_service::{
         error::TransactionServiceError,
@@ -125,6 +125,7 @@ use minotari_wallet::{
         offline_signing::models::{SignedOneSidedTransactionResult, TransactionResult},
         storage::models::{self, WalletTransaction},
     },
+    WalletKeyManager,
     WalletSqlite,
 };
 use rand::rngs::OsRng;
@@ -132,23 +133,19 @@ use tari_common_types::{
     payment_reference::generate_payment_reference,
     tari_address::TariAddress,
     transaction::TxId,
-    types::{BlockHash, CompressedPublicKey, PrivateKey, Signature, SignatureWithDomain},
+    types::{BlockHash, CompressedPublicKey, CompressedSignature, PrivateKey, SignatureWithDomain},
 };
-use tari_comms::{types::CommsPublicKey, CommsNode};
-use tari_core::{
-    consensus::{ConsensusBuilderError, ConsensusConstants, ConsensusManager},
-    transactions::{
-        tari_amount::MicroMinotari,
-        transaction_components::{
-            payment_id::{PaymentId, TxType},
-            OutputFeatures,
-            UnblindedOutput,
-        },
-        transaction_key_manager::TransactionKeyManagerInterface,
-        transaction_protocol::recipient::RecipientState,
+use tari_comms::{connectivity::ConnectivityStatus, types::CommsPublicKey, CommsNode};
+use tari_transaction_components::{
+    consensus::{ConsensusConstants, ConsensusManager},
+    key_manager::TransactionKeyManagerInterface,
+    transaction_components::{
+        memo_field::{MemoField, TxType},
+        OutputFeatures,
+        UnblindedOutput,
     },
+    MicroMinotari,
 };
-use tari_crypto::hash_domain;
 use tari_utilities::{hex::Hex, ByteArray};
 use tokio::{
     sync::{broadcast, Mutex},
@@ -163,7 +160,7 @@ use crate::{
 };
 
 const LOG_TARGET: &str = "wallet::ui::grpc";
-
+use tari_crypto::hash_domain;
 // Domain separator for signing arbitrary messages with a wallet secret key
 hash_domain!(
     WalletMessageSigningDomain,
@@ -179,9 +176,9 @@ async fn send_transaction_event(
         transaction: Some(transaction_event),
     };
     if let Err(err) = sender.send(Ok(response)).await {
-        warn!(target: LOG_TARGET, "Error sending transaction via GRPC:  {}", err);
+        warn!(target: LOG_TARGET, "Error sending transaction via GRPC:  {err}");
         if let Err(send_err) = sender.send(Err(Status::unknown("Error sending data"))).await {
-            warn!(target: LOG_TARGET, "Error sending error to GRPC client: {}", send_err)
+            warn!(target: LOG_TARGET, "Error sending error to GRPC client: {send_err}")
         }
     }
 }
@@ -189,12 +186,12 @@ async fn send_transaction_event(
 pub struct WalletGrpcServer {
     wallet: WalletSqlite,
     rules: ConsensusManager,
-    debouncer: Arc<Mutex<WalletDebouncer>>,
+    debouncer: Arc<Mutex<WalletDebouncer<WalletKeyManager>>>,
 }
 
 impl WalletGrpcServer {
     #[allow(dead_code)]
-    pub fn new(wallet: WalletSqlite) -> Result<Self, ConsensusBuilderError> {
+    pub fn new(wallet: WalletSqlite) -> Self {
         let scanned_height = wallet
             .db
             .get_last_scanned_height()
@@ -204,15 +201,16 @@ impl WalletGrpcServer {
             wallet.output_manager_service.clone(),
             wallet.transaction_service.clone(),
             wallet.utxo_scanner_service.clone(),
+            wallet.clone(),
             wallet.comms.shutdown_signal(),
             scanned_height,
         );
-        let rules = ConsensusManager::builder(wallet.network.as_network()).build()?;
-        Ok(Self {
+        let rules = ConsensusManager::builder(wallet.network.as_network()).build();
+        Self {
             wallet,
             debouncer: Arc::new(Mutex::new(debouncer)),
             rules,
-        })
+        }
     }
 
     fn get_consensus_constants(&self) -> Result<&ConsensusConstants, WalletStorageError> {
@@ -228,7 +226,7 @@ impl WalletGrpcServer {
         self.wallet.transaction_service.clone()
     }
 
-    fn get_output_manager_service(&self) -> OutputManagerHandle {
+    fn get_output_manager_service(&self) -> OutputManagerHandle<WalletKeyManager> {
         self.wallet.output_manager_service.clone()
     }
 
@@ -239,6 +237,7 @@ impl WalletGrpcServer {
 
 #[tonic::async_trait]
 impl wallet_server::Wallet for WalletGrpcServer {
+    type GetAllCompletedTransactionsStreamStream = mpsc::Receiver<Result<GetCompletedTransactionsResponse, Status>>;
     type GetCompletedTransactionsStream = mpsc::Receiver<Result<GetCompletedTransactionsResponse, Status>>;
     type StreamTransactionEventsStream = mpsc::Receiver<Result<TransactionEventResponse, Status>>;
 
@@ -252,9 +251,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
         &self,
         _: Request<GetConnectivityRequest>,
     ) -> Result<Response<CheckConnectivityResponse>, Status> {
-        let connectivity = self.wallet.wallet_connectivity.clone();
-        let status = connectivity.get_connectivity_status().await;
-        Ok(Response::new(CheckConnectivityResponse { status: status as i32 }))
+        let debouncer = self.debouncer.lock().await;
+        let connection_status = debouncer.get_connection_status().await;
+        Ok(Response::new(CheckConnectivityResponse {
+            status: connection_status as i32,
+        }))
     }
 
     async fn check_for_updates(
@@ -289,12 +290,12 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .wallet
             .get_wallet_interactive_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
         let one_sided_address = self
             .wallet
             .get_wallet_one_sided_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
         Ok(Response::new(GetAddressResponse {
             interactive_address: interactive_address.to_vec(),
             one_sided_address: one_sided_address.to_vec(),
@@ -306,23 +307,32 @@ impl wallet_server::Wallet for WalletGrpcServer {
         request: Request<GetPaymentIdAddressRequest>,
     ) -> Result<Response<GetCompleteAddressResponse>, Status> {
         let message = request.into_inner();
+        trace!(
+            target: LOG_TARGET,
+            "get_payment_id_address: payment_id: '{:?}' / '{}'",
+            message.payment_id, String::from_utf8_lossy(&message.payment_id),
+        );
 
         let interactive_address = self
             .wallet
             .get_wallet_interactive_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
+        trace!(target: LOG_TARGET, "get_payment_id_address: interactive:      '{}'", interactive_address.to_base58());
         let interactive_address = interactive_address
-            .with_payment_id_user_data(message.payment_id.clone())
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .with_memo_field_payment_id(message.payment_id.clone())
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
+        trace!(target: LOG_TARGET, "get_payment_id_address: interactive + id: '{}'", interactive_address.to_base58());
         let one_sided_address = self
             .wallet
             .get_wallet_one_sided_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
+        trace!(target: LOG_TARGET, "get_payment_id_address: one_sided:        '{}'", one_sided_address.to_base58());
         let one_sided_address = one_sided_address
-            .with_payment_id_user_data(message.payment_id)
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .with_memo_field_payment_id(message.payment_id)
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
+        trace!(target: LOG_TARGET, "get_payment_id_address: one_sided + id:   '{}'", one_sided_address.to_base58());
         Ok(Response::new(GetCompleteAddressResponse {
             interactive_address: interactive_address.to_vec(),
             one_sided_address: one_sided_address.to_vec(),
@@ -341,12 +351,12 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .wallet
             .get_wallet_interactive_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
         let one_sided_address = self
             .wallet
             .get_wallet_one_sided_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
 
         Ok(Response::new(GetCompleteAddressResponse {
             interactive_address: interactive_address.to_vec(),
@@ -380,7 +390,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             let balance = oms
                 .get_balance_for_payment_id(bytes)
                 .await
-                .map_err(|e| Status::not_found(format!("WalletDebouncer error! {}", e)))?;
+                .map_err(|e| Status::not_found(format!("WalletDebouncer error! {e}")))?;
             return Ok(Response::new(GetBalanceResponse {
                 available_balance: balance.available_balance.into(),
                 pending_incoming_balance: balance.pending_incoming_balance.into(),
@@ -392,7 +402,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             let mut get_balance = self.debouncer.lock().await;
             match get_balance.get_balance().await {
                 Ok(b) => b,
-                Err(e) => return Err(Status::not_found(format!("WalletDebouncer error! {}", e))),
+                Err(e) => return Err(Status::not_found(format!("WalletDebouncer error! {e}"))),
             }
         };
         trace!(target: LOG_TARGET, "'get_balance' completed in {:.2?}", start.elapsed());
@@ -401,15 +411,18 @@ impl wallet_server::Wallet for WalletGrpcServer {
 
     async fn get_state(&self, _request: Request<GetStateRequest>) -> Result<Response<GetStateResponse>, Status> {
         let start = std::time::Instant::now();
-        let (balance, scanned_height) = {
+        let (balance, scanned_height, is_initial_validation_done) = {
             let mut debouncer = self.debouncer.lock().await;
             let balance = match debouncer.get_balance().await {
                 Ok(b) => b,
-                Err(e) => return Err(Status::not_found(format!("WalletDebouncer error! {}", e))),
+                Err(e) => return Err(Status::not_found(format!("WalletDebouncer error! {e}"))),
             };
             let scanned_height = debouncer.get_scanned_height().await;
-            (Some(balance), scanned_height)
+            let is_initial_validation_done = debouncer.is_initial_validation_done();
+            (Some(balance), scanned_height, is_initial_validation_done)
         };
+
+        let online_status = self.wallet.wallet_connectivity.get_connectivity_status().await;
 
         let status = self
             .comms()
@@ -417,6 +430,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .get_connectivity_status()
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+
+        let status = if online_status == OnlineStatus::Offline {
+            ConnectivityStatus::Offline
+        } else {
+            status
+        };
+
         let mut base_node_service = self.wallet.base_node_service.clone();
 
         let network = Some(tari_rpc::NetworkStatusResponse {
@@ -436,6 +456,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             scanned_height,
             balance,
             network,
+            has_done_initial_validation: is_initial_validation_done,
         }))
     }
 
@@ -447,7 +468,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let mut output_service = self.get_output_manager_service();
         let unspent_amounts = match output_service.get_unspent_outputs().await {
             Ok(uo) => uo,
-            Err(e) => return Err(Status::not_found(format!("GetUnspentAmounts error! {}", e))),
+            Err(e) => return Err(Status::not_found(format!("GetUnspentAmounts error! {e}"))),
         };
         trace!(target: LOG_TARGET, "'get_unspent_amounts' completed in {:.2?}", start.elapsed());
         Ok(Response::new(GetUnspentAmountsResponse {
@@ -484,7 +505,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let address = TariAddress::from_str(&message.address)
             .map_err(|_| Status::internal("Destination address is malformed".to_string()))?;
         let payment_id = if !message.raw_payment_id.is_empty() {
-            PaymentId::from_bytes(&message.raw_payment_id)
+            MemoField::from_bytes(&message.raw_payment_id)
         } else if let Some(user_pay_id) = message.user_payment_id {
             let bytes = match (
                 user_pay_id.u256.is_empty(),
@@ -500,12 +521,9 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     ));
                 },
             };
-            PaymentId::Open {
-                user_data: bytes,
-                tx_type: TxType::ClaimAtomicSwap,
-            }
+            MemoField::open_unchecked(bytes, TxType::ClaimAtomicSwap)
         } else {
-            PaymentId::Empty
+            MemoField::new_empty()
         };
         let mut transaction_service = self.get_transaction_service();
         let response = match transaction_service
@@ -537,7 +555,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             Err(e) => {
                 warn!(
                     target: LOG_TARGET,
-                    "Failed to send Sha - XTR atomic swap for address `{}`: {}", address, e
+                    "Failed to send Sha - XTR atomic swap for address `{address}`: {e}"
                 );
                 SendShaAtomicSwapResponse {
                     transaction_id: Default::default(),
@@ -574,7 +592,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         tx_id,
                         tx,
                         amount,
-                        PaymentId::open_from_string(
+                        MemoField::open_from_string(
                             "Claiming HTLC transaction with pre-image",
                             TxType::ClaimAtomicSwap,
                         ),
@@ -586,12 +604,12 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .wallet
                             .get_wallet_one_sided_address()
                             .await
-                            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+                            .map_err(|e| Status::internal(format!("{e:?}")))?;
                         let wallet_tx = self
                             .get_transaction_service()
                             .get_any_transaction(tx_id)
                             .await
-                            .map_err(|e| Status::internal(format!("{:?}", e)))?
+                            .map_err(|e| Status::internal(format!("{e:?}")))?
                             .ok_or_else(|| Status::not_found("Transaction not found".to_string()))?;
                         let final_tx = convert_wallet_transaction_into_transaction_info(
                             wallet_tx,
@@ -617,7 +635,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 }
             },
             Err(e) => {
-                warn!(target: LOG_TARGET, "Failed to claim SHA - XTR atomic swap: {}", e);
+                warn!(target: LOG_TARGET, "Failed to claim SHA - XTR atomic swap: {e}");
                 TransferResult {
                     address: Default::default(),
                     transaction_id: Default::default(),
@@ -654,7 +672,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         tx_id,
                         tx,
                         amount,
-                        PaymentId::open_from_string("Creating HTLC refund transaction", TxType::HtlcAtomicSwapRefund),
+                        MemoField::open_from_string("Creating HTLC refund transaction", TxType::HtlcAtomicSwapRefund),
                     )
                     .await
                 {
@@ -663,12 +681,12 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .wallet
                             .get_wallet_one_sided_address()
                             .await
-                            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+                            .map_err(|e| Status::internal(format!("{e:?}")))?;
                         let wallet_tx = self
                             .get_transaction_service()
                             .get_any_transaction(tx_id)
                             .await
-                            .map_err(|e| Status::internal(format!("{:?}", e)))?
+                            .map_err(|e| Status::internal(format!("{e:?}")))?
                             .ok_or_else(|| Status::not_found("Transaction not found".to_string()))?;
                         let final_tx = convert_wallet_transaction_into_transaction_info(
                             wallet_tx,
@@ -694,7 +712,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 }
             },
             Err(e) => {
-                warn!(target: LOG_TARGET, "Failed to claim HTLC refund transaction: {}", e);
+                warn!(target: LOG_TARGET, "Failed to claim HTLC refund transaction: {e}");
                 TransferResult {
                     address: Default::default(),
                     transaction_id: Default::default(),
@@ -721,7 +739,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .map_err(|_| Status::invalid_argument("Destination address is malformed"))?;
 
         let payment_id = if !recipient.raw_payment_id.is_empty() {
-            PaymentId::from_bytes(&recipient.raw_payment_id)
+            MemoField::from_bytes(&recipient.raw_payment_id)
         } else if let Some(user_pay_id) = recipient.user_payment_id {
             let bytes = match (
                 user_pay_id.u256.is_empty(),
@@ -737,12 +755,9 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     ));
                 },
             };
-            PaymentId::Open {
-                user_data: bytes,
-                tx_type: TxType::PaymentToOther,
-            }
+            MemoField::open_unchecked(bytes, TxType::PaymentToOther)
         } else {
-            PaymentId::Empty
+            MemoField::new_empty()
         };
 
         let mut transaction_service = self.get_transaction_service();
@@ -768,7 +783,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             Err(err) => {
                 warn!(
                     target: LOG_TARGET,
-                    "Failed to lock transaction for address `{}`: {}", address, err
+                    "Failed to lock transaction for address `{address}`: {err}"
                 );
                 PrepareOneSidedTransactionForSigningResponse {
                     is_success: false,
@@ -802,7 +817,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             Err(err) => {
                 warn!(
                     target: LOG_TARGET,
-                    "Failed to broadcast a signed transaction: {}", err
+                    "Failed to broadcast a signed transaction: {err}"
                 );
                 BroadcastSignedOneSidedTransactionResponse {
                     is_success: false,
@@ -824,7 +839,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .enumerate()
             .map(|(idx, dest)| -> Result<_, String> {
                 let address = TariAddress::from_str(&dest.address)
-                    .map_err(|_| format!("Destination address at index {} is malformed", idx))?;
+                    .map_err(|_| format!("Destination address at index {idx} is malformed"))?;
                 Ok((
                     dest.address,
                     address,
@@ -840,8 +855,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
 
         let mut transfers = Vec::new();
         for (hex_address, address, amount, fee_per_gram, payment_type, user_payment_id, raw_payment_id) in recipients {
+            if payment_type == PaymentType::StandardMimblewimble as i32 {
+                return Err(Status::invalid_argument(
+                    "Standard Mimblewimble transactions are not supported in this method".to_string(),
+                ));
+            }
             let payment_id = if !raw_payment_id.is_empty() {
-                PaymentId::open(raw_payment_id.to_vec(), TxType::PaymentToOther)
+                MemoField::open_unchecked(raw_payment_id.to_vec(), TxType::PaymentToOther)
             } else if let Some(user_pay_id) = user_payment_id {
                 let bytes = match (
                     user_pay_id.u256.is_empty(),
@@ -857,29 +877,15 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         ));
                     },
                 };
-                PaymentId::Open {
-                    user_data: bytes,
-                    tx_type: TxType::PaymentToOther,
-                }
+                MemoField::open_unchecked(bytes, TxType::PaymentToOther)
             } else {
-                PaymentId::Empty
+                MemoField::new_empty()
             };
             let mut transaction_service = self.get_transaction_service();
             transfers.push(async move {
                 (
                     hex_address,
-                    if payment_type == PaymentType::StandardMimblewimble as i32 {
-                        transaction_service
-                            .send_transaction(
-                                address,
-                                amount.into(),
-                                UtxoSelectionCriteria::default(),
-                                OutputFeatures::default(),
-                                fee_per_gram.into(),
-                                payment_id,
-                            )
-                            .await
-                    } else if payment_type == PaymentType::OneSided as i32 {
+                    if payment_type == PaymentType::OneSided as i32 {
                         transaction_service
                             .send_one_sided_transaction(
                                 address,
@@ -915,14 +921,14 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         .wallet
                         .get_wallet_one_sided_address()
                         .await
-                        .map_err(|e| Status::internal(format!("{:?}", e)))?;
+                        .map_err(|e| Status::internal(format!("{e:?}")))?;
                     let wallet_tx = timeout(Duration::from_millis(100), async {
                         loop {
                             let tx = self
                                 .get_transaction_service()
                                 .get_any_transaction(tx_id)
                                 .await
-                                .map_err(|e| Status::internal(format!("{:?}", e)));
+                                .map_err(|e| Status::internal(format!("{e:?}")));
 
                             if let Ok(Some(tx)) = tx {
                                 break tx;
@@ -932,8 +938,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     })
                     .await
                     .map_err(|_| {
-                        error!(target: LOG_TARGET, "Transaction {} not found within timeout", tx_id);
-                        Status::not_found(format!("Transaction {} not found within timeout", tx_id))
+                        error!(target: LOG_TARGET, "Transaction {tx_id} not found within timeout");
+                        Status::not_found(format!("Transaction {tx_id} not found within timeout"))
                     })?;
                     let final_tx = convert_wallet_transaction_into_transaction_info(
                         wallet_tx,
@@ -952,7 +958,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 Err(err) => {
                     warn!(
                         target: LOG_TARGET,
-                        "Failed to send transaction for address `{}`: {}", address, err
+                        "Failed to send transaction for address `{address}`: {err}"
                     );
                     results.push(TransferResult {
                         address,
@@ -981,7 +987,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 message.amount.into(),
                 UtxoSelectionCriteria::default(),
                 message.fee_per_gram.into(),
-                PaymentId::from_bytes(&message.payment_id),
+                MemoField::from_bytes(&message.payment_id),
                 if message.claim_public_key.is_empty() {
                     None
                 } else {
@@ -1002,7 +1008,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .await
         {
             Ok((tx_id, proof)) => {
-                debug!(target: LOG_TARGET, "Transaction broadcast: {}", tx_id,);
+                debug!(target: LOG_TARGET, "Transaction broadcast: {tx_id}",);
                 CreateBurnTransactionResponse {
                     transaction_id: tx_id.as_u64(),
                     is_success: true,
@@ -1014,7 +1020,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 }
             },
             Err(e) => {
-                warn!(target: LOG_TARGET, "Failed to burn Tarid: {}", e);
+                warn!(target: LOG_TARGET, "Failed to burn Tarid: {e}");
                 CreateBurnTransactionResponse {
                     is_success: false,
                     failure_message: e.to_string(),
@@ -1051,7 +1057,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .wallet
             .get_wallet_interactive_address()
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
         let mut transactions = Vec::new();
         for (tx_id, tx) in all_transactions {
             transactions.push(match tx {
@@ -1102,8 +1108,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                                                 };
                                                 send_transaction_event(transaction_event, &mut sender).await;
                                             },
-                                            Err(e) => error!(target: LOG_TARGET, "Transaction service error: {}", e),
-                                            _ => error!(target: LOG_TARGET, "Transaction not found tx_id: {}", tx_id),
+                                            Err(e) => error!(target: LOG_TARGET, "Transaction service error: {e}"),
+                                            _ => error!(target: LOG_TARGET, "Transaction not found tx_id: {tx_id}"),
                                         }
                                     },
                                     TransactionCompletedImmediately(tx_id) => handle_pending_outbound(tx_id, SENT, &mut transaction_service, &mut sender).await,
@@ -1112,7 +1118,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                                         let event = if is_sent { SENT } else { QUEUED };
                                         handle_pending_outbound(tx_id, event, &mut transaction_service, &mut sender).await;
                                     },
-                                    TransactionValidationStateChanged(_t_operation_id) => {
+                                    TransactionValidationStateChanged{..} => {
                                         send_transaction_event(simple_event("unknown"), &mut sender).await;
                                     },
                                     ReceivedTransaction(_) | ReceivedTransactionReply(_)  | TransactionBroadcast(_) => {
@@ -1123,7 +1129,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                                 }
                             },
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                warn!(target: LOG_TARGET, "Missed {} from Transaction events", n);
+                                warn!(target: LOG_TARGET, "Missed {n} from Transaction events");
                             }
                             Err(broadcast::error::RecvError::Closed) => {}
                         }
@@ -1149,7 +1155,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let start = std::time::Instant::now();
         trace!(
             target: LOG_TARGET,
-            "GetAllCompletedTransactions: Incoming GRPC request"
+            "GetCompletedTransactions: Incoming GRPC request"
         );
         let message = request.into_inner();
         let payment_id = if let Some(user_payment_id) = message.payment_id {
@@ -1185,10 +1191,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let transactions = transaction_service
             .get_completed_transactions(payment_id, block_hash, block_height, 0)
             .await
-            .map_err(|err| Status::not_found(format!("No completed transactions found: {:?}", err)))?;
+            .map_err(|err| Status::not_found(format!("No completed transactions found: {err:?}")))?;
         debug!(
             target: LOG_TARGET,
-            "GetAllCompletedTransactions: Found {} completed transactions",
+            "GetCompletedTransactions: Found {} completed transactions",
             transactions.len()
         );
 
@@ -1210,7 +1216,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     .map(|i| match i.commitment() {
                         Ok(c) => c.as_bytes().to_vec(),
                         Err(e) => {
-                            warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
+                            warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
                             vec![]
                         },
                     })
@@ -1230,11 +1236,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         excess_sig: txn
                             .transaction
                             .first_kernel_excess_sig()
-                            .unwrap_or(&Signature::default())
+                            .unwrap_or(&CompressedSignature::default())
                             .get_signature()
                             .to_vec(),
                         raw_payment_id: txn.payment_id.to_bytes(),
-                        user_payment_id: txn.payment_id.user_data_as_bytes(),
+                        user_payment_id: txn.payment_id.payment_id_as_bytes(),
                         mined_in_block_height: txn.mined_height.unwrap_or(0),
                         output_commitments,
                         input_commitments,
@@ -1259,18 +1265,18 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     Ok(_) => {
                         trace!(
                             target: LOG_TARGET,
-                            "GetAllCompletedTransactions: Sent transaction TxId: {} ({} of {})",
+                            "GetCompletedTransactions: Sent transaction TxId: {} ({} of {})",
                             txn.tx_id,
                             i + 1,
                             transactions.len()
                         );
                     },
                     Err(err) => {
-                        warn!(target: LOG_TARGET, "Error sending transaction via GRPC:  {}", err);
+                        warn!(target: LOG_TARGET, "Error sending transaction via GRPC:  {err}");
                         match sender.send(Err(Status::unknown("Error sending data"))).await {
                             Ok(_) => (),
                             Err(send_err) => {
-                                warn!(target: LOG_TARGET, "Error sending error to GRPC client: {}", send_err)
+                                warn!(target: LOG_TARGET, "Error sending error to GRPC client: {send_err}")
                             },
                         }
                         return;
@@ -1283,6 +1289,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         Ok(Response::new(receiver))
     }
 
+    // DEPRECATED: Use get_all_completed_transactions_stream for better performance and memory efficiency
     #[allow(clippy::too_many_lines)]
     async fn get_all_completed_transactions(
         &self,
@@ -1290,114 +1297,320 @@ impl wallet_server::Wallet for WalletGrpcServer {
     ) -> Result<Response<GetAllCompletedTransactionsResponse>, Status> {
         let start = std::time::Instant::now();
         let req = request.into_inner();
+        warn!(
+            target: LOG_TARGET,
+            "GetAllCompletedTransactions: DEPRECATED method called - consider migrating to GetAllCompletedTransactionsStream for better performance"
+        );
         trace!(
             target: LOG_TARGET,
             "GetAllCompletedTransactions: Incoming GRPC request"
         );
         let mut transaction_service = self.get_transaction_service();
 
-        let mut completed_transactions = transaction_service
-            .get_completed_transactions(None, None, None, 0)
-            .await
-            .map_err(|err| {
-                Status::not_found(format!(
-                    "GetAllCompletedTransactions: Error found for get_completed_transactions: {:?}",
-                    err
-                ))
-            })?;
-        completed_transactions.extend(
-            transaction_service
-                .get_cancelled_completed_transactions(0)
+        let status_filter = if req.status_bitflag == 0 {
+            None
+        } else {
+            Some(req.status_bitflag)
+        };
+
+        let total_requested = req.limit;
+        let chunk_size = std::cmp::min(total_requested, 100); // Process in chunks of 100
+        let mut all_transactions: Vec<TransactionInfo> =
+            Vec::with_capacity(total_requested.try_into().unwrap_or(usize::MAX));
+        let mut current_offset = req.offset;
+        let mut remaining = total_requested;
+
+        // Stream data in chunks to reduce memory usage
+        while remaining > 0 {
+            let current_limit = std::cmp::min(remaining, chunk_size);
+
+            let chunk_transactions = transaction_service
+                .get_completed_transactions_paginated(current_offset, current_limit, status_filter)
                 .await
                 .map_err(|err| {
                     Status::not_found(format!(
-                        "GetAllCompletedTransactions: Error found for get_cancelled_completed_transactions: {:?}",
-                        err
+                        "GetAllCompletedTransactions: Error found for get_completed_transactions_paginated: {err:?}"
                     ))
-                })?,
-        );
+                })?;
 
-        completed_transactions.sort_by(|a, b| {
-            b.timestamp
-                .partial_cmp(&a.timestamp)
-                .expect("Should be able to compare timestamps")
-        });
+            // Break if we get no more results
+            if chunk_transactions.is_empty() {
+                break;
+            }
 
-        let offset = usize::try_from(req.offset).unwrap_or(0);
-        let limit = if req.limit > 0 {
-            usize::try_from(req.limit).unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
-        let mut transactions: Vec<TransactionInfo> = Vec::new();
-        for txn in completed_transactions
-            .into_iter()
-            .filter(|tx| req.status_bitflag == 0 || (req.status_bitflag & (1 << (tx.status as u32))) != 0)
-            .skip(offset)
-            .take(limit)
-        {
-            let output_commitments: Vec<Vec<u8>> = txn
-                .transaction
-                .body
-                .outputs()
-                .iter()
-                .map(|o| o.commitment().as_bytes().to_vec())
-                .collect();
-            let input_commitments: Vec<Vec<u8>> = txn
-                .transaction
-                .body
-                .inputs()
-                .iter()
-                .map(|i| match i.commitment() {
-                    Ok(c) => c.as_bytes().to_vec(),
-                    Err(e) => {
-                        warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
-                        vec![]
-                    },
-                })
-                .collect();
-
-            transactions.push(TransactionInfo {
-                tx_id: txn.tx_id.into(),
-                source_address: txn.source_address.to_vec(),
-                dest_address: txn.destination_address.to_vec(),
-                status: TransactionStatus::from(txn.status) as i32,
-                amount: txn.amount.into(),
-                is_cancelled: txn.cancelled.is_some(),
-                direction: TransactionDirection::from(txn.direction) as i32,
-                fee: txn.fee.into(),
-                timestamp: txn.timestamp.timestamp() as u64,
-                excess_sig: txn
+            // Process this chunk
+            for txn in chunk_transactions {
+                let output_commitments: Vec<Vec<u8>> = txn
                     .transaction
-                    .first_kernel_excess_sig()
-                    .unwrap_or(&Signature::default())
-                    .get_signature()
-                    .to_vec(),
-                raw_payment_id: txn.payment_id.to_bytes(),
-                user_payment_id: txn.payment_id.user_data_as_bytes(),
-                mined_in_block_height: txn.mined_height.unwrap_or(0),
-                output_commitments,
-                input_commitments,
-                payment_references_sent: txn
-                    .calculate_sent_payment_references()
-                    .into_iter()
-                    .map(|pr| pr.to_vec())
-                    .collect(),
-                payment_references_received: txn
-                    .calculate_received_payment_references()
-                    .into_iter()
-                    .map(|pr| pr.to_vec())
-                    .collect(),
-                payment_references_change: txn
-                    .calculate_change_payment_references()
-                    .into_iter()
-                    .map(|pr| pr.to_vec())
-                    .collect(),
-            });
+                    .body
+                    .outputs()
+                    .iter()
+                    .map(|o| o.commitment().as_bytes().to_vec())
+                    .collect();
+                let input_commitments: Vec<Vec<u8>> = txn
+                    .transaction
+                    .body
+                    .inputs()
+                    .iter()
+                    .map(|i| match i.commitment() {
+                        Ok(c) => c.as_bytes().to_vec(),
+                        Err(e) => {
+                            warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
+                            vec![]
+                        },
+                    })
+                    .collect();
+
+                all_transactions.push(TransactionInfo {
+                    tx_id: txn.tx_id.into(),
+                    source_address: txn.source_address.to_vec(),
+                    dest_address: txn.destination_address.to_vec(),
+                    status: TransactionStatus::from(txn.status) as i32,
+                    amount: txn.amount.into(),
+                    is_cancelled: txn.cancelled.is_some(),
+                    direction: TransactionDirection::from(txn.direction) as i32,
+                    fee: txn.fee.into(),
+                    timestamp: txn.timestamp.timestamp() as u64,
+                    excess_sig: txn
+                        .transaction
+                        .first_kernel_excess_sig()
+                        .unwrap_or(&CompressedSignature::default())
+                        .get_signature()
+                        .to_vec(),
+                    raw_payment_id: txn.payment_id.to_bytes(),
+                    user_payment_id: txn.payment_id.payment_id_as_bytes(),
+                    mined_in_block_height: txn.mined_height.unwrap_or(0),
+                    output_commitments,
+                    input_commitments,
+                    payment_references_sent: txn
+                        .calculate_sent_payment_references()
+                        .into_iter()
+                        .map(|pr| pr.to_vec())
+                        .collect(),
+                    payment_references_received: txn
+                        .calculate_received_payment_references()
+                        .into_iter()
+                        .map(|pr| pr.to_vec())
+                        .collect(),
+                    payment_references_change: txn
+                        .calculate_change_payment_references()
+                        .into_iter()
+                        .map(|pr| pr.to_vec())
+                        .collect(),
+                });
+            }
+
+            // Update for next iteration
+            current_offset += current_limit;
+            remaining -= current_limit;
         }
 
+        debug!(
+            target: LOG_TARGET,
+            "GetAllCompletedTransactions: Processed {} transactions in chunks",
+            all_transactions.len()
+        );
+
         trace!(target: LOG_TARGET, "'GetAllCompletedTransactions' completed in {:.2?}", start.elapsed());
-        Ok(Response::new(GetAllCompletedTransactionsResponse { transactions }))
+        Ok(Response::new(GetAllCompletedTransactionsResponse {
+            transactions: all_transactions,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_all_completed_transactions_stream(
+        &self,
+        request: Request<GetAllCompletedTransactionsRequest>,
+    ) -> Result<Response<Self::GetAllCompletedTransactionsStreamStream>, Status> {
+        let start = std::time::Instant::now();
+        let req = request.into_inner();
+
+        trace!(
+            target: LOG_TARGET,
+            "GetAllCompletedTransactionsStreaming: Incoming GRPC request with offset={}, limit={}, status_bitflag={}",
+            req.offset,
+            req.limit,
+            req.status_bitflag
+        );
+
+        let status_filter = if req.status_bitflag == 0 {
+            None
+        } else {
+            Some(req.status_bitflag)
+        };
+
+        // Streaming parameters - smaller chunks for better responsiveness
+        let total_requested = req.limit;
+        let chunk_size = std::cmp::min(total_requested, 50);
+
+        // Create GRPC streaming channel
+        let buffer_size: usize = std::cmp::min(chunk_size, 10).try_into().unwrap_or(50);
+        let (mut sender, receiver) = mpsc::channel(buffer_size);
+
+        // Clone transaction service handle for async task
+        let mut transaction_service = self.get_transaction_service();
+
+        // Spawn async task to stream data
+        task::spawn(async move {
+            let mut current_offset = req.offset;
+            let mut remaining = total_requested;
+            let mut total_sent = 0u64;
+
+            debug!(
+                target: LOG_TARGET,
+                "GetAllCompletedTransactionsStreaming: Starting to stream {total_requested} transactions in chunks of {chunk_size}"
+            );
+
+            while remaining > 0 {
+                let current_limit = std::cmp::min(remaining, chunk_size);
+
+                trace!(
+                    target: LOG_TARGET,
+                    "GetAllCompletedTransactionsStreaming: Fetching chunk at offset={current_offset}, limit={current_limit}"
+                );
+
+                // Fetch chunk from database
+                let chunk_transactions = match transaction_service
+                    .get_completed_transactions_paginated(current_offset, current_limit, status_filter)
+                    .await
+                {
+                    Ok(transactions) => transactions,
+                    Err(err) => {
+                        warn!(
+                            target: LOG_TARGET,
+                            "GetAllCompletedTransactionsStreaming: Database error: {err:?}"
+                        );
+                        let _ = sender
+                            .send(Err(Status::internal(format!(
+                                "Database error while fetching transactions: {err:?}"
+                            ))))
+                            .await;
+                        return;
+                    },
+                };
+
+                // Break if no more results
+                if chunk_transactions.is_empty() {
+                    debug!(
+                        target: LOG_TARGET,
+                        "GetAllCompletedTransactionsStreaming: No more transactions found, ending stream"
+                    );
+                    break;
+                }
+
+                // Process and stream each transaction
+                for txn in chunk_transactions {
+                    let output_commitments: Vec<Vec<u8>> = txn
+                        .transaction
+                        .body
+                        .outputs()
+                        .iter()
+                        .map(|o| o.commitment().as_bytes().to_vec())
+                        .collect();
+
+                    let input_commitments: Vec<Vec<u8>> = txn
+                        .transaction
+                        .body
+                        .inputs()
+                        .iter()
+                        .map(|i| match i.commitment() {
+                            Ok(c) => c.as_bytes().to_vec(),
+                            Err(e) => {
+                                warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
+                                vec![]
+                            },
+                        })
+                        .collect();
+
+                    let transaction_info = TransactionInfo {
+                        tx_id: txn.tx_id.into(),
+                        source_address: txn.source_address.to_vec(),
+                        dest_address: txn.destination_address.to_vec(),
+                        status: TransactionStatus::from(txn.status) as i32,
+                        amount: txn.amount.into(),
+                        is_cancelled: txn.cancelled.is_some(),
+                        direction: TransactionDirection::from(txn.direction) as i32,
+                        fee: txn.fee.into(),
+                        timestamp: txn.timestamp.timestamp() as u64,
+                        excess_sig: txn
+                            .transaction
+                            .first_kernel_excess_sig()
+                            .unwrap_or(&CompressedSignature::default())
+                            .get_signature()
+                            .to_vec(),
+                        raw_payment_id: txn.payment_id.to_bytes(),
+                        user_payment_id: txn.payment_id.payment_id_as_bytes(),
+                        mined_in_block_height: txn.mined_height.unwrap_or(0),
+                        output_commitments,
+                        input_commitments,
+                        payment_references_sent: txn
+                            .calculate_sent_payment_references()
+                            .into_iter()
+                            .map(|pr| pr.to_vec())
+                            .collect(),
+                        payment_references_received: txn
+                            .calculate_received_payment_references()
+                            .into_iter()
+                            .map(|pr| pr.to_vec())
+                            .collect(),
+                        payment_references_change: txn
+                            .calculate_change_payment_references()
+                            .into_iter()
+                            .map(|pr| pr.to_vec())
+                            .collect(),
+                    };
+
+                    let response = GetCompletedTransactionsResponse {
+                        transaction: Some(transaction_info),
+                    };
+
+                    // Stream the transaction
+                    match sender.send(Ok(response)).await {
+                        Ok(_) => {
+                            total_sent += 1;
+                            trace!(
+                                target: LOG_TARGET,
+                                "GetAllCompletedTransactionsStreaming: Sent transaction TxId: {} ({} of {})",
+                                txn.tx_id,
+                                total_sent,
+                                total_requested
+                            );
+                        },
+                        Err(_) => {
+                            warn!(
+                                target: LOG_TARGET,
+                                "GetAllCompletedTransactionsStreaming: Stream closed by client"
+                            );
+                            return;
+                        },
+                    }
+                }
+
+                // Update for next iteration
+                current_offset += current_limit;
+                remaining = remaining.saturating_sub(current_limit);
+
+                trace!(
+                    target: LOG_TARGET,
+                    "GetAllCompletedTransactionsStreaming: Completed chunk, remaining={remaining}"
+                );
+            }
+
+            debug!(
+                target: LOG_TARGET,
+                "GetAllCompletedTransactionsStreaming: Completed. Sent {} transactions in {:.2?}",
+                total_sent,
+                start.elapsed()
+            );
+        });
+
+        trace!(
+            target: LOG_TARGET,
+            "GetAllCompletedTransactionsStreaming: Setup completed in {:.2?}",
+            start.elapsed()
+        );
+
+        Ok(Response::new(receiver))
     }
 
     async fn get_block_height_transactions(
@@ -1418,8 +1631,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .await
             .map_err(|err| {
                 Status::not_found(format!(
-                    "GetBlockHeightTransactions: Error found at block height {}: {:?}",
-                    block_height, err
+                    "GetBlockHeightTransactions: Error found at block height {block_height}: {err:?}"
                 ))
             })?;
         debug!(
@@ -1446,7 +1658,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 .map(|i| match i.commitment() {
                     Ok(c) => c.as_bytes().to_vec(),
                     Err(e) => {
-                        warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
+                        warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
                         vec![]
                     },
                 })
@@ -1465,11 +1677,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 excess_sig: txn
                     .transaction
                     .first_kernel_excess_sig()
-                    .unwrap_or(&Signature::default())
+                    .unwrap_or(&CompressedSignature::default())
                     .get_signature()
                     .to_vec(),
                 raw_payment_id: txn.payment_id.to_bytes(),
-                user_payment_id: txn.payment_id.user_data_as_bytes(),
+                user_payment_id: txn.payment_id.payment_id_as_bytes(),
                 mined_in_block_height: txn.mined_height.unwrap_or(0),
                 output_commitments,
                 input_commitments,
@@ -1510,10 +1722,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 usize::try_from(message.split_count)
                     .map_err(|_| Status::internal("Count not convert u64 to usize".to_string()))?,
                 MicroMinotari::from(message.fee_per_gram),
-                PaymentId::open_from_string("Creating coin-split transaction", TxType::CoinSplit),
+                MemoField::open_from_string("Creating coin-split transaction", TxType::CoinSplit),
             )
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
 
         Ok(Response::new(CoinSplitResponse { tx_id: tx_id.into() }))
     }
@@ -1540,10 +1752,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     .import_unblinded_output_as_non_rewindable(
                         o.clone(),
                         TariAddress::default(),
-                        PaymentId::from_bytes(&message.payment_id),
+                        MemoField::from_bytes(&message.payment_id),
                     )
                     .await
-                    .map_err(|e| Status::internal(format!("{:?}", e)))?
+                    .map_err(|e| Status::internal(format!("{e:?}")))?
                     .into(),
             );
         }
@@ -1602,8 +1814,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
             let mut error_response = Vec::new();
             node_ids.iter().for_each(|node_id| {
                 if !peers.iter().any(|p| p.node_id == *node_id) {
-                    warn!(target: LOG_TARGET, "Peer '{}' not found", node_id);
-                    error_response.push(format!("'{}'", node_id));
+                    warn!(target: LOG_TARGET, "Peer '{node_id}' not found");
+                    error_response.push(format!("'{node_id}'"));
                 }
             });
             if !error_response.is_empty() {
@@ -1733,7 +1945,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         };
 
         let constants = self.get_consensus_constants().map_err(|e| {
-            error!(target: LOG_TARGET, "Failed to get consensus constants: {}", e);
+            error!(target: LOG_TARGET, "Failed to get consensus constants: {e}");
             Status::internal("failed to fetch consensus constants")
         })?;
 
@@ -1747,7 +1959,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 request.max_epoch.into(),
                 UtxoSelectionCriteria::default(),
                 request.fee_per_gram.into(),
-                PaymentId::from_bytes(&request.payment_id),
+                MemoField::from_bytes(&request.payment_id),
             )
             .await
         {
@@ -1757,7 +1969,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 failure_message: Default::default(),
             },
             Err(e) => {
-                error!(target: LOG_TARGET, "Transaction service error: {}", e);
+                error!(target: LOG_TARGET, "Transaction service error: {e}");
                 RegisterValidatorNodeResponse {
                     transaction_id: Default::default(),
                     is_success: false,
@@ -1792,7 +2004,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         };
 
         let constants = self.get_consensus_constants().map_err(|e| {
-            error!(target: LOG_TARGET, "Failed to get consensus constants: {}", e);
+            error!(target: LOG_TARGET, "Failed to get consensus constants: {e}");
             Status::internal("failed to fetch consensus constants")
         })?;
 
@@ -1805,11 +2017,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 request.max_epoch.into(),
                 UtxoSelectionCriteria::default(),
                 request.fee_per_gram.into(),
-                PaymentId::Open {
-                    // TODO: should this be its own TxType?
-                    tx_type: TxType::PaymentToSelf,
-                    user_data: request.message,
-                },
+                MemoField::open_unchecked(request.message, TxType::PaymentToSelf),
             )
             .await
         {
@@ -1819,7 +2027,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 failure_message: Default::default(),
             },
             Err(e) => {
-                error!(target: LOG_TARGET, "Transaction service error: {}", e);
+                error!(target: LOG_TARGET, "Transaction service error: {e}");
                 SubmitValidatorNodeExitResponse {
                     transaction_id: Default::default(),
                     is_success: false,
@@ -1848,12 +2056,12 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .map(TryInto::try_into)
             .ok_or_else(|| Status::invalid_argument("Proof is missing"))?
             .map_err(|e| {
-                error!(target: LOG_TARGET, "Failed to convert proof: {}", e);
+                error!(target: LOG_TARGET, "Failed to convert proof: {e}");
                 Status::invalid_argument(format!("Invalid proof: {e}"))
             })?;
 
         let constants = self.get_consensus_constants().map_err(|e| {
-            error!(target: LOG_TARGET, "Failed to get consensus constants: {}", e);
+            error!(target: LOG_TARGET, "Failed to get consensus constants: {e}");
             Status::internal("failed to fetch consensus constants")
         })?;
 
@@ -1863,16 +2071,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 proof,
                 request.fee_per_gram.into(),
                 sidechain_key,
-                PaymentId::Open {
-                    user_data: request.message.into_bytes(),
-                    tx_type: TxType::PaymentToSelf,
-                },
+                MemoField::open_unchecked(request.message.into_bytes(), TxType::PaymentToSelf),
             )
             .await
         {
             Ok(tx) => SubmitValidatorEvictionProofResponse { tx_id: tx.as_u64() },
             Err(e) => {
-                error!(target: LOG_TARGET, "Transaction service error: {}", e);
+                error!(target: LOG_TARGET, "Transaction service error: {e}");
                 return Err(Status::unknown(e.to_string()));
             },
         };
@@ -1895,7 +2100,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 Ok(id) => {
                     tx_ids.push(id.into());
                 },
-                Err(e) => eprintln!("Could not import tx {}", e),
+                Err(e) => eprintln!("Could not import tx {e}"),
             };
         }
         Ok(Response::new(ImportTransactionsResponse { tx_ids }))
@@ -1941,7 +2146,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     .map(|i| match i.commitment() {
                         Ok(c) => c.as_bytes().to_vec(),
                         Err(e) => {
-                            warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
+                            warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
                             vec![]
                         },
                     })
@@ -1959,11 +2164,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     excess_sig: txn
                         .transaction
                         .first_kernel_excess_sig()
-                        .unwrap_or(&Signature::default())
+                        .unwrap_or(&CompressedSignature::default())
                         .get_signature()
                         .to_vec(),
                     raw_payment_id: txn.payment_id.to_bytes(),
-                    user_payment_id: txn.payment_id.user_data_as_bytes(),
+                    user_payment_id: txn.payment_id.payment_id_as_bytes(),
                     mined_in_block_height: txn.mined_height.unwrap_or(0),
                     output_commitments,
                     input_commitments,
@@ -1994,7 +2199,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     payment_ref.to_hex(),
                     e
                 );
-                Err(Status::internal(format!("Error looking up payment reference: {}", e)))
+                Err(Status::internal(format!("Error looking up payment reference: {e}")))
             },
         }
     }
@@ -2143,7 +2348,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .map(|(index, transfer_with_id)| -> Result<_, String> {
                 let dest = transfer_with_id.destination;
                 let address = TariAddress::from_str(&dest)
-                    .map_err(|_| format!("Destination address at index {} is malformed", index))?;
+                    .map_err(|_| format!("Destination address at index {index} is malformed"))?;
                 Ok((address, transfer_with_id.fee, transfer_with_id.tx_id))
             })
             .collect::<Result<Vec<_>, _>>()
@@ -2172,14 +2377,14 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         .wallet
                         .get_wallet_one_sided_address()
                         .await
-                        .map_err(|e| Status::internal(format!("{:?}", e)))?;
+                        .map_err(|e| Status::internal(format!("{e:?}")))?;
                     let wallet_tx = timeout(Duration::from_millis(100), async {
                         loop {
                             let tx = self
                                 .get_transaction_service()
                                 .get_any_transaction(tx_id)
                                 .await
-                                .map_err(|e| Status::internal(format!("{:?}", e)));
+                                .map_err(|e| Status::internal(format!("{e:?}")));
 
                             if let Ok(Some(tx)) = tx {
                                 break tx;
@@ -2189,8 +2394,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     })
                     .await
                     .map_err(|_| {
-                        error!(target: LOG_TARGET, "Transaction {} not found within timeout", tx_id);
-                        Status::not_found(format!("Transaction {} not found within timeout", tx_id))
+                        error!(target: LOG_TARGET, "Transaction {tx_id} not found within timeout");
+                        Status::not_found(format!("Transaction {tx_id} not found within timeout"))
                     })?;
                     let final_tx = convert_wallet_transaction_into_transaction_info(
                         wallet_tx,
@@ -2209,7 +2414,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 Err(err) => {
                     warn!(
                         target: LOG_TARGET,
-                        "Failed to send transaction for address `{}`: {}", address, err
+                        "Failed to send transaction for address `{address}`: {err}"
                     );
                     results.push(TransferResult {
                         address: address.to_string(),
@@ -2233,7 +2438,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let tx_id = transaction_service
             .replace_by_fee(request.transaction_id.into(), MicroMinotari::from(request.fee_increase))
             .await
-            .map_err(|e| Status::internal(format!("Failed to replace by fee: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to replace by fee: {e}")))?;
         Ok(Response::new(ReplaceByFeeResponse {
             transaction_id: tx_id.into(),
         }))
@@ -2256,7 +2461,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
 
         let signature =
             SignatureWithDomain::<WalletMessageSigningDomain>::sign(&secret, message_str.as_bytes(), &mut OsRng)
-                .map_err(|e| Status::internal(format!("Failed to sign message: {}", e)))?;
+                .map_err(|e| Status::internal(format!("Failed to sign message: {e}")))?;
 
         let hex_sig = signature.get_signature().to_hex();
         let hex_nonce = signature.get_public_nonce().to_hex();
@@ -2280,7 +2485,7 @@ async fn handle_completed_tx(
                 convert_to_transaction_event(event.to_string(), TransactionWrapper::Completed(Box::new(completed)));
             send_transaction_event(transaction_event, sender).await;
         },
-        Err(e) => error!(target: LOG_TARGET, "Transaction service error: {}", e),
+        Err(e) => error!(target: LOG_TARGET, "Transaction service error: {e}"),
     }
 }
 
@@ -2299,10 +2504,10 @@ async fn handle_pending_outbound(
                 send_transaction_event(transaction_event, sender).await;
             },
             _ => {
-                error!(target: LOG_TARGET, "Not found in pending outbound set tx_id: {}", tx_id);
+                error!(target: LOG_TARGET, "Not found in pending outbound set tx_id: {tx_id}");
             },
         },
-        Err(e) => error!(target: LOG_TARGET, "Transaction service error: {}", e),
+        Err(e) => error!(target: LOG_TARGET, "Transaction service error: {e}"),
     }
 }
 
@@ -2345,7 +2550,7 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
                 excess_sig: Default::default(),
                 timestamp: tx.timestamp.timestamp() as u64,
                 raw_payment_id: tx.payment_id.to_bytes(),
-                user_payment_id: tx.payment_id.user_data_as_bytes(),
+                user_payment_id: tx.payment_id.payment_id_as_bytes(),
                 mined_in_block_height: 0,
                 output_commitments,
                 input_commitments: vec![],
@@ -2358,14 +2563,14 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
             let output_commitments = match tx.sender_protocol.get_output_commitments(key_manager).await {
                 Ok(v) => v.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
                 Err(e) => {
-                    warn!(target: LOG_TARGET, "Failed to get output commitments: {}", e);
+                    warn!(target: LOG_TARGET, "Failed to get output commitments: {e}");
                     vec![]
                 },
             };
             let input_commitments = match tx.sender_protocol.get_input_commitments(key_manager).await {
                 Ok(v) => v.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
                 Err(e) => {
-                    warn!(target: LOG_TARGET, "Failed to get output commitments: {}", e);
+                    warn!(target: LOG_TARGET, "Failed to get output commitments: {e}");
                     vec![]
                 },
             };
@@ -2381,7 +2586,7 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
                 excess_sig: Default::default(),
                 timestamp: tx.timestamp.timestamp() as u64,
                 raw_payment_id: tx.payment_id.to_bytes(),
-                user_payment_id: tx.payment_id.user_data_as_bytes(),
+                user_payment_id: tx.payment_id.payment_id_as_bytes(),
                 mined_in_block_height: 0,
                 output_commitments,
                 input_commitments,
@@ -2406,7 +2611,7 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
                 .map(|i| match i.commitment() {
                     Ok(c) => c.as_bytes().to_vec(),
                     Err(e) => {
-                        warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
+                        warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
                         vec![]
                     },
                 })
@@ -2427,7 +2632,7 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
                     .map(|s| s.get_signature().to_vec())
                     .unwrap_or_default(),
                 raw_payment_id: tx.payment_id.to_bytes(),
-                user_payment_id: tx.payment_id.user_data_as_bytes(),
+                user_payment_id: tx.payment_id.payment_id_as_bytes(),
                 mined_in_block_height: tx.mined_height.unwrap_or(0),
                 output_commitments: output_commitments.clone(),
                 input_commitments,

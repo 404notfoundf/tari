@@ -54,9 +54,9 @@ use tari_common_types::{
         TransactionStatus,
         TxId,
     },
-    types::{BlockHash, CompressedPublicKey, FixedHash, PrivateKey, Signature},
+    types::{BlockHash, CompressedPublicKey, CompressedSignature, FixedHash, PrivateKey},
 };
-use tari_core::transactions::{tari_amount::MicroMinotari, transaction_components::payment_id::PaymentId};
+use tari_transaction_components::{transaction_components::MemoField, MicroMinotari};
 use tari_utilities::{hex::Hex, ByteArray, Hidden};
 use thiserror::Error;
 use tokio::time::Instant;
@@ -978,7 +978,7 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
                 completed_transactions::mined_in_block.eq::<Option<Vec<u8>>>(None),
             ))
             .execute(&mut conn)?;
-        trace!(target: LOG_TARGET, "rows updated: {:?}", result);
+        trace!(target: LOG_TARGET, "rows updated: {result:?}");
         if start.elapsed().as_millis() > 0 {
             trace!(
                 target: LOG_TARGET,
@@ -1005,7 +1005,7 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
                 completed_transactions::mined_in_block.eq::<Option<Vec<u8>>>(None),
             ))
             .execute(&mut conn)?;
-        trace!(target: LOG_TARGET, "rows updated: {:?}", result);
+        trace!(target: LOG_TARGET, "rows updated: {result:?}");
         // we want to double check unmined coinbases again, so lets set those
         let result = diesel::update(completed_transactions::table)
             .filter(completed_transactions::status.eq(TransactionStatus::CoinbaseNotInBlockChain as i32))
@@ -1015,7 +1015,7 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
                 completed_transactions::status.eq(TransactionStatus::CoinbaseUnconfirmed as i32),
             ))
             .execute(&mut conn)?;
-        trace!(target: LOG_TARGET, "rows updated: {:?}", result);
+        trace!(target: LOG_TARGET, "rows updated: {result:?}");
         if start.elapsed().as_millis() > 0 {
             trace!(
                 target: LOG_TARGET,
@@ -1240,6 +1240,50 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
             Err(e) => return Err(e),
         };
         Ok(tx)
+    }
+
+    fn find_completed_transactions_paginated(
+        &self,
+        offset: u64,
+        limit: u64,
+        status_filter: Option<u64>,
+    ) -> Result<Vec<CompletedTransaction>, TransactionStorageError> {
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        let cipher = acquire_read_lock!(self.cipher);
+
+        use diesel::prelude::*;
+
+        let mut query = completed_transactions::table.into_boxed();
+
+        // Apply status filter if provided
+        if let Some(status_bitflag) = status_filter {
+            if status_bitflag != 0 {
+                // Build a vector of status values to filter by
+                let mut status_values: Vec<i32> = Vec::new();
+
+                for i in 0..32 {
+                    let status_bit = 1u64 << i;
+                    if (status_bitflag & status_bit) != 0 {
+                        status_values.push(i);
+                    }
+                }
+
+                if !status_values.is_empty() {
+                    query = query.filter(completed_transactions::status.eq_any(status_values));
+                }
+            }
+        }
+
+        query
+            .order(completed_transactions::timestamp.desc())
+            .offset(offset as i64)
+            .limit(limit as i64)
+            .load::<CompletedTransactionSql>(&mut conn)?
+            .into_iter()
+            .map(|ct: CompletedTransactionSql| {
+                CompletedTransaction::try_from(ct, &cipher).map_err(TransactionStorageError::from)
+            })
+            .collect::<Result<Vec<CompletedTransaction>, TransactionStorageError>>()
     }
 
     fn fetch_confirmed_detected_transactions_from_height(
@@ -1502,7 +1546,7 @@ impl InboundTransactionSql {
     fn try_from(i: InboundTransaction, cipher: &XChaCha20Poly1305) -> Result<Self, TransactionStorageError> {
         let receiver_protocol_bytes = bincode::serialize(&i.receiver_protocol)
             .map_err(|e| TransactionStorageError::BincodeSerialize(e.to_string()))?;
-        let user_payment_id = i.payment_id.user_data_as_bytes();
+        let user_payment_id = i.payment_id.payment_id_as_bytes();
         let user_payment_id = if user_payment_id.is_empty() {
             None
         } else {
@@ -1570,7 +1614,7 @@ impl InboundTransaction {
             direct_send_success: i.direct_send_success != 0,
             send_count: i.send_count as u32,
             last_send_timestamp: i.last_send_timestamp.map(|t| t.and_utc()),
-            payment_id: PaymentId::from_bytes(&i.payment_id.unwrap_or_default()),
+            payment_id: MemoField::from_bytes(&i.payment_id.unwrap_or_default()),
             received_output_hashes: bytes_to_fixedhash_vec(&i.received_output_hashes.unwrap_or_default()),
         })
     }
@@ -1762,7 +1806,7 @@ impl OutboundTransactionSql {
     fn try_from(o: OutboundTransaction, cipher: &XChaCha20Poly1305) -> Result<Self, TransactionStorageError> {
         let sender_protocol_bytes = bincode::serialize(&o.sender_protocol)
             .map_err(|e| TransactionStorageError::BincodeSerialize(e.to_string()))?;
-        let user_payment_id = o.payment_id.user_data_as_bytes();
+        let user_payment_id = o.payment_id.payment_id_as_bytes();
         let user_payment_id = if user_payment_id.is_empty() {
             None
         } else {
@@ -1833,7 +1877,7 @@ impl OutboundTransaction {
             direct_send_success: o.direct_send_success != 0,
             send_count: o.send_count as u32,
             last_send_timestamp: o.last_send_timestamp.map(|t| t.and_utc()),
-            payment_id: PaymentId::from_bytes(&o.payment_id.unwrap_or_default()),
+            payment_id: MemoField::from_bytes(&o.payment_id.unwrap_or_default()),
             sent_output_hashes: bytes_to_fixedhash_vec(&o.sent_output_hashes.unwrap_or_default()),
         };
 
@@ -2101,8 +2145,7 @@ impl CompletedTransactionSql {
 
         let timestamp = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0).ok_or_else(|| {
             TransactionStorageError::UnexpectedResult(format!(
-                "Could not create timestamp mined_timestamp: {}",
-                mined_timestamp
+                "Could not create timestamp mined_timestamp: {mined_timestamp}"
             ))
         })?;
         trace!(
@@ -2259,7 +2302,7 @@ impl CompletedTransactionSql {
     fn try_from(c: CompletedTransaction, cipher: &XChaCha20Poly1305) -> Result<Self, TransactionStorageError> {
         let transaction_bytes =
             bincode::serialize(&c.transaction).map_err(|e| TransactionStorageError::BincodeSerialize(e.to_string()))?;
-        let user_payment_id = c.payment_id.user_data_as_bytes();
+        let user_payment_id = c.payment_id.payment_id_as_bytes();
         let user_payment_id = if user_payment_id.is_empty() {
             None
         } else {
@@ -2350,10 +2393,10 @@ impl CompletedTransaction {
             .map_err(CompletedTransactionConversionError::AeadError)?;
         let transaction_signature = match CompressedPublicKey::from_vec(&c.transaction_signature_nonce) {
             Ok(public_nonce) => match PrivateKey::from_vec(&c.transaction_signature_key) {
-                Ok(signature) => Signature::new(public_nonce, signature),
-                Err(_) => Signature::default(),
+                Ok(signature) => CompressedSignature::new(public_nonce, signature),
+                Err(_) => CompressedSignature::default(),
             },
-            Err(_) => Signature::default(),
+            Err(_) => CompressedSignature::default(),
         };
         let mined_in_block = match c.mined_in_block {
             Some(v) => v.try_into().ok(),
@@ -2381,7 +2424,7 @@ impl CompletedTransaction {
             mined_height: c.mined_height.map(|ic| ic as u64),
             mined_in_block,
             mined_timestamp: c.mined_timestamp.map(|t| t.and_utc()),
-            payment_id: PaymentId::from_bytes(&c.payment_id.unwrap_or_default()),
+            payment_id: MemoField::from_bytes(&c.payment_id.unwrap_or_default()),
             sent_output_hashes: bytes_to_fixedhash_vec(&c.sent_output_hashes.unwrap_or_default()),
             received_output_hashes: bytes_to_fixedhash_vec(&c.received_output_hashes.unwrap_or_default()),
             change_output_hashes: bytes_to_fixedhash_vec(&c.change_output_hashes.unwrap_or_default()),
@@ -2418,9 +2461,9 @@ pub struct UpdateCompletedTransactionSql {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnconfirmedTransactionInfo {
     pub tx_id: TxId,
-    pub signature: Signature,
+    pub signature: CompressedSignature,
     pub status: TransactionStatus,
-    pub payment_id: PaymentId,
+    pub payment_id: MemoField,
 }
 
 impl TryFrom<UnconfirmedTransactionInfoSql> for UnconfirmedTransactionInfo {
@@ -2429,12 +2472,12 @@ impl TryFrom<UnconfirmedTransactionInfoSql> for UnconfirmedTransactionInfo {
     fn try_from(i: UnconfirmedTransactionInfoSql) -> Result<Self, Self::Error> {
         Ok(Self {
             tx_id: (i.tx_id as u64).into(),
-            signature: Signature::new(
+            signature: CompressedSignature::new(
                 CompressedPublicKey::from_vec(&i.transaction_signature_nonce)?,
                 PrivateKey::from_vec(&i.transaction_signature_key)?,
             ),
             status: TransactionStatus::try_from(i.status)?,
-            payment_id: PaymentId::from_bytes(&i.payment_id.unwrap_or_default()),
+            payment_id: MemoField::from_bytes(&i.payment_id.unwrap_or_default()),
         })
     }
 }
@@ -2558,27 +2601,26 @@ mod test {
         encryption::Encryptable,
         tari_address::TariAddress,
         transaction::{TransactionDirection, TransactionStatus, TxId},
-        types::{CompressedPublicKey, PrivateKey, Signature},
+        types::{CompressedPublicKey, CompressedSignature, PrivateKey},
     };
-    use tari_core::transactions::{
-        tari_amount::MicroMinotari,
+    use tari_crypto::keys::SecretKey as SecretKeyTrait;
+    use tari_script::script;
+    use tari_test_utils::random::string;
+    use tari_transaction_components::{
         test_helpers::{create_wallet_output_with_data, TestParams},
+        transaction_builder::TransactionBuilder,
         transaction_components::{
-            payment_id::{PaymentId, TxType},
+            memo_field::{MemoField, TxType},
             OutputFeatures,
             Transaction,
         },
-        transaction_key_manager::create_memory_db_key_manager,
-        transaction_protocol::sender::TransactionSenderMessage,
-        ReceiverTransactionProtocol,
-        SenderTransactionProtocol,
+        MicroMinotari,
     };
-    use tari_crypto::keys::SecretKey as SecretKeyTrait;
-    use tari_script::{inputs, script};
-    use tari_test_utils::random::string;
+    use tari_transaction_key_manager::create_memory_db_key_manager;
     use tempfile::tempdir;
 
     use crate::{
+        legacy_transaction_protocol::{ReceiverTransactionProtocol, SenderTransactionProtocol},
         storage::sqlite_utilities::wallet_db_connection::WalletDbConnection,
         test_utils::create_consensus_constants,
         transaction_service::storage::{
@@ -2598,17 +2640,16 @@ mod test {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_crud() {
-        let key_manager = create_memory_db_key_manager().unwrap();
-        let consensus_constants = create_consensus_constants(0);
+        let key_manager = create_memory_db_key_manager().await.unwrap();
         let db_name = format!("{}.sqlite3", string(8).as_str());
         let temp_dir = tempdir().unwrap();
         let db_folder = temp_dir.path().to_str().unwrap().to_string();
-        let db_path = format!("{}{}", db_folder, db_name);
+        let db_path = format!("{db_folder}{db_name}");
 
         const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
         let mut conn =
-            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         let mut key = [0u8; size_of::<Key>()];
         OsRng.fill_bytes(&mut key);
@@ -2619,10 +2660,7 @@ mod test {
             .map(|v| {
                 v.into_iter()
                     .map(|b| {
-                        let m = format!("Running migration {}", b);
-                        // std::io::stdout()
-                        //     .write_all(m.as_ref())
-                        //     .expect("Couldn't write migration number to stdout");
+                        let m = format!("Running migration {b}");
                         m
                     })
                     .collect::<Vec<String>>()
@@ -2632,7 +2670,9 @@ mod test {
         sql_query("PRAGMA foreign_keys = ON").execute(&mut conn).unwrap();
 
         let constants = create_consensus_constants(0);
-        let mut builder = SenderTransactionProtocol::builder(constants, key_manager.clone());
+        let mut builder = TransactionBuilder::new(constants, key_manager.clone(), Network::LocalNet)
+            .await
+            .unwrap();
         let test_params = TestParams::new(&key_manager).await;
         let input = create_wallet_output_with_data(
             script!(Nop).unwrap(),
@@ -2644,47 +2684,28 @@ mod test {
         .await
         .unwrap();
         let amount = MicroMinotari::from(10_000);
-        let change = TestParams::new(&key_manager).await;
         builder
             .with_lock_height(0)
             .with_fee_per_gram(MicroMinotari::from(177 / 5))
-            .with_payment_id(PaymentId::open_from_string("Yo!", TxType::PaymentToOther))
+            .with_memo(MemoField::open_from_string("Yo!", TxType::PaymentToOther))
             .with_input(input)
             .await
-            .unwrap()
-            .with_recipient_data(
-                script!(Nop).unwrap(),
-                OutputFeatures::default(),
-                Default::default(),
-                MicroMinotari::zero(),
-                amount,
-                TariAddress::default(),
-            )
-            .await
-            .unwrap()
-            .with_change_data(
-                script!(Nop).unwrap(),
-                inputs!(change.script_key_pk),
-                change.script_key_id,
-                change.commitment_mask_key_id,
-                Default::default(),
-                TariAddress::default(),
-            );
-        let mut stp = builder.build().await.unwrap();
+            .unwrap();
 
         let address = TariAddress::new_single_address_with_interactive_only(
             CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         )
         .unwrap();
+        let fee = builder.get_fee_estimate().unwrap();
         let outbound_tx1 = OutboundTransaction {
             tx_id: 1u64.into(),
             destination_address: address,
             amount,
-            fee: stp.get_fee_amount().unwrap(),
-            sender_protocol: stp.clone(),
+            fee,
+            sender_protocol: SenderTransactionProtocol::new_placeholder(),
             status: TransactionStatus::Pending,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
@@ -2702,10 +2723,10 @@ mod test {
                 tx_id: 2u64.into(),
                 destination_address: address,
                 amount,
-                fee: stp.get_fee_amount().unwrap(),
-                sender_protocol: stp.clone(),
+                fee,
+                sender_protocol: SenderTransactionProtocol::new_placeholder(),
                 status: TransactionStatus::Pending,
-                payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+                payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
                 timestamp: Utc::now(),
                 cancelled: false,
                 direct_send_success: false,
@@ -2744,36 +2765,38 @@ mod test {
                 .unwrap()
         );
 
+        let receiver_test_params = TestParams::new(&key_manager).await;
         let output = create_wallet_output_with_data(
             script!(Nop).unwrap(),
             OutputFeatures::default(),
-            &test_params,
+            &receiver_test_params,
             MicroMinotari::from(100_000),
             &key_manager,
         )
         .await
         .unwrap();
 
-        let rtp = ReceiverTransactionProtocol::new(
-            TransactionSenderMessage::Single(Box::new(stp.build_single_round_message(&key_manager).await.unwrap())),
-            output,
-            &key_manager,
-            &consensus_constants,
-        )
-        .await;
-        let address = TariAddress::new_dual_address_with_default_features(
+        let source_address = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         )
         .unwrap();
+        builder
+            .add_recipient(
+                source_address.clone(),
+                output,
+                Some(receiver_test_params.sender_offset_key_id),
+            )
+            .await
+            .unwrap();
         let inbound_tx1 = InboundTransaction {
             tx_id: 2u64.into(),
-            source_address: address,
+            source_address: source_address.clone(),
             amount,
-            receiver_protocol: rtp.clone(),
+            receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
             status: TransactionStatus::Pending,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
@@ -2781,19 +2804,13 @@ mod test {
             last_send_timestamp: None,
             received_output_hashes: vec![],
         };
-        let address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            Network::LocalNet,
-        )
-        .unwrap();
         let inbound_tx2 = InboundTransaction {
             tx_id: 3u64.into(),
-            source_address: address,
+            source_address,
             amount,
-            receiver_protocol: rtp,
+            receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
             status: TransactionStatus::Pending,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
@@ -2865,11 +2882,14 @@ mod test {
             sent_output_hashes: vec![],
             received_output_hashes: vec![],
             change_output_hashes: vec![],
-            transaction_signature: tx.first_kernel_excess_sig().unwrap_or(&Signature::default()).clone(),
+            transaction_signature: tx
+                .first_kernel_excess_sig()
+                .unwrap_or(&CompressedSignature::default())
+                .clone(),
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
         };
         let source_address = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
@@ -2899,11 +2919,14 @@ mod test {
             sent_output_hashes: vec![],
             received_output_hashes: vec![],
             change_output_hashes: vec![],
-            transaction_signature: tx.first_kernel_excess_sig().unwrap_or(&Signature::default()).clone(),
+            transaction_signature: tx
+                .first_kernel_excess_sig()
+                .unwrap_or(&CompressedSignature::default())
+                .clone(),
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
         };
 
         CompletedTransactionSql::try_from(completed_tx1.clone(), &cipher)
@@ -3024,21 +3047,18 @@ mod test {
         let db_name = format!("{}.sqlite3", string(8).as_str());
         let temp_dir = tempdir().unwrap();
         let db_folder = temp_dir.path().to_str().unwrap().to_string();
-        let db_path = format!("{}{}", db_folder, db_name);
+        let db_path = format!("{db_folder}{db_name}");
 
         const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
         let mut conn =
-            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         conn.run_pending_migrations(MIGRATIONS)
             .map(|v| {
                 v.into_iter()
                     .map(|b| {
-                        let m = format!("Running migration {}", b);
-                        // std::io::stdout()
-                        //     .write_all(m.as_ref())
-                        //     .expect("Couldn't write migration number to stdout");
+                        let m = format!("Running migration {b}");
                         m
                     })
                     .collect::<Vec<String>>()
@@ -3064,7 +3084,7 @@ mod test {
             amount: MicroMinotari::from(100),
             receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
             status: TransactionStatus::Pending,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
@@ -3094,7 +3114,7 @@ mod test {
             fee: MicroMinotari::from(10),
             sender_protocol: SenderTransactionProtocol::new_placeholder(),
             status: TransactionStatus::Pending,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
@@ -3146,11 +3166,11 @@ mod test {
             sent_output_hashes: vec![],
             received_output_hashes: vec![],
             change_output_hashes: vec![],
-            transaction_signature: Signature::default(),
+            transaction_signature: CompressedSignature::default(),
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
-            payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+            payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
         };
 
         let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx.clone(), &cipher).unwrap();
@@ -3169,13 +3189,13 @@ mod test {
         let db_name = format!("{}.sqlite3", string(8).as_str());
         let temp_dir = tempdir().unwrap();
         let db_folder = temp_dir.path().to_str().unwrap().to_string();
-        let db_path = format!("{}{}", db_folder, db_name);
+        let db_path = format!("{db_folder}{db_name}");
 
         const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
         let mut pool = SqliteConnectionPool::new(db_path.clone(), 1, true, true, Duration::from_secs(60));
         pool.create_pool()
-            .unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            .unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         let mut key = [0u8; size_of::<Key>()];
         OsRng.fill_bytes(&mut key);
@@ -3187,16 +3207,13 @@ mod test {
         {
             let mut conn = pool
                 .get_pooled_connection()
-                .unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+                .unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
             conn.run_pending_migrations(MIGRATIONS)
                 .map(|v| {
                     v.into_iter()
                         .map(|b| {
-                            let m = format!("Running migration {}", b);
-                            // std::io::stdout()
-                            //     .write_all(m.as_ref())
-                            //     .expect("Couldn't write migration number to stdout");
+                            let m = format!("Running migration {b}");
                             m
                         })
                         .collect::<Vec<String>>()
@@ -3215,7 +3232,7 @@ mod test {
                 amount: MicroMinotari::from(100),
                 receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
                 status: TransactionStatus::Pending,
-                payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+                payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
                 timestamp: Utc::now(),
                 cancelled: false,
                 direct_send_success: false,
@@ -3240,7 +3257,7 @@ mod test {
                 fee: MicroMinotari::from(10),
                 sender_protocol: SenderTransactionProtocol::new_placeholder(),
                 status: TransactionStatus::Pending,
-                payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+                payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
                 timestamp: Utc::now(),
                 cancelled: false,
                 direct_send_success: false,
@@ -3286,11 +3303,11 @@ mod test {
                 sent_output_hashes: vec![],
                 received_output_hashes: vec![],
                 change_output_hashes: vec![],
-                transaction_signature: Signature::default(),
+                transaction_signature: CompressedSignature::default(),
                 mined_height: None,
                 mined_in_block: None,
                 mined_timestamp: None,
-                payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+                payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             };
             let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx, &cipher).unwrap();
 
@@ -3324,26 +3341,23 @@ mod test {
         let db_name = format!("{}.sqlite3", string(8).as_str());
         let temp_dir = tempdir().unwrap();
         let db_folder = temp_dir.path().to_str().unwrap().to_string();
-        let db_path = format!("{}{}", db_folder, db_name);
+        let db_path = format!("{db_folder}{db_name}");
 
         const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
         // Note: For this test the connection pool is setup with a pool size of 2; a pooled connection must go out
         // of scope to be released once obtained otherwise subsequent calls to obtain a pooled connection will fail .
         let mut pool = SqliteConnectionPool::new(db_path.clone(), 2, true, true, Duration::from_secs(60));
         pool.create_pool()
-            .unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            .unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
         let mut conn = pool
             .get_pooled_connection()
-            .unwrap_or_else(|_| panic!("Error connecting to {}", db_path));
+            .unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         conn.run_pending_migrations(MIGRATIONS)
             .map(|v| {
                 v.into_iter()
                     .map(|b| {
-                        let m = format!("Running migration {}", b);
-                        // std::io::stdout()
-                        //     .write_all(m.as_ref())
-                        //     .expect("Couldn't write migration number to stdout");
+                        let m = format!("Running migration {b}");
                         m
                     })
                     .collect::<Vec<String>>()
@@ -3432,11 +3446,11 @@ mod test {
                 sent_output_hashes: vec![],
                 received_output_hashes: vec![],
                 change_output_hashes: vec![],
-                transaction_signature: Signature::default(),
+                transaction_signature: CompressedSignature::default(),
                 mined_height: None,
                 mined_in_block: None,
                 mined_timestamp: None,
-                payment_id: PaymentId::open_from_string("Yo!", TxType::PaymentToOther),
+                payment_id: MemoField::open_from_string("Yo!", TxType::PaymentToOther),
             };
             let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx.clone(), &cipher).unwrap();
 

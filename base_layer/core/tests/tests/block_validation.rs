@@ -20,7 +20,8 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{convert::TryFrom, sync::Arc};
+#![allow(clippy::indexing_slicing)]
+use std::sync::Arc;
 
 use borsh::BorshSerialize;
 use monero::{blockdata::block::Block as MoneroBlock, consensus::Encodable};
@@ -29,37 +30,15 @@ use serial_test::serial;
 use tari_common::configuration::Network;
 use tari_common_types::types::FixedHash;
 use tari_core::{
-    blocks::{Block, BlockHeaderAccumulatedData, BlockHeaderValidationError, BlockValidationError, ChainBlock},
+    blocks::{BlockHeaderAccumulatedData, ChainBlock},
     chain_storage::{BlockchainDatabase, BlockchainDatabaseConfig, ChainStorageError, Validators},
-    consensus::{
-        consensus_constants::PowAlgorithmConstants,
-        emission::Emission,
-        ConsensusConstantsBuilder,
-        ConsensusManager,
-    },
+    consensus::BaseNodeConsensusManager,
     proof_of_work::{
         monero_rx,
         monero_rx::{verify_header, FixedByteArray, MoneroPowData},
         randomx_factory::RandomXFactory,
-        Difficulty,
-        PowAlgorithm,
     },
     test_helpers::blockchain::{create_store_with_consensus_and_validators, create_test_db},
-    transactions::{
-        aggregated_body::AggregateBody,
-        tari_amount::{uT, MicroMinotari, T},
-        test_helpers::{
-            create_wallet_output_with_data,
-            schema_to_transaction,
-            spend_utxos,
-            TestParams,
-            UtxoTestParams,
-        },
-        transaction_components::OutputFeatures,
-        transaction_key_manager::TransactionKeyManagerInterface,
-        CryptoFactories,
-    },
-    txn_schema,
     validation::{
         block_body::{BlockBodyFullValidator, BlockBodyInternalConsistencyValidator},
         header::HeaderFullValidator,
@@ -72,8 +51,25 @@ use tari_core::{
         ValidationError,
     },
 };
+use tari_node_components::blocks::{Block, BlockHeaderValidationError, BlockValidationError};
 use tari_script::{inputs, script};
 use tari_test_utils::unpack_enum;
+use tari_transaction_components::{
+    aggregated_body::AggregateBody,
+    consensus::{
+        consensus_constants::{BlockVersion, PowAlgorithmConstants},
+        ConsensusConstantsBuilder,
+    },
+    crypto_factories::CryptoFactories,
+    key_manager::TransactionKeyManagerInterface,
+    tari_amount::{uT, T},
+    tari_proof_of_work::{Difficulty, PowAlgorithm, PowData},
+    test_helpers::{create_wallet_output_with_data, schema_to_transaction, spend_utxos, TestParams, UtxoTestParams},
+    transaction_components::{CoinBaseExtra, OutputFeatures, TransactionError},
+    txn_schema,
+    validation::AggregatedBodyValidationError,
+};
+use tari_transaction_key_manager::create_memory_db_key_manager;
 use tari_utilities::{epoch_time::EpochTime, hex::Hex, ByteArray};
 use tiny_keccak::{Hasher, Keccak};
 use tokio::time::Instant;
@@ -110,8 +106,7 @@ async fn test_monero_blocks() {
     let seed1 = "9f02e032f9b15d2aded991e0f68cc3c3427270b568b782e55fbd269ead0bad97";
     let seed2 = "9f02e032f9b15d2aded991e0f68cc3c3427270b568b782e55fbd269ead0bad98";
 
-    let key_manager = create_memory_db_key_manager().unwrap();
-    let network = Network::Esmeralda;
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let cc = ConsensusConstantsBuilder::new(network)
         .with_max_randomx_seed_height(1)
         .clear_proof_of_work()
@@ -125,9 +120,10 @@ async fn test_monero_blocks() {
             max_difficulty: Difficulty::min(),
             target_time: 200,
         })
-        .with_blockchain_version(0)
+        .with_blockchain_version(BlockVersion::V0)
+        .with_valid_blockchain_version_range(0..=0)
         .build();
-    let cm = ConsensusManager::builder(network)
+    let cm = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(cc)
         .build()
         .unwrap();
@@ -162,10 +158,10 @@ async fn test_monero_blocks() {
             source: ValidationError::BlockHeaderError(BlockHeaderValidationError::OldSeedHash),
         }) => (),
         Err(e) => {
-            panic!("Failed due to other error:{:?}", e);
+            panic!("Failed due to other error:{e:?}");
         },
         Ok(res) => {
-            panic!("Block add unexpectedly succeeded with result: {:?}", res);
+            panic!("Block add unexpectedly succeeded with result: {res:?}");
         },
     };
 
@@ -177,10 +173,10 @@ async fn test_monero_blocks() {
             source: ValidationError::MergeMineError(_),
         }) => (),
         Err(e) => {
-            panic!("Failed due to other error:{:?}", e);
+            panic!("Failed due to other error:{e:?}");
         },
         Ok(res) => {
-            panic!("Block add unexpectedly succeeded with result: {:?}", res);
+            panic!("Block add unexpectedly succeeded with result: {res:?}");
         },
     };
     // now lets fix the seed, and try again
@@ -196,10 +192,10 @@ async fn test_monero_blocks() {
             source: ValidationError::BlockHeaderError(BlockHeaderValidationError::InvalidNonce),
         }) => (),
         Err(e) => {
-            panic!("Failed due to other error:{:?}", e);
+            panic!("Failed due to other error:{e:?}");
         },
         Ok(res) => {
-            panic!("Block add unexpectedly succeeded with result: {:?}", res);
+            panic!("Block add unexpectedly succeeded with result: {res:?}");
         },
     };
     // lets fix block3
@@ -292,7 +288,7 @@ async fn inputs_are_not_malleable() {
     let mut malicious_test_params = TestParams::new(&blockchain.key_manager).await;
 
     // Oh noes - they've managed to get hold of the private script and spend keys
-    malicious_test_params.commitment_mask_key_id = spent_output.spending_key_id;
+    malicious_test_params.commitment_mask_key_id = spent_output.commitment_mask_key_id;
     let modified_so = blockchain
         .key_manager
         .get_script_offset(&vec![spent_output.script_key_id.clone()], &vec![malicious_test_params
@@ -347,14 +343,14 @@ async fn inputs_are_not_malleable() {
 #[allow(clippy::too_many_lines)]
 async fn test_orphan_validator() {
     let factories = CryptoFactories::default();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let network = Network::Igor;
     let consensus_constants = ConsensusConstantsBuilder::new(network)
         .with_max_block_transaction_weight(335)
         .build();
     let (genesis, outputs) = create_genesis_block_with_utxos(&[T, T, T], &consensus_constants, &key_manager).await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants)
         .with_block(genesis.clone())
         .build()
@@ -495,10 +491,10 @@ async fn test_orphan_body_validation() {
         .clear_proof_of_work()
         .add_proof_of_work(PowAlgorithm::Sha3x, sha3x_constants)
         .build();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let (genesis, outputs) = create_genesis_block_with_utxos(&[T, T, T], &consensus_constants, &key_manager).await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants)
         .with_block(genesis.clone())
         .build()
@@ -705,7 +701,7 @@ OutputFeatures::default()),
 #[allow(clippy::too_many_lines)]
 async fn test_header_validation() {
     let factories = CryptoFactories::default();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let network = Network::Igor;
     // we dont want localnet's 1 difficulty or the full mined difficulty of weather wax but we want some.
     let sha3x_constants = PowAlgorithmConstants {
@@ -719,7 +715,7 @@ async fn test_header_validation() {
         .build();
     let (genesis, outputs) = create_genesis_block_with_utxos(&[T, T, T], &consensus_constants, &key_manager).await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants)
         .with_block(genesis.clone())
         .build()
@@ -834,10 +830,10 @@ async fn test_block_sync_body_validator() {
     let consensus_constants = ConsensusConstantsBuilder::new(network)
         .with_max_block_transaction_weight(400)
         .build();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let (genesis, outputs) = create_genesis_block_with_utxos(&[T, T, T], &consensus_constants, &key_manager).await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants.clone())
         .with_block(genesis.clone())
         .build()
@@ -939,7 +935,7 @@ async fn test_block_sync_body_validator() {
     assert!(
         matches!(
             err,
-            ValidationError::BlockTooLarge { actual_weight, max_weight } if
+            ValidationError::AggregatedBodyValidationError(AggregatedBodyValidationError::BlockTooLarge { actual_weight, max_weight }) if
             actual_weight == 414 && max_weight == 400
         ),
         "{}",
@@ -1094,7 +1090,7 @@ async fn add_block_with_large_block() {
     let factories = CryptoFactories::default();
     let network = Network::LocalNet;
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let (genesis, outputs) = create_genesis_block_with_utxos(
         &[
             5 * T,
@@ -1115,7 +1111,7 @@ async fn add_block_with_large_block() {
     )
     .await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants.clone())
         .with_block(genesis.clone())
         .build()
@@ -1171,10 +1167,10 @@ async fn add_block_with_large_many_output_block() {
     let consensus_constants = ConsensusConstantsBuilder::new(network)
         .with_max_block_transaction_weight(127_795)
         .build();
-    let key_manager = create_memory_db_key_manager().unwrap();
+    let key_manager = create_memory_db_key_manager().await.unwrap();
     let (genesis, outputs) = create_genesis_block_with_utxos(&[501 * T], &consensus_constants, &key_manager).await;
     let network = Network::LocalNet;
-    let rules = ConsensusManager::builder(network)
+    let rules = BaseNodeConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants.clone())
         .with_block(genesis.clone())
         .build()
@@ -1222,144 +1218,4 @@ async fn add_block_with_large_many_output_block() {
     // we can extrapolate full block validation by 4.59, this we get from the 127_795/block_weight
     // of the block
     println!("finished validating in: {}", finished.as_millis());
-}
-
-use tari_core::{
-    blocks::{BlockHeader, NewBlockTemplate},
-    proof_of_work::PowData,
-    transactions::{
-        test_helpers::create_stx_protocol_internal,
-        transaction_components::{CoinBaseExtra, Transaction, TransactionError, TransactionKernel},
-        transaction_key_manager::create_memory_db_key_manager,
-    },
-};
-
-use crate::helpers::{block_builders::generate_new_block, sample_blockchains::create_new_blockchain};
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_fee_overflow() {
-    let network = Network::LocalNet;
-    let (mut store, mut blocks, mut outputs, consensus_manager, key_manager) = create_new_blockchain(network).await;
-    let schemas = vec![txn_schema!(
-        from: vec![outputs[0][0].clone()],
-        to: vec![10 * T, 10 * T, 10 * T, 10 * T]
-    )];
-    generate_new_block(
-        &mut store,
-        &mut blocks,
-        &mut outputs,
-        schemas,
-        &consensus_manager,
-        &key_manager,
-    )
-    .await
-    .unwrap();
-
-    let schemas = vec![
-        txn_schema!(
-            from: vec![outputs[1][0].clone()],
-            to: vec![1 * T, 1 * T, 1 * T, 1 * T]
-        ),
-        txn_schema!(
-            from: vec![outputs[1][1].clone()],
-            to: vec![1 * T, 1 * T, 1 * T, 1 * T]
-        ),
-        txn_schema!(
-            from: vec![outputs[1][2].clone()],
-            to: vec![1 * T, 1 * T, 1 * T, 1 * T]
-        ),
-    ];
-
-    let coinbase_value = consensus_manager
-        .emission_schedule()
-        .block_reward(store.get_height().unwrap() + 1);
-
-    let mut transactions = Vec::new();
-    let mut block_utxos = Vec::new();
-    let mut fees = MicroMinotari(0);
-    for schema in schemas {
-        let (tx, mut utxos) = spend_utxos(schema, &key_manager).await;
-        fees += tx.body.get_total_fee().unwrap();
-        transactions.push(tx);
-        block_utxos.append(&mut utxos);
-    }
-
-    let (coinbase_utxo, coinbase_kernel, coinbase_output) =
-        create_coinbase(coinbase_value + fees, 100, None, &key_manager).await;
-    block_utxos.push(coinbase_output);
-
-    outputs.push(block_utxos);
-
-    let mut header = BlockHeader::from_previous(blocks.last().unwrap().header());
-    header.version = consensus_manager
-        .consensus_constants(header.height)
-        .blockchain_version();
-    let height = header.height;
-
-    let mut transactions_new = Vec::with_capacity(transactions.len());
-    for txn in transactions {
-        transactions_new.push(Transaction {
-            offset: txn.offset,
-            body: {
-                let mut inputs = Vec::with_capacity(txn.body.inputs().len());
-                for input in txn.body.inputs() {
-                    inputs.push(input.clone());
-                }
-                let mut outputs = Vec::with_capacity(txn.body.outputs().len());
-                for output in txn.body.outputs() {
-                    outputs.push(output.clone());
-                }
-                let mut kernels = Vec::with_capacity(txn.body.kernels().len());
-                for kernel in txn.body.kernels() {
-                    kernels.push(TransactionKernel {
-                        version: kernel.version,
-                        features: kernel.features,
-                        fee: (u64::MAX / 2).into(), // This is the adversary's attack!
-                        lock_height: kernel.lock_height,
-                        excess_sig: kernel.excess_sig.clone(),
-                        excess: kernel.excess.clone(),
-                        burn_commitment: kernel.burn_commitment.clone(),
-                    });
-                }
-                AggregateBody::new(inputs, outputs, kernels)
-            },
-            script_offset: txn.script_offset,
-        });
-    }
-
-    // This will call `BlockBuilder::add_kernels(...)` and `AggregateBody::get_total_fee(...)`, which will overflow if
-    // regressed
-    let template_result = NewBlockTemplate::from_block(
-        header
-            .into_builder()
-            .with_transactions(transactions_new)
-            .with_coinbase_utxo(coinbase_utxo, coinbase_kernel)
-            .build(),
-        Difficulty::min(),
-        consensus_manager.get_block_reward_at(height),
-        true,
-    );
-    assert!(template_result.is_err());
-    assert_eq!(
-        template_result.unwrap_err().to_string(),
-        "Invalid kernel in body: Aggregated body has greater fee than u64::MAX".to_string()
-    );
-
-    let schema = txn_schema!(
-        from: vec![outputs[1][3].clone()],
-        to: vec![],
-        fee: MicroMinotari(u64::MAX / 2), // This is the adversary's attack!
-        lock: 0,
-        features: OutputFeatures::default()
-    );
-    let stx_builder = create_stx_protocol_internal(schema, &key_manager, &mut Vec::new()).await;
-
-    // This will call `Fee::calculate(...)`, which will overflow if regressed
-    let build_result = stx_builder.build().await;
-    assert!(build_result.is_err());
-    assert_eq!(
-        &format!("{:?}", build_result.unwrap_err()),
-        "You are spending more than you're providing: provided 10.000000 T, required 18446744073709.551615 T."
-    );
 }

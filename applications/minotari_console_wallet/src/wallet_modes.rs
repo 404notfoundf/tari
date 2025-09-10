@@ -90,14 +90,14 @@ pub(crate) fn command_mode(
 ) -> Result<(), ExitError> {
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER_A: &str = "Minotari Console Wallet running... (Command mode started)";
-    println!("{}", CUCUMBER_TEST_MARKER_A);
+    println!("{CUCUMBER_TEST_MARKER_A}");
 
     info!(target: LOG_TARGET, "Starting wallet command mode");
     let exit_override = handle.block_on(command_runner(config, vec![command.clone()], wallet.clone()))?;
 
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER_B: &str = "Minotari Console Wallet running... (Command mode completed)";
-    println!("{}", CUCUMBER_TEST_MARKER_B);
+    println!("{CUCUMBER_TEST_MARKER_B}");
 
     info!(target: LOG_TARGET, "Completed wallet command mode");
 
@@ -141,7 +141,7 @@ pub(crate) fn parse_command_file(script: String) -> Result<Vec<CliCommands>, Exi
                     }
                 },
                 Err(e) => {
-                    println!("\nError! parsing '{}' ({})\n", command, e);
+                    println!("\nError! parsing '{command}' ({e})\n");
                     return Err(ExitError::new(ExitCode::CommandError, e.to_string()));
                 },
             }
@@ -172,7 +172,7 @@ pub(crate) fn script_mode(
     for command in &commands {
         (force_exit, force_interactive) = force_exit_for_pre_mine_commands(command);
         if force_exit || force_interactive {
-            println!("Pre-mine command '{:?}' may not run in script mode!", command);
+            println!("Pre-mine command '{command:?}' may not run in script mode!");
             break;
         }
     }
@@ -182,7 +182,7 @@ pub(crate) fn script_mode(
 
         // Do not remove this println!
         const CUCUMBER_TEST_MARKER_A: &str = "Minotari Console Wallet running... (Script mode started)";
-        println!("{}", CUCUMBER_TEST_MARKER_A);
+        println!("{CUCUMBER_TEST_MARKER_A}");
 
         println!("Starting the command runner!");
         let exit_override = handle.block_on(command_runner(config, commands, wallet.clone()))?;
@@ -193,7 +193,7 @@ pub(crate) fn script_mode(
 
         // Do not remove this println!
         const CUCUMBER_TEST_MARKER_B: &str = "Minotari Console Wallet running... (Script mode completed)";
-        println!("{}", CUCUMBER_TEST_MARKER_B);
+        println!("{CUCUMBER_TEST_MARKER_B}");
 
         info!(target: LOG_TARGET, "Completed wallet script mode");
     }
@@ -254,10 +254,7 @@ pub fn tui_mode(handle: Handle, config: &WalletConfig, mut wallet: WalletSqlite)
     if config.grpc_enabled {
         #[cfg(feature = "grpc")]
         if let Some(address) = config.grpc_address.clone() {
-            let grpc = WalletGrpcServer::new(wallet.clone()).map_err(|e| ExitError {
-                exit_code: ExitCode::UnknownError,
-                details: Some(e.to_string()),
-            })?;
+            let grpc = WalletGrpcServer::new(wallet.clone());
 
             let mut tls_identity = None;
             if config.grpc_tls_enabled {
@@ -304,7 +301,7 @@ pub fn tui_mode(handle: Handle, config: &WalletConfig, mut wallet: WalletSqlite)
 
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER: &str = "Minotari Console Wallet running... (TUI mode started)";
-    println!("{}", CUCUMBER_TEST_MARKER);
+    println!("{CUCUMBER_TEST_MARKER}");
 
     {
         let _enter = handle.enter();
@@ -329,14 +326,14 @@ pub fn recovery_mode(
     if !skip_recovery {
         // Do not remove this println!
         const CUCUMBER_TEST_MARKER_A: &str = "Minotari Console Wallet running... (Recovery mode started)";
-        println!("{}", CUCUMBER_TEST_MARKER_A);
+        println!("{CUCUMBER_TEST_MARKER_A}");
 
         let url = Url::parse(wallet_config.http_server_url.as_ref())
-            .map_err(|e| ExitError::new(ExitCode::ConfigError, format!("Invalid HTTP client URL: {}", e)))?;
+            .map_err(|e| ExitError::new(ExitCode::ConfigError, format!("Invalid HTTP client URL: {e}")))?;
         match handle.block_on(wallet_recovery(&wallet, wallet_config.recovery_retry_limit)) {
             Ok(_) => println!("Wallet recovered!"),
             Err(e) => {
-                error!(target: LOG_TARGET, "Recovery failed: {}", e);
+                error!(target: LOG_TARGET, "Recovery failed: {e}");
                 println!(
                     "Recovery failed. Restarting the console wallet will restart the recovery process from where you \
                      left off. If you want to start with a fresh wallet then delete the wallet data file"
@@ -348,7 +345,7 @@ pub fn recovery_mode(
 
         // Do not remove this println!
         const CUCUMBER_TEST_MARKER_B: &str = "Minotari Console Wallet running... (Recovery mode completed)";
-        println!("{}", CUCUMBER_TEST_MARKER_B);
+        println!("{CUCUMBER_TEST_MARKER_B}");
     }
 
     println!("Starting TUI.");
@@ -368,10 +365,7 @@ pub fn grpc_mode(handle: Handle, config: &WalletConfig, wallet: WalletSqlite) ->
     if let Some(address) = config.grpc_address.as_ref().filter(|_| config.grpc_enabled).cloned() {
         #[cfg(feature = "grpc")]
         {
-            let grpc = WalletGrpcServer::new(wallet.clone()).map_err(|e| ExitError {
-                exit_code: ExitCode::UnknownError,
-                details: Some(e.to_string()),
-            })?;
+            let grpc = WalletGrpcServer::new(wallet.clone());
             let auth = config.grpc_authentication.clone();
 
             let mut tls_identity = None;
@@ -413,9 +407,9 @@ async fn run_grpc(
 ) -> Result<(), String> {
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER_A: &str = "Minotari Console Wallet running... (gRPC mode started)";
-    println!("{}", CUCUMBER_TEST_MARKER_A);
+    println!("{CUCUMBER_TEST_MARKER_A}");
 
-    info!(target: LOG_TARGET, "Starting GRPC on {}", grpc_listener_addr);
+    info!(target: LOG_TARGET, "Starting GRPC on {grpc_listener_addr}");
     let address = multiaddr_to_socketaddr(&grpc_listener_addr).map_err(|e| e.to_string())?;
     let auth = ServerAuthenticationInterceptor::new(auth_config)
         .ok_or("Unable to prepare server gRPC authentication".to_string())?;
@@ -437,11 +431,11 @@ async fn run_grpc(
         .add_service(service)
         .serve_with_shutdown(address, wallet.wait_until_shutdown())
         .await
-        .map_err(|e| format!("GRPC server returned error:{}", e))?;
+        .map_err(|e| format!("GRPC server returned error:{e}"))?;
 
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER_B: &str = "Minotari Console Wallet running... (gRPC mode completed)";
-    println!("{}", CUCUMBER_TEST_MARKER_B);
+    println!("{CUCUMBER_TEST_MARKER_B}");
 
     info!(target: LOG_TARGET, "Stopping GRPC");
     Ok(())
@@ -464,9 +458,6 @@ mod test {
             whois 5c4f2a4b3f3f84e047333218a84fd24f581a9d7e4f23b78e3714e9d174427d61
 
             discover-peer f6b2ca781342a3ebe30ee1643655c96f1d7c14f4d49f077695395de98ae73665
-
-            send-minotari --payment-id Our_secret! 125T \
-                      f425UWsDp714RiN53c1G6ek57rfFnotB5NCMyrn4iDgbR8i2sXVHa4xSsedd66o9KmkRgErQnyDdCaAdNLzcKrj7eUb
 
             burn-minotari --payment-id Ups_these_funds_will_be_burned! 100T
 
@@ -501,7 +492,6 @@ mod test {
         let commands = parse_command_file(script).unwrap();
 
         let mut get_balance = false;
-        let mut send_tari = false;
         let mut burn_tari = false;
         let mut pre_mine_spend_get_output_status = false;
         let mut pre_mine_spend_session_info = false;
@@ -518,7 +508,6 @@ mod test {
         for command in commands {
             match command {
                 CliCommands::GetBalance => get_balance = true,
-                CliCommands::SendMinotari(_) => send_tari = true,
                 CliCommands::BurnMinotari(_) => burn_tari = true,
                 CliCommands::PreMineSpendGetOutputStatus => pre_mine_spend_get_output_status = true,
                 CliCommands::PreMineStart(_) => pre_mine_spend_session_info = true,
@@ -565,7 +554,6 @@ mod test {
         }
         assert!(
             get_balance &&
-                send_tari &&
                 burn_tari &&
                 pre_mine_spend_get_output_status &&
                 pre_mine_spend_session_info &&

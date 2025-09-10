@@ -8,14 +8,13 @@ mod test {
         mem::size_of,
         sync::{Arc, Mutex},
         thread,
-        time::{Duration, SystemTime},
+        time::Duration,
     };
 
     use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
     use chrono::{DateTime, Utc};
     use minotari_wallet::{
-        base_node_service::{handle::BaseNodeEvent, service::BaseNodeState},
-        connectivity_service::OnlineStatus,
+        legacy_transaction_protocol::{ReceiverTransactionProtocol, SenderTransactionProtocol},
         output_manager_service::{
             handle::{OutputManagerEvent, OutputManagerHandle},
             service::Balance,
@@ -35,34 +34,23 @@ mod test {
     use rand::{rngs::OsRng, RngCore};
     use tari_common::configuration::Network;
     use tari_common_types::{
-        chain_metadata::ChainMetadata,
         tari_address::TariAddress,
         transaction::{TransactionDirection, TransactionStatus},
         types::{CompressedPublicKey, PrivateKey},
     };
     use tari_comms_dht::event::DhtEvent;
-    use tari_contacts::contacts_service::{
-        handle::{ContactsLivenessData, ContactsLivenessEvent},
-        service::{ContactMessageType, ContactOnlineStatus},
-        types::Contact,
-    };
-    use tari_core::transactions::{
-        tari_amount::{uT, MicroMinotari},
-        transaction_components::{
-            payment_id::{PaymentId, TxType},
-            Transaction,
-        },
-        ReceiverTransactionProtocol,
-        SenderTransactionProtocol,
-    };
     use tari_crypto::keys::SecretKey;
     use tari_service_framework::reply_channel;
     use tari_shutdown::Shutdown;
-    use tokio::{
-        runtime::Runtime,
-        sync::{broadcast, watch},
-        time::Instant,
+    use tari_transaction_components::{
+        tari_amount::{uT, MicroMinotari},
+        transaction_components::{
+            memo_field::{MemoField, TxType},
+            Transaction,
+        },
     };
+    use tari_transaction_key_manager::MemoryDbKeyManager;
+    use tokio::{runtime::Runtime, sync::broadcast, time::Instant};
 
     use crate::{
         callback_handler::{CallbackHandler, Context},
@@ -91,7 +79,6 @@ mod test {
         pub callback_txo_validation_communication_failure: bool,
         pub callback_txo_validation_internal_failure: bool,
         pub callback_txo_validation_already_busy: bool,
-        pub callback_contacts_liveness_data_updated: u32,
         pub callback_balance_updated: u32,
         pub callback_transaction_validation_complete: u32,
         pub saf_messages_received: bool,
@@ -118,7 +105,6 @@ mod test {
                 callback_txo_validation_communication_failure: false,
                 callback_txo_validation_internal_failure: false,
                 callback_txo_validation_already_busy: false,
-                callback_contacts_liveness_data_updated: 0,
                 callback_balance_updated: 0,
                 callback_transaction_validation_complete: 0,
                 tx_cancellation_callback_called_completed: false,
@@ -246,15 +232,6 @@ mod test {
         drop(lock);
     }
 
-    unsafe extern "C" fn contacts_liveness_data_updated_callback(
-        _context: *mut c_void,
-        _data: *mut ContactsLivenessData,
-    ) {
-        let mut lock = CALLBACK_STATE.lock().unwrap();
-        lock.callback_contacts_liveness_data_updated += 1;
-        drop(lock);
-    }
-
     unsafe extern "C" fn balance_updated_callback(_context: *mut c_void, balance: *mut Balance) {
         let mut lock = CALLBACK_STATE.lock().unwrap();
         lock.callback_balance_updated += 1;
@@ -322,7 +299,7 @@ mod test {
             22 * uT,
             rtp,
             TransactionStatus::Pending,
-            PaymentId::open_from_string("1", TxType::PaymentToOther),
+            MemoField::open_from_string("1", TxType::PaymentToOther),
             Utc::now(),
         );
         db.add_pending_inbound_transaction(1u64.into(), inbound_tx.clone())
@@ -358,7 +335,7 @@ mod test {
             TransactionDirection::Inbound,
             None,
             None,
-            PaymentId::open_from_string("2", TxType::PaymentToOther),
+            MemoField::open_from_string("2", TxType::PaymentToOther),
         )
         .unwrap();
         db.insert_completed_transaction(2u64.into(), completed_tx.clone())
@@ -378,7 +355,7 @@ mod test {
             23 * uT,
             stp,
             TransactionStatus::Pending,
-            PaymentId::open_from_string("3", TxType::PaymentToOther),
+            MemoField::open_from_string("3", TxType::PaymentToOther),
             Utc::now(),
             false,
         );
@@ -432,7 +409,7 @@ mod test {
             TransactionDirection::Inbound,
             Some(2),
             Some(DateTime::from_timestamp(0, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)),
-            PaymentId::open_from_string("6", TxType::PaymentToOther),
+            MemoField::open_from_string("6", TxType::PaymentToOther),
         )
         .unwrap();
         db.insert_completed_transaction(6u64.into(), faux_unconfirmed_tx.clone())
@@ -468,19 +445,19 @@ mod test {
             TransactionDirection::Inbound,
             Some(5),
             Some(DateTime::from_timestamp(0, 0).unwrap()),
-            PaymentId::open_from_string("7", TxType::PaymentToOther),
+            MemoField::open_from_string("7", TxType::PaymentToOther),
         )
         .unwrap();
         db.insert_completed_transaction(7u64.into(), faux_confirmed_tx.clone())
             .unwrap();
 
-        let (base_node_event_sender, base_node_event_receiver) = broadcast::channel(20);
         let (transaction_event_sender, transaction_event_receiver) = broadcast::channel(20);
         let (oms_event_sender, oms_event_receiver) = broadcast::channel(20);
         let (dht_event_sender, dht_event_receiver) = broadcast::channel(20);
 
         let (oms_request_sender, oms_request_receiver) = reply_channel::unbounded();
-        let mut oms_handle = OutputManagerHandle::new(oms_request_sender, oms_event_sender.clone());
+        let mut oms_handle =
+            OutputManagerHandle::<MemoryDbKeyManager>::new(oms_request_sender, oms_event_sender.clone());
 
         let shutdown_signal = Shutdown::new();
         let mut mock_output_manager_service =
@@ -499,9 +476,6 @@ mod test {
         runtime.spawn(mock_output_manager_service.run());
         assert_eq!(balance, runtime.block_on(oms_handle.get_balance()).unwrap());
 
-        let (connectivity_tx, connectivity_rx) = watch::channel(OnlineStatus::Offline);
-        let (contacts_liveness_events_sender, _) = broadcast::channel(250);
-        let contacts_liveness_events = contacts_liveness_events_sender.subscribe();
         let (utxo_scanner_events_sender, _) = broadcast::channel(250);
         let utxo_scanner_events = utxo_scanner_events_sender.subscribe();
         let comms_address = TariAddress::new_dual_address_with_default_features(
@@ -514,7 +488,6 @@ mod test {
         let callback_handler = CallbackHandler::new(
             Context(void_ptr),
             db,
-            base_node_event_receiver,
             transaction_event_receiver,
             oms_event_receiver,
             oms_handle,
@@ -522,8 +495,6 @@ mod test {
             dht_event_receiver,
             shutdown_signal.to_signal(),
             comms_address,
-            connectivity_rx,
-            contacts_liveness_events,
             received_tx_callback,
             received_tx_reply_callback,
             received_tx_finalized_callback,
@@ -535,7 +506,6 @@ mod test {
             transaction_send_result_callback,
             tx_cancellation_callback,
             txo_validation_complete_callback,
-            contacts_liveness_data_updated_callback,
             balance_updated_callback,
             transaction_validation_complete_callback,
             saf_messages_received_callback,
@@ -546,33 +516,6 @@ mod test {
 
         runtime.spawn(callback_handler.start());
 
-        let ts_now = DateTime::from_timestamp_millis(
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64,
-        )
-        .unwrap();
-
-        let chain_metadata = ChainMetadata::new(
-            1,
-            Default::default(),
-            0,
-            0,
-            123.into(),
-            ts_now.timestamp_millis() as u64,
-        )
-        .unwrap();
-
-        base_node_event_sender
-            .send(Arc::new(BaseNodeEvent::BaseNodeStateChanged(BaseNodeState {
-                chain_metadata: Some(chain_metadata),
-                is_synced: Some(true),
-                updated: DateTime::from_timestamp_millis(ts_now.timestamp_millis() - (60 * 1000)),
-                latency: Some(Duration::from_micros(500)),
-            })))
-            .unwrap();
-
         let start = Instant::now();
         while start.elapsed().as_secs() < 10 {
             let lock = CALLBACK_STATE.lock().unwrap();
@@ -581,7 +524,6 @@ mod test {
                 break;
             }
         }
-        assert!(CALLBACK_STATE.lock().unwrap().base_node_state_changed_callback_invoked);
 
         // The balance updated callback is bundled with other callbacks and will only fire if the balance actually
         // changed from an initial zero balance.
@@ -758,15 +700,16 @@ mod test {
         assert_eq!(callback_balance_updated, 5);
 
         transaction_event_sender
-            .send(Arc::new(TransactionEvent::TransactionValidationStateChanged(
-                1u64.into(),
-            )))
+            .send(Arc::new(TransactionEvent::TransactionValidationStateChanged {
+                faux: false,
+                id: 1u64.into(),
+            }))
             .unwrap();
-
         transaction_event_sender
-            .send(Arc::new(TransactionEvent::TransactionValidationStateChanged(
-                2u64.into(),
-            )))
+            .send(Arc::new(TransactionEvent::TransactionValidationStateChanged {
+                faux: false,
+                id: 2u64.into(),
+            }))
             .unwrap();
 
         oms_event_sender
@@ -840,47 +783,9 @@ mod test {
         }
         assert_eq!(callback_balance_updated, 7);
 
-        let contact = Contact::new(
-            "My friend".to_string(),
-            faux_unconfirmed_tx.destination_address,
-            None,
-            None,
-            false,
-        );
-        let data = ContactsLivenessData::new(
-            contact.address.clone(),
-            contact.node_id.clone(),
-            contact.latency,
-            contact.last_seen,
-            ContactMessageType::NoMessage,
-            ContactOnlineStatus::NeverSeen,
-        );
-        contacts_liveness_events_sender
-            .send(Arc::new(ContactsLivenessEvent::StatusUpdated(Box::new(data))))
-            .unwrap();
-        let data = ContactsLivenessData::new(
-            contact.address.clone(),
-            contact.node_id,
-            Some(1234),
-            Some(Utc::now()),
-            ContactMessageType::Ping,
-            ContactOnlineStatus::Online,
-        );
-        contacts_liveness_events_sender
-            .send(Arc::new(ContactsLivenessEvent::StatusUpdated(Box::new(data))))
-            .unwrap();
-
         dht_event_sender
             .send(Arc::new(DhtEvent::StoreAndForwardMessagesReceived))
             .unwrap();
-        thread::sleep(Duration::from_secs(2));
-        connectivity_tx.send(OnlineStatus::Offline).unwrap();
-        thread::sleep(Duration::from_secs(2));
-        connectivity_tx.send(OnlineStatus::Connecting).unwrap();
-        thread::sleep(Duration::from_secs(2));
-        connectivity_tx.send(OnlineStatus::Online).unwrap();
-        thread::sleep(Duration::from_secs(2));
-        connectivity_tx.send(OnlineStatus::Connecting).unwrap();
 
         thread::sleep(Duration::from_secs(10));
 
@@ -926,10 +831,9 @@ mod test {
         assert!(lock.callback_txo_validation_communication_failure);
         assert!(lock.callback_txo_validation_already_busy);
         assert!(lock.callback_txo_validation_internal_failure);
-        assert_eq!(lock.callback_contacts_liveness_data_updated, 2);
         assert_eq!(lock.callback_balance_updated, 7);
         assert_eq!(lock.callback_transaction_validation_complete, 13);
-        assert_eq!(lock.connectivity_status_callback_called, 7);
+        assert_eq!(lock.connectivity_status_callback_called, 4);
         assert_eq!(lock.wallet_scanner_height_callback_called, 1100);
 
         drop(lock);

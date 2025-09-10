@@ -22,33 +22,22 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
-use futures::{Stream, StreamExt};
 use log::*;
 use tari_common::configuration::Network;
 use tari_common_types::wallet_types::WalletType;
 use tari_comms::NodeIdentity;
 use tari_comms_dht::Dht;
-use tari_core::{
-    consensus::ConsensusManager,
-    proto::base_node as base_node_proto,
-    transactions::{
-        transaction_key_manager::TransactionKeyManagerInterface,
-        transaction_protocol::proto::protocol as proto,
-        CryptoFactories,
-    },
-};
-use tari_p2p::{
-    comms_connector::SubscriptionFactory,
-    domain_message::DomainMessage,
-    services::utils::map_decode,
-    tari_message::TariMessageType,
-};
 use tari_service_framework::{
     async_trait,
     reply_channel,
     ServiceInitializationError,
     ServiceInitializer,
     ServiceInitializerContext,
+};
+use tari_transaction_components::{
+    consensus::ConsensusManager,
+    crypto_factories::CryptoFactories,
+    key_manager::TransactionKeyManagerInterface,
 };
 use tokio::sync::broadcast;
 
@@ -74,11 +63,9 @@ pub mod offline_signing;
 pub mod protocols;
 pub mod service;
 pub mod storage;
-pub mod tasks;
 mod utc;
 
 const LOG_TARGET: &str = "wallet::transaction_service";
-const SUBSCRIPTION_LABEL: &str = "Transaction Service";
 
 pub struct TransactionServiceInitializer<T, W, TKeyManagerInterface, THttpClientFactory>
 where
@@ -88,7 +75,6 @@ where
     THttpClientFactory: HttpClientFactory,
 {
     config: TransactionServiceConfig,
-    subscription_factory: Arc<SubscriptionFactory>,
     tx_backend: Option<T>,
     node_identity: Arc<NodeIdentity>,
     network: Network,
@@ -110,7 +96,6 @@ where
 {
     pub fn new(
         config: TransactionServiceConfig,
-        subscription_factory: Arc<SubscriptionFactory>,
         backend: T,
         node_identity: Arc<NodeIdentity>,
         network: Network,
@@ -121,7 +106,6 @@ where
     ) -> Self {
         Self {
             config,
-            subscription_factory,
             tx_backend: Some(backend),
             node_identity,
             network,
@@ -132,77 +116,6 @@ where
             _phantom_data_key_manager: Default::default(),
             _phantom_data_http_interface: Default::default(),
         }
-    }
-
-    /// Get a stream of inbound Text messages
-    fn transaction_stream(
-        &self,
-    ) -> impl Stream<Item = DomainMessage<Result<proto::TransactionSenderMessage, prost::DecodeError>>> {
-        trace!(
-            target: LOG_TARGET,
-            "Subscription '{}' for topic '{:?}' created.",
-            SUBSCRIPTION_LABEL,
-            TariMessageType::SenderPartialTransaction
-        );
-        self.subscription_factory
-            .get_subscription(TariMessageType::SenderPartialTransaction, SUBSCRIPTION_LABEL)
-            .map(map_decode::<proto::TransactionSenderMessage>)
-    }
-
-    fn transaction_reply_stream(
-        &self,
-    ) -> impl Stream<Item = DomainMessage<Result<proto::RecipientSignedMessage, prost::DecodeError>>> {
-        trace!(
-            target: LOG_TARGET,
-            "Subscription '{}' for topic '{:?}' created.",
-            SUBSCRIPTION_LABEL,
-            TariMessageType::ReceiverPartialTransactionReply
-        );
-        self.subscription_factory
-            .get_subscription(TariMessageType::ReceiverPartialTransactionReply, SUBSCRIPTION_LABEL)
-            .map(map_decode::<proto::RecipientSignedMessage>)
-    }
-
-    fn transaction_finalized_stream(
-        &self,
-    ) -> impl Stream<Item = DomainMessage<Result<proto::TransactionFinalizedMessage, prost::DecodeError>>> {
-        trace!(
-            target: LOG_TARGET,
-            "Subscription '{}' for topic '{:?}' created.",
-            SUBSCRIPTION_LABEL,
-            TariMessageType::TransactionFinalized
-        );
-        self.subscription_factory
-            .get_subscription(TariMessageType::TransactionFinalized, SUBSCRIPTION_LABEL)
-            .map(map_decode::<proto::TransactionFinalizedMessage>)
-    }
-
-    fn base_node_response_stream(
-        &self,
-    ) -> impl Stream<Item = DomainMessage<Result<base_node_proto::BaseNodeServiceResponse, prost::DecodeError>>> {
-        trace!(
-            target: LOG_TARGET,
-            "Subscription '{}' for topic '{:?}' created.",
-            SUBSCRIPTION_LABEL,
-            TariMessageType::BaseNodeResponse
-        );
-        self.subscription_factory
-            .get_subscription(TariMessageType::BaseNodeResponse, SUBSCRIPTION_LABEL)
-            .map(map_decode::<base_node_proto::BaseNodeServiceResponse>)
-    }
-
-    fn transaction_cancelled_stream(
-        &self,
-    ) -> impl Stream<Item = DomainMessage<Result<proto::TransactionCancelledMessage, prost::DecodeError>>> {
-        trace!(
-            target: LOG_TARGET,
-            "Subscription '{}' for topic '{:?}' created.",
-            SUBSCRIPTION_LABEL,
-            TariMessageType::TransactionCancelled
-        );
-        self.subscription_factory
-            .get_subscription(TariMessageType::TransactionCancelled, SUBSCRIPTION_LABEL)
-            .map(map_decode::<proto::TransactionCancelledMessage>)
     }
 }
 
@@ -217,11 +130,6 @@ where
 {
     async fn initialize(&mut self, context: ServiceInitializerContext) -> Result<(), ServiceInitializationError> {
         let (sender, receiver) = reply_channel::unbounded();
-        let transaction_stream = self.transaction_stream();
-        let transaction_reply_stream = self.transaction_reply_stream();
-        let transaction_finalized_stream = self.transaction_finalized_stream();
-        let base_node_response_stream = self.base_node_response_stream();
-        let transaction_cancelled_stream = self.transaction_cancelled_stream();
 
         let (publisher, _) = broadcast::channel(self.config.transaction_event_channel_size);
 
@@ -249,7 +157,7 @@ where
 
         context.spawn_when_ready(move |handles| async move {
             let outbound_message_service = handles.expect_handle::<Dht>().outbound_requester();
-            let output_manager_service = handles.expect_handle::<OutputManagerHandle>();
+            let output_manager_service = handles.expect_handle::<OutputManagerHandle<TKeyManagerInterface>>();
             let core_key_manager_service = handles.expect_handle::<TKeyManagerInterface>();
             let connectivity = handles.expect_handle::<WalletConnectivityHandle<THttpClientFactory>>();
             let base_node_service_handle = handles.expect_handle::<BaseNodeServiceHandle>();
@@ -260,11 +168,6 @@ where
                 TransactionDatabase::new(tx_backend),
                 wallet_database,
                 receiver,
-                transaction_stream,
-                transaction_reply_stream,
-                transaction_finalized_stream,
-                base_node_response_stream,
-                transaction_cancelled_stream,
                 output_manager_service,
                 core_key_manager_service,
                 outbound_message_service,
@@ -285,7 +188,7 @@ where
             .await;
 
             if let Err(e) = result {
-                error!(target: LOG_TARGET, "Transaction Service error: {}", e);
+                error!(target: LOG_TARGET, "Transaction Service error: {e}");
             }
             info!(target: LOG_TARGET, "Transaction Service shutdown");
         });

@@ -40,8 +40,7 @@ use tari_common::{
     SubConfigPath,
 };
 use tari_common_types::{grpc_authentication::GrpcAuthentication, tari_address::TariAddress};
-use tari_core::{proof_of_work::PowAlgorithm, transactions::transaction_components::RangeProofType};
-
+use tari_transaction_components::{tari_proof_of_work::PowAlgorithm, transaction_components::RangeProofType};
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct MinerConfig {
@@ -129,6 +128,9 @@ impl MinerConfig {
             }),
             PowAlgorithm::RandomXT => Some(PowAlgo {
                 pow_algo: PowAlgos::Randomxt.into(),
+            }),
+            PowAlgorithm::Cuckaroo => Some(PowAlgo {
+                pow_algo: PowAlgos::Cuckaroo.into(),
             }),
         };
         NewBlockTemplateRequest { algo, max_weight: 0 }

@@ -22,7 +22,6 @@
 
 //! Common test helper functions that are small and useful enough to be included in the main crate, rather than the
 //! integration test folder.
-
 use std::sync::Arc;
 
 use blake2::Blake2b;
@@ -49,33 +48,36 @@ use tari_comms::{
     PeerManager,
 };
 use tari_crypto::keys::SecretKey;
+use tari_node_components::blocks::{Block, BlockHeader};
+use tari_transaction_components::{
+    consensus::consensus_constants::ConsensusConstants,
+    generate_coinbase_with_wallet_output,
+    key_manager::{TariKeyId, TransactionKeyManagerInterface},
+    tari_proof_of_work::Difficulty,
+    transaction_components::{
+        memo_field::{MemoField, TxType},
+        CoinBaseExtra,
+        RangeProofType,
+        Transaction,
+        WalletOutput,
+    },
+    MicroMinotari,
+};
+use tari_transaction_key_manager::MemoryDbKeyManager;
 use tari_utilities::epoch_time::EpochTime;
 
 use crate::{
-    blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainHeader},
+    blocks::{BlockHeaderAccumulatedData, ChainHeader},
     chain_storage::{BlockchainBackend, BlockchainDatabase},
-    consensus::{ConsensusConstants, ConsensusManager},
-    proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty, Difficulty},
-    transactions::{
-        generate_coinbase_with_wallet_output,
-        tari_amount::MicroMinotari,
-        transaction_components::{
-            payment_id::{PaymentId, TxType},
-            CoinBaseExtra,
-            RangeProofType,
-            Transaction,
-            WalletOutput,
-        },
-        transaction_key_manager::{MemoryDbKeyManager, TariKeyId, TransactionKeyManagerInterface},
-    },
+    consensus::BaseNodeConsensusManager,
+    proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty},
 };
-
 #[macro_use]
 mod block_spec;
 pub mod blockchain;
 
-pub fn create_consensus_rules() -> ConsensusManager {
-    ConsensusManager::builder(Network::LocalNet).build().unwrap()
+pub fn create_consensus_rules() -> BaseNodeConsensusManager {
+    BaseNodeConsensusManager::builder(Network::LocalNet).build().unwrap()
 }
 
 pub fn create_consensus_constants(height: u64) -> ConsensusConstants {
@@ -84,8 +86,12 @@ pub fn create_consensus_constants(height: u64) -> ConsensusConstants {
 
 /// Create a partially constructed block using the provided set of transactions
 /// is chain_block, or rename it to `create_orphan_block` and drop the prev_block argument
-pub fn create_orphan_block(block_height: u64, transactions: Vec<Transaction>, consensus: &ConsensusManager) -> Block {
-    let mut header = BlockHeader::new(consensus.consensus_constants(block_height).blockchain_version());
+pub fn create_orphan_block(
+    block_height: u64,
+    transactions: Vec<Transaction>,
+    consensus: &BaseNodeConsensusManager,
+) -> Block {
+    let mut header = BlockHeader::new(consensus.consensus_constants(block_height).blockchain_version().into());
     header.height = block_height;
     header.into_builder().with_transactions(transactions).build()
 }
@@ -106,7 +112,7 @@ pub async fn default_coinbase_entities(key_manager: &MemoryDbKeyManager) -> (Tar
 
 pub async fn create_block<TDB: BlockchainBackend>(
     db: &BlockchainDatabase<TDB>,
-    rules: &ConsensusManager,
+    rules: &BaseNodeConsensusManager,
     prev_block: &Block,
     spec: BlockSpec,
     km: &MemoryDbKeyManager,
@@ -115,7 +121,7 @@ pub async fn create_block<TDB: BlockchainBackend>(
     range_proof_type: Option<RangeProofType>,
 ) -> (Block, WalletOutput) {
     let mut header = BlockHeader::from_previous(&prev_block.header);
-    header.version = rules.consensus_constants(header.height).blockchain_version();
+    header.version = rules.consensus_constants(header.height).blockchain_version().into();
     let block_height = spec.height_override.unwrap_or(prev_block.header.height + 1);
     header.height = block_height;
     let reward = spec.reward_override.unwrap_or_else(|| {
@@ -142,10 +148,7 @@ pub async fn create_block<TDB: BlockchainBackend>(
         false,
         rules.consensus_constants(header.height),
         range_proof_type.unwrap_or(RangeProofType::BulletProofPlus),
-        PaymentId::Open {
-            user_data: vec![],
-            tx_type: TxType::Coinbase,
-        },
+        MemoField::new_open(vec![], TxType::Coinbase).expect("Should never fail since the vector is empty"),
     )
     .await
     .unwrap();

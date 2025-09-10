@@ -27,11 +27,11 @@ use tari_common_types::{
     payment_reference::generate_payment_reference,
     types::{BlockHash, BulletRangeProof, CompressedCommitment, CompressedPublicKey, RangeProof},
 };
-use tari_core::transactions::{
-    tari_amount::MicroMinotari,
-    transaction_components::{EncryptedData, TransactionOutput, TransactionOutputVersion},
-};
 use tari_script::TariScript;
+use tari_transaction_components::{
+    transaction_components::{EncryptedData, TransactionOutput, TransactionOutputVersion},
+    MicroMinotari,
+};
 use tari_utilities::ByteArray;
 
 use crate::{tari_rpc as grpc, tari_rpc::RangeProof as GrpcRangeProof};
@@ -46,10 +46,10 @@ impl TryFrom<grpc::TransactionOutput> for TransactionOutput {
             .ok_or_else(|| "Transaction output features not provided".to_string())??;
 
         let commitment = CompressedCommitment::from_canonical_bytes(&output.commitment)
-            .map_err(|err| format!("Invalid output commitment: {}", err))?;
+            .map_err(|err| format!("Invalid output commitment: {err}"))?;
         let sender_offset_public_key =
             CompressedPublicKey::from_canonical_bytes(output.sender_offset_public_key.as_bytes())
-                .map_err(|err| format!("Invalid sender_offset_public_key {:?}", err))?;
+                .map_err(|err| format!("Invalid sender_offset_public_key {err:?}"))?;
 
         let range_proof = if let Some(proof) = output.range_proof {
             Some(BulletRangeProof::from_canonical_bytes(&proof.proof_bytes).map_err(|err| err.to_string())?)
@@ -58,7 +58,7 @@ impl TryFrom<grpc::TransactionOutput> for TransactionOutput {
         };
 
         let script = TariScript::from_bytes(output.script.as_slice())
-            .map_err(|err| format!("Script deserialization: {:?}", err))?;
+            .map_err(|err| format!("Script deserialization: {err:?}"))?;
 
         let metadata_signature = output
             .metadata_signature

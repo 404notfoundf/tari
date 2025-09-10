@@ -29,11 +29,12 @@ use log::*;
 use minotari_node_wallet_client::BaseNodeWalletClient;
 use tari_common_types::{
     transaction::{TransactionStatus, TxId},
-    types::Signature,
+    types::CompressedSignature,
 };
-use tari_core::{
-    base_node::rpc::models::{TxLocation, TxSubmissionRejectionReason},
-    transactions::{transaction_components::Transaction, transaction_key_manager::TransactionKeyManagerInterface},
+use tari_transaction_components::{
+    key_manager::TransactionKeyManagerInterface,
+    rpc::models::{TxLocation, TxSubmissionRejectionReason},
+    transaction_components::Transaction,
 };
 use tari_utilities::{hex::Hex, ByteArray};
 use tokio::{sync::watch, time::sleep};
@@ -182,7 +183,7 @@ where
             Err(e) => {
                 info!(
                     target: LOG_TARGET,
-                    "Submit Transaction RPC Call to Base Node failed: {}", e
+                    "Submit Transaction RPC Call to Base Node failed: {e}"
                 );
                 return Ok(false);
             },
@@ -231,13 +232,11 @@ where
                 .resources
                 .event_publisher
                 .send(Arc::new(TransactionEvent::TransactionCancelled(self.tx_id, reason)))
-                .map_err(|e| {
+                .inspect_err(|e| {
                     trace!(
                         target: LOG_TARGET,
-                        "Error sending event because there are no subscribers: {:?}",
-                        e
+                        "Error sending event because there are no subscribers: {e:?}",
                     );
-                    e
                 });
 
             return Err(TransactionServiceProtocolError::new(self.tx_id, reason_error));
@@ -262,13 +261,11 @@ where
                 .resources
                 .event_publisher
                 .send(Arc::new(TransactionEvent::TransactionBroadcast(self.tx_id)))
-                .map_err(|e| {
+                .inspect_err(|e| {
                     trace!(
                         target: LOG_TARGET,
-                        "Error sending event, usually because there are no subscribers: {:?}",
-                        e
+                        "Error sending event, usually because there are no subscribers: {e:?}",
                     );
-                    e
                 });
         }
 
@@ -283,7 +280,7 @@ where
     /// end.
     async fn transaction_query(
         &mut self,
-        signature: Signature,
+        signature: CompressedSignature,
         client: &TWalletConnectivity::BaseNodeClient,
     ) -> Result<bool, TransactionServiceProtocolError<TxId>> {
         let response = client
@@ -295,7 +292,7 @@ where
             .map_err(|e| {
                 info!(
                     target: LOG_TARGET,
-                    "Transaction Query RPC Call to Base Node failed: {}", e
+                    "Transaction Query RPC Call to Base Node failed: {e}"
                 );
                 TransactionServiceProtocolError::new(self.tx_id, TransactionServiceError::Other(e.to_string()))
             })?;
@@ -335,13 +332,11 @@ where
                         self.tx_id,
                         TxCancellationReason::InvalidTransaction,
                     )))
-                    .map_err(|e| {
+                    .inspect_err(|e| {
                         trace!(
                             target: LOG_TARGET,
-                            "Error sending event because there are no subscribers: {:?}",
-                            e
+                            "Error sending event because there are no subscribers: {e:?}",
                         );
-                        e
                     });
                 Err(TransactionServiceProtocolError::new(
                     self.tx_id,

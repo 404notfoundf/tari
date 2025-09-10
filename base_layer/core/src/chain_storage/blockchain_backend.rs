@@ -4,19 +4,22 @@
 use tari_common_types::{
     chain_metadata::ChainMetadata,
     epoch::VnEpoch,
-    types::{BadBlock, CompressedCommitment, CompressedPublicKey, FixedHash, HashOutput, Signature},
+    types::{BadBlock, CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput},
 };
+use tari_node_components::blocks::{Block, BlockHeader};
 use tari_sidechain::ShardGroup;
+use tari_transaction_components::transaction_components::{TransactionInput, TransactionKernel, TransactionOutput};
 
 use super::{
     lmdb_db::lmdb_tree_reader::OwnedLmdbTreeReader,
+    AccumulatedDataRebuildStatus,
     MinedInfo,
     PayrefRebuildStatus,
     TemplateRegistrationEntry,
     ValidatorNodeRegistrationInfo,
 };
 use crate::{
-    blocks::{Block, BlockAccumulatedData, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader},
+    blocks::{BlockAccumulatedData, BlockHeaderAccumulatedData, ChainBlock, ChainHeader},
     chain_storage::{
         ChainStorageError,
         DbBasicStats,
@@ -30,9 +33,7 @@ use crate::{
         OutputMinedInfo,
         Reorg,
     },
-    transactions::transaction_components::{TransactionInput, TransactionKernel, TransactionOutput},
 };
-
 /// Identify behaviour for Blockchain database backends. Implementations must support `Send` and `Sync` so that
 /// `BlockchainDatabase` can be thread-safe. The backend *must* also execute transactions atomically; i.e., every
 /// operation within it must succeed, or they all fail. Failure to support this contract could lead to
@@ -90,11 +91,14 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     /// Fetch all bad blocks
     fn fetch_bad_blocks(&self) -> Result<Vec<BadBlock>, ChainStorageError>;
 
+    /// clears all bad blocks
+    fn clear_all_bad_blocks(&mut self) -> Result<(), ChainStorageError>;
+
     /// Fetch a kernel with this excess signature  and returns a `TransactionKernel` and the hash of the block that it
     /// is in
     fn fetch_kernel_by_excess_sig(
         &self,
-        excess_sig: &Signature,
+        excess_sig: &CompressedSignature,
     ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError>;
 
     /// Fetch all UTXOs and spends in the block
@@ -148,6 +152,8 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     fn fetch_chain_metadata(&self) -> Result<ChainMetadata, ChainStorageError>;
     /// Returns the stored payref rebuild status.
     fn fetch_payref_rebuild_status(&self) -> Result<PayrefRebuildStatus, ChainStorageError>;
+    /// Returns the stored accumulated data rebuild status.
+    fn fetch_accumulated_data_rebuild_status(&self) -> Result<AccumulatedDataRebuildStatus, ChainStorageError>;
     /// Builds the payref indexes for a given block height, with stats.
     fn build_payref_indexes_for_height(
         &self,
@@ -156,6 +162,13 @@ pub trait BlockchainBackend: Send + Sync + 'static {
         initialize_stats: Option<u64>,
         finalize: bool,
     ) -> Result<PayrefRebuildStatus, ChainStorageError>;
+    /// Builds the payref indexes for a given block height, with stats.
+    fn update_accumulated_difficulty(
+        &self,
+        height: u64,
+        header_accum_data: BlockHeaderAccumulatedData,
+        last_chain_header: ChainHeader,
+    ) -> Result<AccumulatedDataRebuildStatus, ChainStorageError>;
     /// Returns the UTXO count
     fn utxo_count(&self) -> Result<usize, ChainStorageError>;
     /// Returns the kernel count
