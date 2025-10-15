@@ -110,4 +110,4 @@ tikv-jemalloc-sys= { version ="0.6", features = ["profiling"]}
 # 用于生成与 pprof 兼容的内存剖析数据，并支持符号化和火焰图
 jemalloc_pprof= { version ="0.7", features = ["symbolize","flamegraph"]}
 # 用于生成 CPU 性能剖析数据和火焰图
-pprof= { version ="0.14", features = ["flamegraph","protobuf-codec"]}
+pprof= { version ="0.14", features = ["flamegraph","protobuf-codec"]} 
