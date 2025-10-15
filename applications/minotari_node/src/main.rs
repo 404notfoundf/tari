@@ -91,6 +91,18 @@ use tari_shutdown::Shutdown;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// 配置 Jemalloc 内存分析参数
+#[export_name ="malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
+
+#[cfg(not(target_env="msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env="msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+
 const LOG_TARGET: &str = "minotari::base_node::app";
 
 fn format_system_time(time: SystemTime) -> String {

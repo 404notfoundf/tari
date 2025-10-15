@@ -17,6 +17,7 @@ pub use sync_utxos_by_block::__path_handle as __path_sync_utxos_by_block;
 pub mod get_utxos_deleted_info;
 pub mod get_utxos_mined_info;
 pub mod json_rpc;
+pub mod profile;
 pub mod transaction_query;
 pub mod util;
 

@@ -98,3 +98,16 @@ ignored = [
 [dev-dependencies]
 toml = { version = "0.5" }
 serde_json = "1.0.108"
+
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "windows")))'.dependencies]
+# 使用 tikv-jemallocator 作为内存分配器，并启用性能分析功能
+tikv-jemallocator= { version = "0.6", features = ["profiling","unprefixed_malloc_on_supported_platforms"] }
+# 用于在运行时控制和获取 jemalloc 的统计信息
+tikv-jemalloc-ctl= { version ="0.6", features = ["use_std","stats"] }
+# tikv-jemallocator 的底层绑定，同样启用性能分析
+tikv-jemalloc-sys= { version ="0.6", features = ["profiling"]}
+# 用于生成与 pprof 兼容的内存剖析数据，并支持符号化和火焰图
+jemalloc_pprof= { version ="0.7", features = ["symbolize","flamegraph"]}
+# 用于生成 CPU 性能剖析数据和火焰图
+pprof= { version ="0.14", features = ["flamegraph","protobuf-codec"]}
