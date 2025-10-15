@@ -36,6 +36,19 @@ pub struct ProfileResponse {
     pub size: Option<u64>,
 }
 
+/// 直接返回Profile数据的响应
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProfileDataResponse {
+    /// 操作是否成功
+    pub success: bool,
+    /// 响应消息
+    pub message: String,
+    /// Profile数据（Base64编码）
+    pub content: Option<Vec<u8>>,
+    /// 数据大小（字节）
+    pub size: Option<u64>,
+}
+
 /// 触发内存分析并生成Profile文件
 #[utoipa::path(
     get,
@@ -109,6 +122,60 @@ pub async fn handle_memory_profile(
             success: false,
             message: "当前平台不支持 Jemalloc profiling (MSVC)".to_string(),
             filename: None,
+            content: None,
+            size: None,
+        };
+        Ok(Json(response))
+    }
+}
+
+/// 直接获取内存分析数据（不写入文件）
+#[utoipa::path(
+    get,
+    path = "/profile/memory-data",
+    responses(
+        (status = 200, description = "内存分析数据获取成功", body = ProfileDataResponse),
+        (status = 500, description = "内存分析失败", body = ProfileDataResponse)
+    ),
+    tag = "Profile"
+)]
+pub async fn handle_memory_profile_data() -> Result<Json<ProfileDataResponse>, StatusCode> {
+    info!(target: LOG_TARGET, "收到直接获取内存分析数据请求");
+
+    #[cfg(not(target_env = "msvc"))]
+    match dump_memory_profile_data().await {
+        Ok(profile_data) => {
+            info!(target: LOG_TARGET, "内存分析数据获取完成，大小: {} 字节", profile_data.len());
+            
+            // 将二进制数据编码为Base64
+            // let base64_data = base64::encode(&profile_data);
+            
+            let response = ProfileDataResponse {
+                success: true,
+                message: "内存分析数据获取成功".to_string(),
+                content: Some(profile_data.clone()),
+                size: Some(profile_data.len()),
+            };
+
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!(target: LOG_TARGET, "内存分析数据获取失败: {}", e);
+            let response = ProfileDataResponse {
+                success: false,
+                message: format!("内存分析数据获取失败: {}", e),
+                profile_data: None,
+                data_size: None,
+            };
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+    
+    #[cfg(target_env = "msvc")]
+    {
+        let response = ProfileDataResponse {
+            success: false,
+            message: "当前平台不支持 Jemalloc profiling (MSVC)".to_string(),
             content: None,
             size: None,
         };
@@ -199,11 +266,13 @@ pub async fn start_profile_server() -> Result<(), Box<dyn std::error::Error>> {
     #[openapi(
         paths(
             handle_memory_profile,
+            handle_memory_profile_data,
             handle_profile_status
         ),
         components(
             schemas(
                 ProfileResponse,
+                ProfileDataResponse,
                 ProfileStatusResponse,
                 ProfileRequest
             )
@@ -216,6 +285,7 @@ pub async fn start_profile_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = Router::new()
         .route("/profile/memory", get(handle_memory_profile))
+        .route("/profile/memory-data", get(handle_memory_profile_data))
         .route("/profile/status", get(handle_profile_status))
         .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", ApiDoc::openapi()));
 
@@ -255,4 +325,26 @@ pub async fn dump_memory_profile() -> Result<String, String> {
 
     info!("Memory profile dumped to: {}", filename);
     Ok(filename)
+}
+
+/// 直接获取内存分析数据（不写入文件）
+#[cfg(not(target_env = "msvc"))]
+pub async fn dump_memory_profile_data() -> Result<Vec<u8>, String> {
+    // 获取 jemalloc 的 profiling 控制器
+    let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref()
+        .ok_or_else(|| "Profiling controller not available".to_string())?;
+
+    let mut prof_ctl = prof_ctl.lock().await;
+    
+    // 检查 profiling 是否已激活
+    if !prof_ctl.activated() {
+        return Err("Jemalloc profiling is not activated".to_string());
+    }
+   
+    // 调用 dump_pprof() 方法生成 pprof 数据
+    let pprof_data = prof_ctl.dump_pprof()
+        .map_err(|e| format!("Failed to dump pprof: {}", e))?;
+
+    info!("Memory profile data generated, size: {} bytes", pprof_data.len());
+    Ok(pprof_data)
 }
