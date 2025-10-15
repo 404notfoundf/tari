@@ -39,6 +39,7 @@ mod recovery;
 mod utils;
 
 mod http;
+mod profile;
 
 use std::{process, sync::Arc};
 
@@ -181,6 +182,13 @@ pub async fn run_base_node_with_cli(
     if config.base_node.grpc_enabled {
         task::spawn(run_grpc(grpc, grpc_address, auth, tls_identity, shutdown.to_signal()));
     }
+
+    // 启动Profile HTTP服务器
+    task::spawn(async move {
+        if let Err(e) = crate::profile::handler::start_profile_server().await {
+            error!(target: LOG_TARGET, "Failed to start profile server: {e}");
+        }
+    });
 
     let main_loop = CliLoop::new(context, cli.watch, cli.non_interactive_mode);
     if cli.non_interactive_mode {
