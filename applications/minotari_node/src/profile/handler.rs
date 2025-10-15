@@ -154,7 +154,7 @@ pub async fn handle_memory_profile_data() -> Result<Json<ProfileDataResponse>, S
                 success: true,
                 message: "内存分析数据获取成功".to_string(),
                 content: Some(profile_data.clone()),
-                size: Some(profile_data.len()),
+                size: Some(profile_data.len() as u64),
             };
 
             Ok(Json(response))
@@ -164,8 +164,8 @@ pub async fn handle_memory_profile_data() -> Result<Json<ProfileDataResponse>, S
             let response = ProfileDataResponse {
                 success: false,
                 message: format!("内存分析数据获取失败: {}", e),
-                profile_data: None,
-                data_size: None,
+                content: None,
+                size: None,
             };
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
