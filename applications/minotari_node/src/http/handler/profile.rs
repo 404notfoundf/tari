@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use log::{error, info};
+use log::info;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -141,7 +141,7 @@ pub async fn handle_memory_profile(
             content: None,
             size: None,
         };
-        Err(StatusCode::NOT_IMPLEMENTED)
+        Ok(Json(response))
     }
 }
 
@@ -165,7 +165,7 @@ pub async fn handle_profile_status() -> Result<Json<ProfileStatusResponse>, Stat
             
             let response = ProfileStatusResponse {
                 success: true,
-                message: "Jemalloc profiling 状态获取成功",
+                message: "Jemalloc profiling 状态获取成功".to_string(),
                 profiling_available: true,
                 profiling_active: is_activated,
                 platform_supported: true,
