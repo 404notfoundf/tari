@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use log::info;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
