@@ -109,5 +109,3 @@ tikv-jemalloc-ctl= { version ="0.6", features = ["use_std","stats"] }
 tikv-jemalloc-sys= { version ="0.6", features = ["profiling"]}
 # 用于生成与 pprof 兼容的内存剖析数据
 jemalloc_pprof= { version ="0.8", features = ["symbolize", "flamegraph"]}
-# 用于生成 CPU 性能剖析数据
-pprof= { version ="0.12", features = ["protobuf-codec"]} 
