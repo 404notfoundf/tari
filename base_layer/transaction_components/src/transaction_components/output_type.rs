@@ -76,8 +76,8 @@ impl OutputType {
         FromPrimitive::from_u8(value)
     }
 
-    pub const fn all() -> &'static [Self] {
-        &[
+    pub fn all() -> Vec<Self> {
+        vec![
             OutputType::Standard,
             OutputType::Coinbase,
             OutputType::Burn,
@@ -102,6 +102,10 @@ impl OutputType {
 
     pub fn is_template_registration(&self) -> bool {
         matches!(self, OutputType::CodeTemplateRegistration)
+    }
+
+    pub fn is_burn(&self) -> bool {
+        matches!(self, OutputType::Burn)
     }
 }
 
@@ -132,7 +136,7 @@ mod tests {
         }
 
         for variant in OutputType::all() {
-            let mask = 1 << *variant as u8;
+            let mask = 1 << variant as u8;
             check_duplicate(variant_bits, mask);
             match variant {
                 OutputType::Standard => variant_bits |= mask,

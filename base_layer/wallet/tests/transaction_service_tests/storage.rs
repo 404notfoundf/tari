@@ -46,7 +46,7 @@ use tari_common::configuration::Network;
 use tari_common_types::{
     key_branches::TransactionKeyManagerBranch,
     tari_address::TariAddress,
-    transaction::{TransactionDirection, TransactionStatus, TxId},
+    transaction::{LegacyTransactionStatus, TransactionDirection, TxId},
     types::{CompressedPublicKey, CompressedSignature, FixedHash, PrivateKey},
 };
 use tari_crypto::keys::SecretKey as SecretKeyTrait;
@@ -135,7 +135,10 @@ pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     )
     .await
     .unwrap();
-    builder.with_output(output.clone(), sender_offset.key_id).await.unwrap();
+    builder
+        .with_output(output.clone(), sender_offset.key_id, None)
+        .await
+        .unwrap();
     let finalized = builder.build().await.unwrap();
 
     let messages = ["Hey!", "Yo!", "Sup!"];
@@ -161,7 +164,7 @@ pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             amount: amounts[i],
             fee: finalized.fee,
             sender_protocol: SenderTransactionProtocol::new_placeholder(),
-            status: TransactionStatus::Pending,
+            status: LegacyTransactionStatus::Pending,
             payment_id: MemoField::open_from_string(messages[i], TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
@@ -221,7 +224,7 @@ pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             source_address: address,
             amount: amounts[i],
             receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
-            status: TransactionStatus::Pending,
+            status: LegacyTransactionStatus::Pending,
             payment_id: MemoField::open_from_string(messages[i], TxType::PaymentToOther),
             timestamp: Utc::now(),
             cancelled: false,
@@ -301,9 +304,9 @@ pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             fee: MicroMinotari::from(200),
             transaction: tx.clone(),
             status: match i {
-                0 => TransactionStatus::Completed,
-                1 => TransactionStatus::Broadcast,
-                _ => TransactionStatus::MinedUnconfirmed,
+                0 => LegacyTransactionStatus::Completed,
+                1 => LegacyTransactionStatus::Broadcast,
+                _ => LegacyTransactionStatus::MinedUnconfirmed,
             },
             timestamp: Utc::now(),
             cancelled: None,
@@ -369,7 +372,7 @@ pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
         FixedHash::zero(),
         0,
         true,
-        &completed_txs[0].status,
+        completed_txs[0].status,
     )
     .unwrap();
 
@@ -461,7 +464,7 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        TransactionStatus::Imported,
+        LegacyTransactionStatus::Imported,
         Utc::now(),
         TransactionDirection::Inbound,
         Some(5),
@@ -490,7 +493,7 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        TransactionStatus::OneSidedUnconfirmed,
+        LegacyTransactionStatus::OneSidedUnconfirmed,
         Utc::now(),
         TransactionDirection::Inbound,
         Some(6),
@@ -519,7 +522,7 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        TransactionStatus::OneSidedConfirmed,
+        LegacyTransactionStatus::OneSidedConfirmed,
         Utc::now(),
         TransactionDirection::Inbound,
         Some(7),

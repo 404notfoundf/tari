@@ -4,6 +4,7 @@ description = "A peer-to-peer messaging system"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -65,6 +66,7 @@ tower = { version = "0.4", features = ["util"] }
 tracing = "0.1.26"
 yamux = "0.13.2"
 zeroize = "1"
+local-ip-address = "0.6.5"
 
 [dev-dependencies]
 tari_test_utils = { workspace = true }

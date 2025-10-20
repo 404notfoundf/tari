@@ -3,6 +3,7 @@ name = "minotari_wallet"
 description = "Tari cryptocurrency wallet library"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -26,6 +27,7 @@ tari_common_types = { workspace = true }
 tari_comms = { workspace = true }
 tari_comms_dht = { workspace = true }
 tari_crypto = { workspace = true }
+tari_hashing = { workspace = true }
 tari_max_size = { workspace = true }
 tari_p2p = { workspace = true, features = ["auto-update"] }
 tari_script = { workspace = true }
@@ -71,12 +73,11 @@ tempfile = "3.1.0"
 thiserror = "1.0.26"
 tower = "0.4"
 prost = "0.13.3"
-semver = { version = "1.0", features = ["serde"] }
 itertools = "0.10.3"
 chacha20poly1305 = "0.10.1"
 zeroize = "1"
 url = { version = "2.5.4", features = ["default", "serde"] }
-
+uuid = "1.17.0"
 [build-dependencies]
 tari_common = { workspace = true, features = [
     "build",

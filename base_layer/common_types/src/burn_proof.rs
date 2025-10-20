@@ -1,4 +1,4 @@
-//  Copyright 2024. The Tari Project
+//  Copyright 2023. The Tari Project
 //
 //  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
 //  following conditions are met:
@@ -19,12 +19,27 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 use serde::{Deserialize, Serialize};
-use tari_node_components::blocks::Block;
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Job {
-    pub job_id: u64,
-    pub block: Option<Block>,
-    pub target: u64,
-    pub height: u64,
+
+use crate::{
+    serializers,
+    types::{BlockHash, CompressedCommitment, CompressedPublicKey, CompressedSignature},
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurnClaimProof {
+    /// Public key used in the DH exchange to derive the decryption key
+    pub reciprocal_claim_public_key: CompressedPublicKey,
+    pub commitment: CompressedCommitment,
+    pub ownership_proof: CompressedSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncodedMerkleProof {
+    #[serde(with = "serializers::base64")]
+    pub block_hash: BlockHash,
+    #[serde(with = "serializers::base64")]
+    pub encoded_merkle_proof: Vec<u8>,
+    pub leaf_index: u64,
 }

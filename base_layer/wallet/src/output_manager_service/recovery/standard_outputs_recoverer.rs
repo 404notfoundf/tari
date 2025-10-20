@@ -31,7 +31,7 @@ use tari_crypto::keys::SecretKey;
 use tari_script::{inputs, script, ExecutionStack, Opcode, TariScript};
 use tari_transaction_components::{
     key_manager::{TariKeyId, TransactionKeyManagerInterface},
-    transaction_components::{MemoField, OutputType, TransactionError, TransactionOutput, WalletOutput},
+    transaction_components::{MemoField, OutputType, TransactionOutput, WalletOutput},
     MicroMinotari,
 };
 use tari_utilities::hex::Hex;
@@ -97,12 +97,12 @@ where
                 continue;
             }
 
-            let (spending_key, committed_value, payment_id) = match self.attempt_output_recovery(&output).await? {
+            let (commitment_mask, committed_value, payment_id) = match self.attempt_output_recovery(&output).await? {
                 Some(recovered) => recovered,
                 None => continue,
             };
             let (input_data, script_key) = match self
-                .find_script_key(&output.script, &spending_key, known_script_index, &known_scripts)
+                .find_script_key(&output.script, &commitment_mask, known_script_index, &known_scripts)
                 .await?
             {
                 Some((input_data, script_key)) => (input_data, script_key),
@@ -110,22 +110,13 @@ where
             };
 
             let hash = output.hash();
-            let uo = WalletOutput::new_with_rangeproof(
-                output.version,
+            let uo = WalletOutput::new_from_transaction_output(
                 committed_value,
-                spending_key,
-                output.features,
-                output.script,
+                commitment_mask,
+                payment_id,
+                output,
                 input_data,
                 script_key,
-                output.sender_offset_public_key,
-                output.metadata_signature,
-                0,
-                output.covenant,
-                output.encrypted_data,
-                output.minimum_value_promise,
-                output.proof.clone(),
-                payment_id,
             );
 
             rewound_outputs.push((uo, known_script_index.is_some(), hash, tx_id));
@@ -143,13 +134,11 @@ where
         for (output, has_known_script, hash, tx_id) in &mut rewound_outputs {
             let db_output = DbWalletOutput::from_wallet_output(
                 output.clone(),
-                &self.master_key_manager,
                 None,
                 Self::output_source(output, *has_known_script),
                 None,
                 None,
-            )
-            .await?;
+            );
             let tx_id = match tx_id {
                 Some(id) => *id,
                 None => {
@@ -200,8 +189,8 @@ where
                 target: LOG_TARGET,
                 "Output {} with value {} with {} recovered",
                 output_hex,
-                output.value,
-                output.features,
+                output.value(),
+                output.features(),
             );
         }
 
@@ -210,8 +199,8 @@ where
 
     // Helper function to get the output source for a given output
     fn output_source(output: &WalletOutput, has_known_script: bool) -> OutputSource {
-        match output.features.output_type {
-            OutputType::Standard => match *output.script.as_slice() {
+        match output.features().output_type {
+            OutputType::Standard => match *output.script().as_slice() {
                 [Opcode::Nop] => OutputSource::Standard,
                 [Opcode::PushPubKey(_), Opcode::Drop, Opcode::PushPubKey(_)] => OutputSource::StealthOneSided,
                 [Opcode::PushPubKey(_)] => {
@@ -246,7 +235,7 @@ where
                 TariKeyId::from_str(&key.to_string()).map_err(OutputManagerError::BuildError)?
             } else {
                 let private_key = PrivateKey::random(&mut rand::thread_rng());
-                self.master_key_manager.import_key(private_key).await?
+                self.master_key_manager.import_key(private_key, None).await?
             };
             let public_key = self.master_key_manager.get_public_key_at_key_id(&key).await?;
             (inputs!(public_key), key)
@@ -293,13 +282,15 @@ where
         };
         let (key, committed_value, payment_id) = match self
             .master_key_manager
-            .try_output_key_recovery(output.commitment(), output.encrypted_data(), None)
-            .await
+            .try_output_key_recovery(
+                output.commitment(),
+                output.encrypted_data(),
+                &output.sender_offset_public_key,
+            )
+            .await?
         {
-            Ok(value) => value,
-            // Key manager errors here are actual errors and should not be suppressed.
-            Err(TransactionError::KeyManagerError(e)) => return Err(TransactionError::KeyManagerError(e).into()),
-            Err(_) => return Ok(None),
+            Some(value) => value,
+            _ => return Ok(None),
         };
 
         Ok(Some((key, committed_value, payment_id)))

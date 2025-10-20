@@ -1,4 +1,4 @@
-//  Copyright 2023. The Tari Project
+//  Copyright 2021, The Tari Project
 //
 //  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
 //  following conditions are met:
@@ -20,14 +20,18 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use tari_crypto::ristretto::RistrettoComSig;
-
-use crate::types::{BulletRangeProof, CompressedCommitment, CompressedPublicKey};
-
-#[derive(Debug, Clone)]
-pub struct BurntProof {
-    pub reciprocal_claim_public_key: CompressedPublicKey,
-    pub commitment: CompressedCommitment,
-    pub ownership_proof: Option<RistrettoComSig>,
-    pub range_proof: BulletRangeProof,
+#[derive(Debug, thiserror::Error)]
+pub enum BlockError {
+    #[error("{field} not provided")]
+    BuilderMissingField { field: &'static str },
+    #[error("{field} contained an invalid value: {details}")]
+    BuilderInvalidValue { field: &'static str, details: String },
+    #[error("A full block cannot be constructed from the historical block because it contains pruned TXOs")]
+    HistoricalBlockContainsPrunedTxos,
+    #[error("Chain block invariant error: {0}")]
+    ChainBlockInvariantError(String),
+    #[error("Adding difficulties overflowed")]
+    DifficultyOverflow,
+    #[error("Failed to convert block")]
+    ConversionError,
 }

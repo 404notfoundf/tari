@@ -28,21 +28,28 @@ use tari_common_types::{
     types::{CompressedCommitment, FixedHash},
 };
 use tari_core::{
-    blocks::{BlockHeaderAccumulatedData, ChainBlock, ChainHeader},
+    blocks::BlockHeaderAccumulatedDataBuilder,
     chain_storage::{BlockAddResult, BlockchainBackend, BlockchainDatabase, ChainStorageError, SmtHasher},
     consensus::BaseNodeConsensusManager,
     kernel_mr_hash_from_mmr,
-    proof_of_work::{sha3x_difficulty, AccumulatedDifficulty, AchievedTargetDifficulty},
+    proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty},
     KernelMmr,
     PrunedOutputMmr,
 };
 use tari_mmr::pruned_hashset::PrunedHashSet;
-use tari_node_components::blocks::{Block, BlockHeader, NewBlockTemplate};
+use tari_node_components::blocks::{
+    Block,
+    BlockHeader,
+    BlockHeaderAccumulatedData,
+    ChainBlock,
+    ChainHeader,
+    NewBlockTemplate,
+};
 use tari_script::script;
 use tari_transaction_components::{
     consensus::{emission::Emission, ConsensusConstants},
     key_manager::{TransactionKeyManagerInterface, TxoStage},
-    tari_proof_of_work::{Difficulty, PowAlgorithm},
+    tari_proof_of_work::{AccumulatedDifficulty, Difficulty, PowAlgorithm},
     test_helpers::{create_wallet_output_with_data, spend_utxos, TestParams, TransactionSchema},
     transaction_components::{
         CoinBaseExtra,
@@ -116,7 +123,7 @@ pub async fn create_coinbase(
     )
     .await
     .unwrap();
-    let output = wallet_output.to_transaction_output(key_manager).await.unwrap();
+    let output = wallet_output.to_transaction_output().unwrap();
 
     (output, kernel, wallet_output)
 }
@@ -238,7 +245,7 @@ pub async fn create_genesis_block_with_utxos(
                 .await
                 .unwrap();
         outputs.push(wallet_output.clone());
-        let output = wallet_output.to_transaction_output(key_manager).await.unwrap();
+        let output = wallet_output.to_transaction_output().unwrap();
         template.body.add_output(output);
     }
     let mut block = update_genesis_block_mmr_roots(template).unwrap();
@@ -591,18 +598,22 @@ pub async fn construct_chained_blocks<B: BlockchainBackend>(
 }
 
 #[allow(dead_code)]
-pub fn create_chain_header(header: BlockHeader, prev_accum: &BlockHeaderAccumulatedData) -> ChainHeader {
+pub fn create_chain_header(
+    header: BlockHeader,
+    prev_accum: &BlockHeaderAccumulatedData,
+    consensus_constants: &ConsensusConstants,
+) -> ChainHeader {
     let achieved_target_diff = AchievedTargetDifficulty::try_construct(
         header.pow_algo(),
         prev_accum.target_difficulty,
         prev_accum.achieved_difficulty,
     )
     .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(prev_accum)
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(prev_accum)
         .with_hash(header.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(header.total_kernel_offset.clone())
-        .build()
+        .build(consensus_constants)
         .unwrap();
     ChainHeader::try_construct(header, accumulated_data).unwrap()
 }

@@ -19,7 +19,10 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 use std::{
+    cmp::max,
+    collections::VecDeque,
     convert::{TryFrom, TryInto},
     str::FromStr,
     sync::Arc,
@@ -45,7 +48,6 @@ use minotari_app_grpc::tari_rpc::{
     ClaimShaAtomicSwapResponse,
     CoinSplitRequest,
     CoinSplitResponse,
-    CommitmentSignature,
     CreateBurnTransactionRequest,
     CreateBurnTransactionResponse,
     CreateTemplateRegistrationRequest,
@@ -58,6 +60,8 @@ use minotari_app_grpc::tari_rpc::{
     GetBalanceResponse,
     GetBlockHeightTransactionsRequest,
     GetBlockHeightTransactionsResponse,
+    GetBurnClaimProofRequest,
+    GetBurnClaimProofResponse,
     GetCompleteAddressResponse,
     GetCompletedTransactionsRequest,
     GetCompletedTransactionsResponse,
@@ -84,8 +88,12 @@ use minotari_app_grpc::tari_rpc::{
     ImportTransactionsResponse,
     ImportUtxosRequest,
     ImportUtxosResponse,
+    PrepareDepositMultisigTransactionRequest,
+    PrepareDepositMultisigTransactionResponse,
     PrepareOneSidedTransactionForSigningRequest,
     PrepareOneSidedTransactionForSigningResponse,
+    PrepareWithdrawMultisigTransactionRequest,
+    PrepareWithdrawMultisigTransactionResponse,
     RegisterValidatorNodeRequest,
     RegisterValidatorNodeResponse,
     ReplaceByFeeRequest,
@@ -115,14 +123,13 @@ use minotari_app_grpc::tari_rpc::{
     ValidateResponse,
 };
 use minotari_wallet::{
-    connectivity_service::{OnlineStatus, WalletConnectivityInterface},
+    connectivity_service::{OnlineStatus, WalletConnectivityInterface, UNKNOWN_LATENCY_MS},
     error::WalletStorageError,
     legacy_transaction_protocol::recipient::RecipientState,
     output_manager_service::{handle::OutputManagerHandle, UtxoSelectionCriteria},
     transaction_service::{
         error::TransactionServiceError,
         handle::TransactionServiceHandle,
-        offline_signing::models::{SignedOneSidedTransactionResult, TransactionResult},
         storage::models::{self, WalletTransaction},
     },
     WalletKeyManager,
@@ -133,12 +140,21 @@ use tari_common_types::{
     payment_reference::generate_payment_reference,
     tari_address::TariAddress,
     transaction::TxId,
-    types::{BlockHash, CompressedPublicKey, CompressedSignature, PrivateKey, SignatureWithDomain},
+    types::{
+        BlockHash,
+        CompressedCommitment,
+        CompressedPublicKey,
+        CompressedSignature,
+        PrivateKey,
+        SignatureWithDomain,
+    },
 };
-use tari_comms::{connectivity::ConnectivityStatus, types::CommsPublicKey, CommsNode};
+use tari_comms::{connectivity::ConnectivityStatus, types::CommsPublicKey};
+use tari_hashing::WalletMessageSigningDomain;
+use tari_script::CompressedCheckSigSchnorrSignature;
 use tari_transaction_components::{
     consensus::{ConsensusConstants, ConsensusManager},
-    key_manager::TransactionKeyManagerInterface,
+    offline_signing::models::SignedOneSidedTransactionResult,
     transaction_components::{
         memo_field::{MemoField, TxType},
         OutputFeatures,
@@ -146,7 +162,7 @@ use tari_transaction_components::{
     },
     MicroMinotari,
 };
-use tari_utilities::{hex::Hex, ByteArray};
+use tari_utilities::{hex::Hex, message_format::MessageFormat, ByteArray};
 use tokio::{
     sync::{broadcast, Mutex},
     task,
@@ -160,13 +176,6 @@ use crate::{
 };
 
 const LOG_TARGET: &str = "wallet::ui::grpc";
-use tari_crypto::hash_domain;
-// Domain separator for signing arbitrary messages with a wallet secret key
-hash_domain!(
-    WalletMessageSigningDomain,
-    "com.tari.base_layer.wallet.message_signing",
-    1
-);
 
 async fn send_transaction_event(
     transaction_event: TransactionEvent,
@@ -183,10 +192,14 @@ async fn send_transaction_event(
     }
 }
 
+const AVG_LATENCIES_CAPACITY: usize = 10;
+
 pub struct WalletGrpcServer {
     wallet: WalletSqlite,
     rules: ConsensusManager,
     debouncer: Arc<Mutex<WalletDebouncer<WalletKeyManager>>>,
+    // Average latencies in ms with fixed/bounded queue
+    avg_latencies_ms: Arc<Mutex<VecDeque<u64>>>,
 }
 
 impl WalletGrpcServer {
@@ -202,7 +215,7 @@ impl WalletGrpcServer {
             wallet.transaction_service.clone(),
             wallet.utxo_scanner_service.clone(),
             wallet.clone(),
-            wallet.comms.shutdown_signal(),
+            wallet.shutdown_signal.clone(),
             scanned_height,
         );
         let rules = ConsensusManager::builder(wallet.network.as_network()).build();
@@ -210,6 +223,7 @@ impl WalletGrpcServer {
             wallet,
             debouncer: Arc::new(Mutex::new(debouncer)),
             rules,
+            avg_latencies_ms: Arc::new(Mutex::new(VecDeque::with_capacity(AVG_LATENCIES_CAPACITY))),
         }
     }
 
@@ -230,8 +244,87 @@ impl WalletGrpcServer {
         self.wallet.output_manager_service.clone()
     }
 
-    fn comms(&self) -> &CommsNode {
-        &self.wallet.comms
+    async fn transfer_single_tx(
+        &self,
+        recipients: Vec<minotari_app_grpc::tari_rpc::PaymentRecipient>,
+    ) -> Result<Response<minotari_app_grpc::tari_rpc::TransferResponse>, Status> {
+        let fee_per_gram = recipients.first().expect("already checked").fee_per_gram;
+        let recipients = recipients
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dest)| -> Result<_, String> {
+                let address = TariAddress::from_str(&dest.address)
+                    .map_err(|_| format!("Destination address at index {idx} is malformed"))?;
+                let payment_id = if !dest.raw_payment_id.is_empty() {
+                    MemoField::new_open(dest.raw_payment_id.to_vec(), TxType::PaymentToOther)?
+                } else if let Some(user_pay_id) = dest.user_payment_id {
+                    let bytes = match (
+                        user_pay_id.u256.is_empty(),
+                        user_pay_id.utf8_string.is_empty(),
+                        user_pay_id.user_bytes.is_empty(),
+                    ) {
+                        (false, true, true) => user_pay_id.u256,
+                        (true, false, true) => user_pay_id.utf8_string.as_bytes().to_vec(),
+                        (true, true, false) => user_pay_id.user_bytes,
+                        _ => {
+                            return Err("user_payment_id must be one of u256, utf8_string or user_bytes".to_string());
+                        },
+                    };
+                    MemoField::new_open(bytes, TxType::PaymentToOther)?
+                } else {
+                    MemoField::new_empty()
+                };
+                Ok((address, MicroMinotari(dest.amount), payment_id))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Status::invalid_argument)?;
+        let mut transaction_service = self.get_transaction_service();
+        let ids = transaction_service
+            .send_one_sided_multi_recipient_transaction(
+                recipients,
+                UtxoSelectionCriteria::default(),
+                OutputFeatures::default(),
+                fee_per_gram.into(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to send transaction: {e}")))?;
+        let mut results = Vec::new();
+        for id in ids {
+            let wallet_address = self
+                .wallet
+                .get_wallet_one_sided_address()
+                .await
+                .map_err(|e| Status::internal(format!("{e:?}")))?;
+            let wallet_tx = timeout(Duration::from_millis(100), async {
+                loop {
+                    let tx = self
+                        .get_transaction_service()
+                        .get_any_transaction(id)
+                        .await
+                        .map_err(|e| Status::internal(format!("{e:?}")));
+
+                    if let Ok(Some(tx)) = tx {
+                        break tx;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                error!(target: LOG_TARGET, "Transaction {id} not found within timeout");
+                Status::not_found(format!("Transaction {id} not found within timeout"))
+            })?;
+            let address = wallet_tx.destination_address().expect("cannot fail").to_string();
+            let final_tx = convert_wallet_transaction_into_transaction_info(wallet_tx, &wallet_address);
+            results.push(minotari_app_grpc::tari_rpc::TransferResult {
+                address,
+                transaction_id: id.into(),
+                is_success: true,
+                failure_message: Default::default(),
+                transaction_info: Some(final_tx),
+            });
+        }
+        Ok(Response::new(minotari_app_grpc::tari_rpc::TransferResponse { results }))
     }
 }
 
@@ -254,7 +347,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let debouncer = self.debouncer.lock().await;
         let connection_status = debouncer.get_connection_status().await;
         Ok(Response::new(CheckConnectivityResponse {
-            status: connection_status as i32,
+            status: i32::from(connection_status.as_u8()),
         }))
     }
 
@@ -277,10 +370,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
     }
 
     async fn identify(&self, _: Request<GetIdentityRequest>) -> Result<Response<GetIdentityResponse>, Status> {
-        let identity = self.wallet.comms.node_identity();
+        let identity = self.wallet.node_identity.clone();
         Ok(Response::new(GetIdentityResponse {
             public_key: identity.public_key().to_vec(),
-            public_address: identity.public_addresses().iter().map(|a| a.to_string()).collect(),
+            public_address: String::new(), // Note: Without comms this will always resolve to be empty
             node_id: identity.node_id().to_vec(),
         }))
     }
@@ -422,34 +515,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
             (Some(balance), scanned_height, is_initial_validation_done)
         };
 
-        let online_status = self.wallet.wallet_connectivity.get_connectivity_status().await;
-
-        let status = self
-            .comms()
-            .connectivity()
-            .get_connectivity_status()
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-
-        let status = if online_status == OnlineStatus::Offline {
-            ConnectivityStatus::Offline
-        } else {
-            status
-        };
-
-        let mut base_node_service = self.wallet.base_node_service.clone();
-
-        let network = Some(tari_rpc::NetworkStatusResponse {
-            status: tari_rpc::ConnectivityStatus::from(status) as i32,
-            avg_latency_ms: base_node_service
-                .get_base_node_latency()
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
-                .unwrap_or_default(),
-            num_node_connections: u32::try_from(status.num_connected_nodes())
-                .map_err(|_| Status::internal("Count not convert u64 to usize".to_string()))?,
-        });
+        let status = self.get_network_status(Request::new(tari_rpc::Empty {})).await?;
+        let network = Some(status.into_inner());
 
         trace!(target: LOG_TARGET, "'get_state' completed in {:.2?}", start.elapsed());
         Ok(Response::new(GetStateResponse {
@@ -474,7 +541,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         Ok(Response::new(GetUnspentAmountsResponse {
             amount: unspent_amounts
                 .into_iter()
-                .map(|o| o.wallet_output.value.as_u64())
+                .map(|o| o.wallet_output.value().as_u64())
                 .filter(|&a| a > 0)
                 .collect(),
         }))
@@ -521,7 +588,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     ));
                 },
             };
-            MemoField::open_unchecked(bytes, TxType::ClaimAtomicSwap)
+            MemoField::new_open(bytes, TxType::ClaimAtomicSwap).map_err(|e| Status::internal(e.to_string()))?
         } else {
             MemoField::new_empty()
         };
@@ -611,12 +678,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .await
                             .map_err(|e| Status::internal(format!("{e:?}")))?
                             .ok_or_else(|| Status::not_found("Transaction not found".to_string()))?;
-                        let final_tx = convert_wallet_transaction_into_transaction_info(
-                            wallet_tx,
-                            &wallet_address,
-                            &self.wallet.key_manager_service,
-                        )
-                        .await;
+                        let final_tx = convert_wallet_transaction_into_transaction_info(wallet_tx, &wallet_address);
                         TransferResult {
                             address: Default::default(),
                             transaction_id: tx_id.as_u64(),
@@ -688,12 +750,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .await
                             .map_err(|e| Status::internal(format!("{e:?}")))?
                             .ok_or_else(|| Status::not_found("Transaction not found".to_string()))?;
-                        let final_tx = convert_wallet_transaction_into_transaction_info(
-                            wallet_tx,
-                            &wallet_address,
-                            &self.wallet.key_manager_service,
-                        )
-                        .await;
+                        let final_tx = convert_wallet_transaction_into_transaction_info(wallet_tx, &wallet_address);
                         TransferResult {
                             address: Default::default(),
                             transaction_id: tx_id.as_u64(),
@@ -755,7 +812,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     ));
                 },
             };
-            MemoField::open_unchecked(bytes, TxType::PaymentToOther)
+            MemoField::new_open(bytes, TxType::PaymentToOther).map_err(|e| Status::internal(e.to_string()))?
         } else {
             MemoField::new_empty()
         };
@@ -830,9 +887,156 @@ impl wallet_server::Wallet for WalletGrpcServer {
         Ok(Response::new(response))
     }
 
+    async fn prepare_deposit_multisig_transaction(
+        &self,
+        request: Request<PrepareDepositMultisigTransactionRequest>,
+    ) -> Result<Response<PrepareDepositMultisigTransactionResponse>, Status> {
+        debug!(target: LOG_TARGET, "prepare_deposit_multisig_transaction called");
+        let message = request.into_inner();
+
+        let recipient = TariAddress::from_bytes(message.recipient_address.as_slice())
+            .map_err(|e| Status::invalid_argument(format!("Invalid recipient address: {e}")))?;
+
+        let public_keys = message
+            .public_keys
+            .into_iter()
+            .map(|pk_bytes| {
+                CompressedPublicKey::from_canonical_bytes(&pk_bytes)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid public key: {e}")))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        // Semantic validation
+        if message.amount == 0 {
+            return Err(Status::invalid_argument("amount must be greater than 0".to_string()));
+        }
+        if public_keys.is_empty() {
+            return Err(Status::invalid_argument("public_keys cannot be empty".to_string()));
+        }
+        let party_number_u8 = u8::try_from(message.party_number)
+            .map_err(|_| Status::invalid_argument("party_number_u8 must be in 1..=255".to_string()))?;
+        if party_number_u8 == 0 {
+            return Err(Status::invalid_argument(
+                "party_number_u8 must be greater than 0".to_string(),
+            ));
+        }
+        if (party_number_u8 as usize) > public_keys.len() {
+            return Err(Status::invalid_argument(
+                "party_number_u8 must be less than or equal to the number of public keys".to_string(),
+            ));
+        }
+        // Ensure unique signers
+        {
+            let mut set = std::collections::HashSet::new();
+            if !public_keys.iter().all(|pk| set.insert(pk.as_bytes().to_vec())) {
+                return Err(Status::invalid_argument("public_keys must be unique".to_string()));
+            }
+        }
+
+        let mut transaction_service = self.get_transaction_service();
+
+        let response = match transaction_service
+            .prepare_deposit_multisig_transaction(
+                MicroMinotari::from(message.amount),
+                party_number_u8,
+                public_keys,
+                recipient.clone(),
+            )
+            .await
+        {
+            Ok(data) => {
+                let json_data = data.to_json().map_err(|e| Status::internal(e.to_string()))?;
+                PrepareDepositMultisigTransactionResponse {
+                    is_success: true,
+                    result: json_data,
+                    failure_message: Default::default(),
+                }
+            },
+            Err(err) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "Failed to lock transaction for address `{recipient}`: {err}"
+                );
+                PrepareDepositMultisigTransactionResponse {
+                    is_success: false,
+                    result: Default::default(),
+                    failure_message: err.to_string(),
+                }
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn prepare_withdraw_multisig_transaction(
+        &self,
+        request: Request<PrepareWithdrawMultisigTransactionRequest>,
+    ) -> Result<Response<PrepareWithdrawMultisigTransactionResponse>, Status> {
+        debug!(target: LOG_TARGET, "prepare_withdraw_multisig_transaction called");
+        let message = request.into_inner();
+
+        let recipient = TariAddress::from_bytes(message.recipient_address.as_slice())
+            .map_err(|e| Status::invalid_argument(format!("Invalid recipient address: {e}")))?;
+
+        let signatures = message
+            .signatures
+            .into_iter()
+            .map(|signature_bytes| {
+                CompressedCheckSigSchnorrSignature::from_binary(&signature_bytes)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid signature: {e}")))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        if signatures.is_empty() {
+            return Err(Status::invalid_argument("signatures cannot be empty".to_string()));
+        }
+
+        let commitment = CompressedCommitment::from_hex(&message.utxo_commitment)
+            .map_err(|e| Status::invalid_argument(format!("Invalid UTXO commitment hash: {e}")))?;
+
+        let mut transaction_service = self.get_transaction_service();
+
+        let response = match transaction_service
+            .prepare_withdraw_multisig_transaction(commitment, signatures, recipient.clone())
+            .await
+        {
+            Ok(data) => {
+                let json_data = data.to_json().map_err(|e| Status::internal(e.to_string()))?;
+                PrepareWithdrawMultisigTransactionResponse {
+                    is_success: true,
+                    result: json_data,
+                    failure_message: Default::default(),
+                }
+            },
+            Err(err) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "Failed to lock transaction for address `{recipient}`: {err}"
+                );
+                PrepareWithdrawMultisigTransactionResponse {
+                    is_success: false,
+                    result: Default::default(),
+                    failure_message: err.to_string(),
+                }
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn transfer(&self, request: Request<TransferRequest>) -> Result<Response<TransferResponse>, Status> {
         let message = request.into_inner();
+
+        if message.recipients.is_empty() {
+            return Err(Status::invalid_argument(
+                "At least one recipient is required".to_string(),
+            ));
+        }
+
+        if message.single_tx {
+            return self.transfer_single_tx(message.recipients).await;
+        }
         let recipients = message
             .recipients
             .into_iter()
@@ -852,7 +1056,6 @@ impl wallet_server::Wallet for WalletGrpcServer {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(Status::invalid_argument)?;
-
         let mut transfers = Vec::new();
         for (hex_address, address, amount, fee_per_gram, payment_type, user_payment_id, raw_payment_id) in recipients {
             if payment_type == PaymentType::StandardMimblewimble as i32 {
@@ -861,7 +1064,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 ));
             }
             let payment_id = if !raw_payment_id.is_empty() {
-                MemoField::open_unchecked(raw_payment_id.to_vec(), TxType::PaymentToOther)
+                MemoField::new_open(raw_payment_id.to_vec(), TxType::PaymentToOther)
+                    .map_err(|e| Status::internal(e.to_string()))?
             } else if let Some(user_pay_id) = user_payment_id {
                 let bytes = match (
                     user_pay_id.u256.is_empty(),
@@ -877,7 +1081,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         ));
                     },
                 };
-                MemoField::open_unchecked(bytes, TxType::PaymentToOther)
+                MemoField::new_open(bytes, TxType::PaymentToOther).map_err(|e| Status::internal(e.to_string()))?
             } else {
                 MemoField::new_empty()
             };
@@ -941,12 +1145,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         error!(target: LOG_TARGET, "Transaction {tx_id} not found within timeout");
                         Status::not_found(format!("Transaction {tx_id} not found within timeout"))
                     })?;
-                    let final_tx = convert_wallet_transaction_into_transaction_info(
-                        wallet_tx,
-                        &wallet_address,
-                        &self.wallet.key_manager_service,
-                    )
-                    .await;
+                    let final_tx = convert_wallet_transaction_into_transaction_info(wallet_tx, &wallet_address);
                     results.push(TransferResult {
                         address,
                         transaction_id: tx_id.into(),
@@ -982,45 +1181,48 @@ impl wallet_server::Wallet for WalletGrpcServer {
 
         let mut transaction_service = self.get_transaction_service();
         debug!(target: LOG_TARGET, "Trying to burn {} Minotari", message.amount);
-        let response = match transaction_service
+        let result = transaction_service
             .burn_tari(
                 message.amount.into(),
                 UtxoSelectionCriteria::default(),
                 message.fee_per_gram.into(),
                 MemoField::from_bytes(&message.payment_id),
-                if message.claim_public_key.is_empty() {
-                    None
-                } else {
-                    Some(
-                        CompressedPublicKey::from_canonical_bytes(&message.claim_public_key)
-                            .map_err(|e| Status::invalid_argument(e.to_string()))?,
-                    )
-                },
-                if message.sidechain_deployment_key.is_empty() {
-                    None
-                } else {
-                    Some(
-                        PrivateKey::from_canonical_bytes(&message.sidechain_deployment_key)
-                            .map_err(|e| Status::invalid_argument(e.to_string()))?,
-                    )
-                },
+                Some(message.claim_public_key.as_slice())
+                    .filter(|v| !v.is_empty())
+                    .map(CompressedPublicKey::from_canonical_bytes)
+                    .transpose()
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
+                Some(message.sidechain_deployment_key.as_slice())
+                    .filter(|v| !v.is_empty())
+                    .map(PrivateKey::from_canonical_bytes)
+                    .transpose()
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
             )
-            .await
-        {
-            Ok((tx_id, proof)) => {
-                debug!(target: LOG_TARGET, "Transaction broadcast: {tx_id}",);
+            .await;
+
+        let response = match result {
+            Ok((tx_id, Some(proof))) => {
+                debug!(target: LOG_TARGET, "Burn transaction broadcast: {tx_id}",);
                 CreateBurnTransactionResponse {
                     transaction_id: tx_id.as_u64(),
                     is_success: true,
                     failure_message: Default::default(),
                     commitment: proof.commitment.to_vec(),
-                    ownership_proof: proof.ownership_proof.map(CommitmentSignature::from),
-                    range_proof: proof.range_proof.to_vec(),
+                    ownership_proof: Some(proof.ownership_proof.into()),
                     reciprocal_claim_public_key: proof.reciprocal_claim_public_key.to_vec(),
                 }
             },
+            Ok((tx_id, None)) => {
+                debug!(target: LOG_TARGET, "Burn transaction broadcast: {tx_id}",);
+                CreateBurnTransactionResponse {
+                    transaction_id: tx_id.as_u64(),
+                    is_success: true,
+                    failure_message: Default::default(),
+                    ..Default::default()
+                }
+            },
             Err(e) => {
-                warn!(target: LOG_TARGET, "Failed to burn Tarid: {e}");
+                warn!(target: LOG_TARGET, "Failed to burn Tari: {e}");
                 CreateBurnTransactionResponse {
                     is_success: false,
                     failure_message: e.to_string(),
@@ -1061,14 +1263,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         let mut transactions = Vec::new();
         for (tx_id, tx) in all_transactions {
             transactions.push(match tx {
-                Some(tx) => {
-                    convert_wallet_transaction_into_transaction_info(
-                        tx,
-                        &wallet_address,
-                        &self.wallet.key_manager_service,
-                    )
-                    .await
-                },
+                Some(tx) => convert_wallet_transaction_into_transaction_info(tx, &wallet_address),
                 None => TransactionInfo::not_found(tx_id),
             });
         }
@@ -1082,7 +1277,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
     ) -> Result<Response<Self::StreamTransactionEventsStream>, Status> {
         let (mut sender, receiver) = mpsc::channel(100);
 
-        let mut shutdown_signal = self.wallet.comms.shutdown_signal();
+        let mut shutdown_signal = self.wallet.shutdown_signal.clone();
         let mut transaction_service = self.wallet.transaction_service.clone();
         let mut transaction_service_events = self.wallet.transaction_service.get_event_stream();
 
@@ -1767,67 +1962,50 @@ impl wallet_server::Wallet for WalletGrpcServer {
         &self,
         _: Request<tari_rpc::Empty>,
     ) -> Result<Response<tari_rpc::NetworkStatusResponse>, Status> {
-        let status = self
-            .comms()
-            .connectivity()
-            .get_connectivity_status()
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let mut base_node_service = self.wallet.base_node_service.clone();
+        // This mapping is to comply to the legacy interface
+        let (status, avg_latency, num_node_connections) =
+            match self.wallet.wallet_connectivity.get_connectivity_status().await {
+                OnlineStatus::Connecting => (ConnectivityStatus::Initializing, UNKNOWN_LATENCY_MS, 0),
+                OnlineStatus::Online { latency_ms, .. } => {
+                    let mut avg_latencies = self.avg_latencies_ms.lock().await;
+                    let latency_ms = update_and_average_latency(&mut avg_latencies, latency_ms);
+                    (ConnectivityStatus::Online(1), latency_ms, 1)
+                },
+                OnlineStatus::Offline => (ConnectivityStatus::Offline, u64::MAX, 0),
+                OnlineStatus::Degraded { latency_ms, .. } => {
+                    let mut avg_latencies = self.avg_latencies_ms.lock().await;
+                    let latency_ms = update_and_average_latency(&mut avg_latencies, latency_ms);
+                    (ConnectivityStatus::Degraded(1), latency_ms, 1)
+                },
+            };
 
         let resp = tari_rpc::NetworkStatusResponse {
             status: tari_rpc::ConnectivityStatus::from(status) as i32,
-            avg_latency_ms: base_node_service
-                .get_base_node_latency()
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
-                .unwrap_or_default(),
-            num_node_connections: u32::try_from(status.num_connected_nodes())
-                .map_err(|_| Status::internal("Count not convert u64 to usize".to_string()))?,
+            avg_latency_ms: u32::try_from(avg_latency).unwrap_or(u32::MAX),
+            num_node_connections,
         };
 
         Ok(Response::new(resp))
     }
 
-    async fn list_connected_peers(
+    async fn get_connected_http_peer(
         &self,
         _: Request<tari_rpc::Empty>,
-    ) -> Result<Response<tari_rpc::ListConnectedPeersResponse>, Status> {
-        let mut connectivity = self.comms().connectivity();
-        let peer_manager = self.comms().peer_manager();
-        let connected_peers = connectivity
-            .get_active_connections()
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+    ) -> Result<Response<tari_rpc::GetConnectedHttpPeerResponse>, Status> {
+        let url = self.wallet.wallet_connectivity.get_address().await;
+        let (is_online, last_latency) = match self.wallet.wallet_connectivity.get_connectivity_status().await {
+            OnlineStatus::Connecting => (false, UNKNOWN_LATENCY_MS),
+            OnlineStatus::Offline => (false, u64::MAX),
+            OnlineStatus::Online { latency_ms, .. } | OnlineStatus::Degraded { latency_ms, .. } => (true, latency_ms),
+        };
 
-        let node_ids = connected_peers
-            .iter()
-            .map(|c| c.peer_node_id())
-            .cloned()
-            .collect::<Vec<_>>();
-        let peers = peer_manager
-            .get_peers_by_node_ids(&node_ids)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        if peers.len() != node_ids.len() {
-            let mut error_response = Vec::new();
-            node_ids.iter().for_each(|node_id| {
-                if !peers.iter().any(|p| p.node_id == *node_id) {
-                    warn!(target: LOG_TARGET, "Peer '{node_id}' not found");
-                    error_response.push(format!("'{node_id}'"));
-                }
-            });
-            if !error_response.is_empty() {
-                return Err(Status::not_found(format!(
-                    "Peer(s) not found: {}",
-                    error_response.join(", ")
-                )));
-            }
-        }
-
-        let resp = tari_rpc::ListConnectedPeersResponse {
-            connected_peers: peers.into_iter().map(Into::into).collect(),
+        let peer = tari_rpc::HttpPeer {
+            url,
+            last_latency,
+            is_online,
+        };
+        let resp = tari_rpc::GetConnectedHttpPeerResponse {
+            connected_peer: Some(peer),
         };
 
         Ok(Response::new(resp))
@@ -2017,7 +2195,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 request.max_epoch.into(),
                 UtxoSelectionCriteria::default(),
                 request.fee_per_gram.into(),
-                MemoField::open_unchecked(request.message, TxType::PaymentToSelf),
+                MemoField::new_open(request.message, TxType::PaymentToSelf)
+                    .map_err(|e| Status::internal(e.to_string()))?,
             )
             .await
         {
@@ -2071,7 +2250,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 proof,
                 request.fee_per_gram.into(),
                 sidechain_key,
-                MemoField::open_unchecked(request.message.into_bytes(), TxType::PaymentToSelf),
+                MemoField::new_open(request.message.into_bytes(), TxType::PaymentToSelf)
+                    .map_err(|e| Status::internal(e.to_string()))?,
             )
             .await
         {
@@ -2397,12 +2577,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         error!(target: LOG_TARGET, "Transaction {tx_id} not found within timeout");
                         Status::not_found(format!("Transaction {tx_id} not found within timeout"))
                     })?;
-                    let final_tx = convert_wallet_transaction_into_transaction_info(
-                        wallet_tx,
-                        &wallet_address,
-                        &self.wallet.key_manager_service,
-                    )
-                    .await;
+                    let final_tx = convert_wallet_transaction_into_transaction_info(wallet_tx, &wallet_address);
                     results.push(TransferResult {
                         address: address.to_string(),
                         transaction_id: tx_id.into(),
@@ -2455,7 +2630,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             message.message.len()
         );
 
-        let secret = self.wallet.comms.node_identity().secret_key().clone();
+        let secret = self.wallet.node_identity.secret_key().clone();
         let message_str =
             String::from_utf8(message.message).map_err(|_| Status::invalid_argument("Message must be valid UTF-8"))?;
 
@@ -2471,6 +2646,77 @@ impl wallet_server::Wallet for WalletGrpcServer {
             public_nonce: hex_nonce,
         }))
     }
+
+    async fn get_burn_claim_proof(
+        &self,
+        request: Request<GetBurnClaimProofRequest>,
+    ) -> Result<Response<GetBurnClaimProofResponse>, Status> {
+        let req = request.into_inner();
+        let commitment = CompressedCommitment::from_canonical_bytes(&req.commitment)
+            .map_err(|_| Status::invalid_argument("Commitment is malformed".to_string()))?;
+
+        let proof = self
+            .wallet
+            .db
+            .get_burn_proof_by_commitment(&commitment)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to get burn claim proof for commitment {}: {}",
+                    commitment.to_compressed_key(),
+                    e
+                ))
+            })?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "No burn claim proof found for commitment {}",
+                    commitment.to_compressed_key()
+                ))
+            })?;
+
+        let output = self
+            .get_output_manager_service()
+            .get_many_outputs(vec![proof.output_hash])
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to get output for commitment {}: {}",
+                    commitment.to_compressed_key(),
+                    e
+                ))
+            })?
+            .pop()
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "No output found for commitment {}",
+                    commitment.to_compressed_key()
+                ))
+            })?;
+
+        Ok(Response::new(GetBurnClaimProofResponse {
+            claim_proof: Some(tari_rpc::BurnClaimProof {
+                commitment: commitment.as_bytes().to_vec(),
+                ownership_proof: Some(proof.burn_proof.ownership_proof.into()),
+                reciprocal_claim_public_key: proof.burn_proof.reciprocal_claim_public_key.to_vec(),
+            }),
+            merkle_proof: proof.kernel_merkle_proof.map(|p| tari_rpc::EncodedMerkleProof {
+                block_hash: p.block_hash.to_vec(),
+                encoded_proof: p.encoded_merkle_proof,
+                leaf_index: p.leaf_index,
+            }),
+            kernel: Some(proof.kernel.into()),
+            encrypted_data: output.encrypted_data().to_byte_vec(),
+            value: output.value().as_u64(),
+        }))
+    }
+}
+
+// Helper function to update the latency history and compute the average latency
+fn update_and_average_latency(latencies: &mut VecDeque<u64>, new_latency: u64) -> u64 {
+    latencies.push_front(new_latency);
+    while latencies.len() > AVG_LATENCIES_CAPACITY {
+        latencies.pop_back();
+    }
+    latencies.iter().sum::<u64>() / max(latencies.len() as u64, 1)
 }
 
 async fn handle_completed_tx(
@@ -2526,10 +2772,9 @@ fn simple_event(event: &str) -> TransactionEvent {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyManagerInterface>(
+fn convert_wallet_transaction_into_transaction_info(
     tx: models::WalletTransaction,
     wallet_address: &TariAddress,
-    key_manager: &KM,
 ) -> TransactionInfo {
     use models::WalletTransaction::{Completed, PendingInbound, PendingOutbound};
     match tx {
@@ -2560,14 +2805,14 @@ async fn convert_wallet_transaction_into_transaction_info<KM: TransactionKeyMana
             }
         },
         PendingOutbound(tx) => {
-            let output_commitments = match tx.sender_protocol.get_output_commitments(key_manager).await {
+            let output_commitments = match tx.sender_protocol.get_output_commitments() {
                 Ok(v) => v.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
                 Err(e) => {
                     warn!(target: LOG_TARGET, "Failed to get output commitments: {e}");
                     vec![]
                 },
             };
-            let input_commitments = match tx.sender_protocol.get_input_commitments(key_manager).await {
+            let input_commitments = match tx.sender_protocol.get_input_commitments() {
                 Ok(v) => v.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
                 Err(e) => {
                     warn!(target: LOG_TARGET, "Failed to get output commitments: {e}");

@@ -457,10 +457,6 @@ mod test {
 
             whois 5c4f2a4b3f3f84e047333218a84fd24f581a9d7e4f23b78e3714e9d174427d61
 
-            discover-peer f6b2ca781342a3ebe30ee1643655c96f1d7c14f4d49f077695395de98ae73665
-
-            burn-minotari --payment-id Ups_these_funds_will_be_burned! 100T
-
             pre-mine-spend-get-output-status
 
             pre-mine-start \
@@ -492,7 +488,6 @@ mod test {
         let commands = parse_command_file(script).unwrap();
 
         let mut get_balance = false;
-        let mut burn_tari = false;
         let mut pre_mine_spend_get_output_status = false;
         let mut pre_mine_spend_session_info = false;
         let mut pre_mine_spend_encumber_aggregate_utxo = false;
@@ -501,14 +496,13 @@ mod test {
         let mut pre_mine_spend_input_output_sigs = false;
         let mut make_it_rain = false;
         let mut coin_split = false;
-        let mut discover_peer = false;
         let mut export_tx = false;
         let mut import_tx = false;
         let mut whois = false;
+
         for command in commands {
             match command {
                 CliCommands::GetBalance => get_balance = true,
-                CliCommands::BurnMinotari(_) => burn_tari = true,
                 CliCommands::PreMineSpendGetOutputStatus => pre_mine_spend_get_output_status = true,
                 CliCommands::PreMineStart(_) => pre_mine_spend_session_info = true,
                 CliCommands::PreMineStartParty(_) => pre_mine_spend_party_details = true,
@@ -518,7 +512,6 @@ mod test {
                 CliCommands::SendOneSidedToStealthAddress(_) => {},
                 CliCommands::MakeItRain(_) => make_it_rain = true,
                 CliCommands::CoinSplit(_) => coin_split = true,
-                CliCommands::DiscoverPeer(_) => discover_peer = true,
                 CliCommands::Whois(_) => whois = true,
                 CliCommands::ExportUtxos(_) => {},
                 CliCommands::ImportPaperWallet(_) => {},
@@ -535,6 +528,7 @@ mod test {
                         import_tx = true
                     }
                 },
+                CliCommands::PrepareDepositMultisigTransaction(_) => {},
                 CliCommands::ExportSpentUtxos(_) => {},
                 CliCommands::CountUtxos => {},
                 CliCommands::InitShaAtomicSwap(_) => {},
@@ -545,16 +539,24 @@ mod test {
                 CliCommands::PreMineSpendBackupUtxo(_) => {},
                 CliCommands::Sync(_) => {},
                 CliCommands::ExportViewKeyAndSpendKey(_) => {},
+
                 CliCommands::ShowPayRef(_) => {},
                 CliCommands::FindPayRef(_) => {},
                 CliCommands::ListTx => {},
+                CliCommands::SendMultisigUtxo(_) => {},
+                CliCommands::GetMultisigUtxoData(_) => {},
+                CliCommands::CreateMultisigUtxo(_) => {},
                 CliCommands::ReplaceByFee(_) => {},
                 CliCommands::UserPayForFee(_) => {},
+                CliCommands::SignMessage(_) => {},
+                CliCommands::SignScriptMessage(_) => {},
+                CliCommands::SignOneSidedDepositMultisigTransaction(_) => {},
+                CliCommands::SignOneSidedWithdrawMultisigTransaction(_) => {},
+                CliCommands::PrepareWithdrawMultisigTransaction(_) => {},
             }
         }
         assert!(
             get_balance &&
-                burn_tari &&
                 pre_mine_spend_get_output_status &&
                 pre_mine_spend_session_info &&
                 pre_mine_spend_encumber_aggregate_utxo &&
@@ -563,7 +565,6 @@ mod test {
                 pre_mine_spend_input_output_sigs &&
                 make_it_rain &&
                 coin_split &&
-                discover_peer &&
                 whois &&
                 export_tx &&
                 import_tx

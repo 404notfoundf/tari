@@ -21,13 +21,12 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #![allow(clippy::indexing_slicing)]
-use std::{mem::size_of, path::Path, sync::Arc, time::Duration};
+use std::{mem::size_of, sync::Arc, time::Duration};
 
 use blake2::Blake2b;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use chrono::{Days, Utc};
 use digest::consts::U32;
-use futures::channel::{mpsc, mpsc::Sender};
 use minotari_wallet::{
     base_node_service::{handle::BaseNodeServiceHandle, BaseNodeServiceInitializer},
     connectivity_service::{WalletConnectivityHandle, WalletConnectivityInitializer},
@@ -72,7 +71,7 @@ use tari_common_sqlite::connection::{DbConnection, DbConnectionUrl};
 use tari_common_types::{
     seeds::cipher_seed::CipherSeed,
     tari_address::TariAddress,
-    transaction::{ImportStatus, TransactionDirection, TransactionStatus, TxId},
+    transaction::{LegacyImportStatus, LegacyTransactionStatus, TransactionDirection, TxId},
     types::{CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput, PrivateKey},
     wallet_types::{ProvidedKeysWallet, WalletType},
 };
@@ -80,25 +79,14 @@ use tari_comms::{
     peer_manager::{NodeIdentity, PeerFeatures},
     protocol::rpc::{mock::MockRpcServer, NamedProtocolService},
     test_utils::node_identity::build_node_identity,
-    types::CommsDHKE,
-    CommsNode,
     PeerConnection,
 };
-use tari_comms_dht::outbound::mock::create_outbound_service_mock;
-use tari_core::{
-    base_node::{
-        proto::wallet_rpc::{TxLocation, TxQueryResponse},
-        rpc::BaseNodeWalletRpcServer,
-    },
-    proto::base_node as base_node_proto,
+use tari_core::base_node::{
+    proto::wallet_rpc::{TxLocation, TxQueryResponse},
+    rpc::BaseNodeWalletRpcServer,
 };
-use tari_crypto::{
-    commitment::HomomorphicCommitmentFactory,
-    extended_range_proof::{ExtendedRangeProofService, Statement},
-    keys::SecretKey as SK,
-    ristretto::bulletproofs_plus::RistrettoAggregatedPublicStatement,
-};
-use tari_p2p::{comms_connector::pubsub_connector, domain_message::DomainMessage, Network};
+use tari_crypto::{commitment::HomomorphicCommitmentFactory, keys::SecretKey as SK};
+use tari_p2p::Network;
 use tari_script::{push_pubkey_script, ExecutionStack};
 use tari_service_framework::{reply_channel, RegisterHandle, StackBuilder};
 use tari_shutdown::{Shutdown, ShutdownSignal};
@@ -106,16 +94,12 @@ use tari_test_utils::{comms_and_services::get_next_memory_address, random};
 use tari_transaction_components::{
     consensus::{ConsensusConstantsBuilder, ConsensusManager},
     crypto_factories::CryptoFactories,
-    key_manager::{
-        ConfidentialOutputHasher,
-        TariKeyId,
-        TransactionKeyManagerInitializer,
-        TransactionKeyManagerInterface,
-    },
+    key_manager::{ConfidentialOutputHasher, TransactionKeyManagerInitializer, TransactionKeyManagerInterface},
     tari_amount::*,
     transaction_components::{
         memo_field::{MemoField, TxType},
         one_sided::shared_secret_to_output_encryption_key,
+        EncryptedData,
         KernelBuilder,
         OutputFeatures,
         RangeProofType,
@@ -138,39 +122,23 @@ use url::Url;
 
 use crate::support::{
     base_node_http_service_mock::MockHttpClientFactory,
-    comms_and_services::setup_comms_services,
     comms_rpc::{BaseNodeWalletRpcMockService, BaseNodeWalletRpcMockState},
     utils::make_input,
 };
 
-async fn setup_transaction_service<P: AsRef<Path>>(
+async fn setup_transaction_service(
     node_identity: Arc<NodeIdentity>,
-    peers: Vec<Arc<NodeIdentity>>,
     consensus_manager: ConsensusManager,
     factories: CryptoFactories,
     db_connection: WalletDbConnection,
-    database_path: P,
-    discovery_request_timeout: Duration,
     shutdown_signal: ShutdownSignal,
 ) -> (
     TransactionServiceHandle,
     OutputManagerHandle<MemoryDbKeyManager>,
-    CommsNode,
     WalletConnectivityHandle<MockHttpClientFactory>,
     MemoryDbKeyManager,
     OutputManagerSqliteDatabase,
 ) {
-    let (publisher, _) = pubsub_connector(100);
-    let (comms, dht) = setup_comms_services(
-        node_identity.clone(),
-        peers,
-        publisher,
-        database_path.as_ref().to_str().unwrap().to_owned(),
-        discovery_request_timeout,
-        shutdown_signal.clone(),
-    )
-    .await;
-
     let passphrase = SafePassword::from("My lovely secret passphrase");
     let db = WalletDatabase::new(WalletSqliteDatabase::new(db_connection.clone(), passphrase).unwrap());
 
@@ -199,8 +167,6 @@ async fn setup_transaction_service<P: AsRef<Path>>(
     let http_node_url = Url::parse("http://127.0.0.1:5434").unwrap();
     let wallet_connectivity_service_mock = WalletConnectivityHandle::new(MockHttpClientFactory::default());
     let handles = StackBuilder::new(shutdown_signal)
-        .add_initializer(RegisterHandle::new(dht))
-        .add_initializer(RegisterHandle::new(comms.connectivity()))
         .add_initializer(RegisterHandle::new(wallet_connectivity_service_mock))
         .add_initializer(OutputManagerServiceInitializer::<
             OutputManagerSqliteDatabase,
@@ -213,7 +179,7 @@ async fn setup_transaction_service<P: AsRef<Path>>(
             Network::LocalNet.into(),
         ))
         .add_initializer(
-            TransactionKeyManagerInitializer::<TransactionKeyManagerSqliteDatabase<_>>::new(
+            TransactionKeyManagerInitializer::<TransactionKeyManagerSqliteDatabase<_>>::new_with_legacy_storage(
                 kms_backend,
                 cipher,
                 factories.clone(),
@@ -266,7 +232,6 @@ async fn setup_transaction_service<P: AsRef<Path>>(
     (
         transaction_service_handle,
         output_manager_handle,
-        comms,
         connectivity_service_handle,
         key_manager_handle,
         oms_backend,
@@ -279,8 +244,6 @@ pub struct TransactionServiceNoCommsInterface {
     transaction_service_handle: TransactionServiceHandle,
     output_manager_service_handle: OutputManagerHandle<MemoryDbKeyManager>,
     key_manager_handle: MemoryDbKeyManager,
-    _base_node_response_message_channel:
-        Sender<DomainMessage<Result<base_node_proto::BaseNodeServiceResponse, prost::DecodeError>>>,
     _shutdown: Shutdown,
     _mock_rpc_server: MockRpcServer<BaseNodeWalletRpcServer<BaseNodeWalletRpcMockService>>,
     base_node_identity: Arc<NodeIdentity>,
@@ -303,14 +266,10 @@ async fn setup_transaction_service_no_comms(
     let (oms_request_sender, oms_request_receiver) = reply_channel::unbounded();
 
     let (output_manager_service_event_publisher, _) = broadcast::channel(200);
-    let (outbound_message_requester, mock_outbound_service) = create_outbound_service_mock();
 
     let (ts_request_sender, ts_request_receiver) = reply_channel::unbounded();
     let (event_publisher, _) = channel(100);
     let transaction_service_handle = TransactionServiceHandle::new(ts_request_sender, event_publisher.clone());
-    let (base_node_response_message_channel, _) = mpsc::channel(20);
-
-    task::spawn(mock_outbound_service.run());
 
     let service = BaseNodeWalletRpcMockService::new();
     let base_node_rpc_mock_state = service.get_state();
@@ -401,7 +360,6 @@ async fn setup_transaction_service_no_comms(
         ts_request_receiver,
         output_manager_service_handle.clone(),
         key_manager.clone(),
-        outbound_message_requester,
         wallet_connectivity_service_mock.clone(),
         event_publisher,
         node_identity.clone(),
@@ -421,7 +379,6 @@ async fn setup_transaction_service_no_comms(
         transaction_service_handle,
         output_manager_service_handle,
         key_manager_handle: key_manager,
-        _base_node_response_message_channel: base_node_response_message_channel,
         _shutdown: shutdown,
         _mock_rpc_server: mock_rpc_server,
         base_node_identity: node_identity,
@@ -458,23 +415,17 @@ async fn large_coin_split_transaction() {
         base_node_identity.node_id().short_str()
     );
 
-    let alice_temp_dir = tempdir().unwrap();
-
     let db_connection = make_wallet_database_memory_connection();
 
     let shutdown = Shutdown::new();
-    let (mut alice_ts, mut alice_oms, _alice_comms, _alice_connectivity, key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity.clone(),
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            db_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, mut alice_oms, _alice_connectivity, key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity.clone(),
+        consensus_manager,
+        factories.clone(),
+        db_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
     let initial_wallet_value = 20 * T;
     let uo1 = make_input(
@@ -487,7 +438,7 @@ async fn large_coin_split_transaction() {
 
     alice_oms.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
 
     let fee_per_gram = MicroMinotari::from(1);
@@ -520,11 +471,25 @@ async fn large_coin_split_transaction() {
         alice_oms.get_balance().await.unwrap().pending_incoming_balance,
         initial_wallet_value - fees
     );
+
+    // The payment id should match the finalized and recovered tx fee
+    let mut payment_id_verified = false;
+    for output in completed_tx.transaction.body.outputs() {
+        if let Ok(payment_id) = key_manager_handle
+            .extract_payment_id_from_encrypted_data(output.encrypted_data(), output.commitment(), None)
+            .await
+        {
+            assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
+            payment_id_verified = true;
+            break;
+        }
+    }
+    assert!(payment_id_verified);
 }
 
 #[tokio::test]
 async fn single_transaction_burn_tari() {
-    // let _ = env_logger::builder().is_test(true).try_init(); // Need `$env:RUST_LOG = "trace"` for this to work
+    // let _ = env_logger::builder().filter_level(log::LevelFilter::Debug).is_test(true).try_init();
     let network = Network::LocalNet;
     let consensus_manager = ConsensusManager::builder(network).build();
     let factories = CryptoFactories::default();
@@ -547,23 +512,17 @@ async fn single_transaction_burn_tari() {
         base_node_identity.node_id().short_str()
     );
 
-    let alice_temp_dir = tempdir().unwrap();
-
     let db_connection = make_wallet_database_memory_connection();
 
     let shutdown = Shutdown::new();
-    let (mut alice_ts, mut alice_oms, _alice_comms, _alice_connectivity, key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity.clone(),
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            db_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, mut alice_oms, _alice_connectivity, key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity.clone(),
+        consensus_manager,
+        factories.clone(),
+        db_connection,
+        shutdown.to_signal(),
+    )
+    .await;
     let initial_wallet_value = 25000.into();
     let uo1 = make_input(
         &mut OsRng,
@@ -574,13 +533,12 @@ async fn single_transaction_burn_tari() {
     .await;
 
     // Burn output
-
     alice_oms.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
     let burn_value = 10000.into();
-    let (claim_private_key, claim_public_key) = CompressedPublicKey::random_keypair(&mut OsRng);
+    let (_claim_private_key, claim_public_key) = CompressedPublicKey::random_keypair(&mut OsRng);
     let (tx_id, burn_proof) = alice_ts
         .burn_tari(
             burn_value,
@@ -592,6 +550,7 @@ async fn single_transaction_burn_tari() {
         )
         .await
         .expect("Alice sending burn tx");
+    let burn_proof = burn_proof.expect("Burn proof should be present");
 
     // Verify final balance
 
@@ -602,57 +561,59 @@ async fn single_transaction_burn_tari() {
 
     let fees = completed_tx.fee;
 
+    let balance = alice_oms.get_balance().await.unwrap();
+
+    eprintln!("Balance after burn: {:#?}", balance);
+
     assert_eq!(
-        alice_oms.get_balance().await.unwrap().pending_incoming_balance,
+        balance.pending_incoming_balance,
         initial_wallet_value - burn_value - fees
     );
 
-    // Verify burn proof
+    // The payment id should match the finalized and recovered tx fee
+    let mut payment_id_verified = false;
+    for output in completed_tx.transaction.body.outputs() {
+        if let Ok(payment_id) = key_manager_handle
+            .extract_payment_id_from_encrypted_data(output.encrypted_data(), output.commitment(), None)
+            .await
+        {
+            assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
+            payment_id_verified = true;
+            break;
+        }
+    }
+    assert!(payment_id_verified);
 
+    // Verify burn proof
     let challenge_bytes = ConfidentialOutputHasher::new("commitment_signature")
-        .chain(&burn_proof.ownership_proof.as_ref().unwrap().public_nonce())
         .chain(&burn_proof.commitment)
         .chain(&claim_public_key)
         .finalize();
-    let challenge = PrivateKey::from_uniform_bytes(&challenge_bytes).unwrap();
-    assert!(burn_proof.ownership_proof.unwrap().verify(
-        &burn_proof.commitment.to_commitment().unwrap(),
-        &challenge,
-        factories.commitment.as_ref()
-    ));
-    let statement = RistrettoAggregatedPublicStatement {
-        statements: vec![Statement {
-            commitment: burn_proof.commitment.to_commitment().unwrap(),
-            minimum_value_promise: MicroMinotari::zero().as_u64(),
-        }],
-    };
-    assert!(factories
-        .range_proof
-        .verify_batch(vec![&burn_proof.range_proof.to_vec()], vec![&statement])
-        .is_ok());
+    let ownership_proof = burn_proof.ownership_proof.to_schnorr_signature().unwrap();
+    let commit_value = factories
+        .commitment
+        .commit_value(&PrivateKey::default(), burn_value.as_u64());
+    let signer_pk = burn_proof.commitment.to_commitment().unwrap().as_public_key() - commit_value.as_public_key();
+    assert!(ownership_proof.verify(&signer_pk, challenge_bytes));
 
     // Verify recovery of burned output
 
-    let shared_secret = CommsDHKE::new(
-        &claim_private_key,
-        &burn_proof.reciprocal_claim_public_key.to_public_key().unwrap(),
-    );
-    let encryption_key = shared_secret_to_output_encryption_key(&shared_secret).unwrap();
-    let recovery_key_id = TariKeyId::Imported {
-        key: CompressedPublicKey::from_secret_key(&encryption_key),
-    };
     let mut found_burned_output = false;
     for output in completed_tx.transaction.body.outputs() {
         if output.is_burned() {
             found_burned_output = true;
             match key_manager_handle
-                .try_output_key_recovery(output.commitment(), output.encrypted_data(), Some(&recovery_key_id))
+                .try_output_key_recovery(
+                    output.commitment(),
+                    output.encrypted_data(),
+                    &output.sender_offset_public_key,
+                )
                 .await
             {
-                Ok((_spending_key_id, value, _)) => {
+                Ok(Some((_spending_key_id, value, _))) => {
                     assert_eq!(value, burn_value);
                 },
-                Err(e) => panic!("{}", e),
+                _ => panic!("Should have recovered the burned output"),
             }
         }
     }
@@ -691,22 +652,17 @@ async fn send_one_sided_transaction_to_other() {
         base_node_identity.node_id().short_str()
     );
 
-    let alice_temp_dir = tempdir().unwrap();
     let db_connection = make_wallet_database_memory_connection();
 
     let shutdown = Shutdown::new();
-    let (mut alice_ts, mut alice_oms, _alice_comms, _alice_connectivity, key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity,
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            db_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, mut alice_oms, _alice_connectivity, key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity,
+        consensus_manager,
+        factories.clone(),
+        db_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
     let mut alice_event_stream = alice_ts.get_event_stream();
 
@@ -721,7 +677,7 @@ async fn send_one_sided_transaction_to_other() {
     let mut alice_oms_clone = alice_oms.clone();
     alice_oms_clone.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
 
     let value = 10000.into();
@@ -777,10 +733,33 @@ async fn send_one_sided_transaction_to_other() {
         }
     }
     assert!(found, "'TransactionCompletedImmediately(_)' event not found");
+
+    // The payment id should match the finalized and recovered tx fee
+    let mut payment_id_verified = false;
+    let bob_view_key_id = key_manager_handle
+        .import_key(random_pvt_key.clone(), None)
+        .await
+        .unwrap();
+    for output in completed_tx.transaction.body.outputs() {
+        let shared_secret = key_manager_handle
+            .get_diffie_hellman_shared_secret(&bob_view_key_id, &output.sender_offset_public_key)
+            .await
+            .unwrap();
+        let encryption_key = shared_secret_to_output_encryption_key(&shared_secret).unwrap();
+        if let Ok((_, _, payment_id)) =
+            EncryptedData::decrypt_data(&encryption_key, output.commitment(), output.encrypted_data())
+        {
+            assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
+            payment_id_verified = true;
+            break;
+        }
+    }
+    assert!(payment_id_verified);
 }
 
 #[tokio::test]
 async fn recover_one_sided_transaction() {
+    // env_logger::builder().filter_level(log::LevelFilter::Trace).init(); //  > ./target/output.log 2>&1
     let network = Network::LocalNet;
     let consensus_manager = ConsensusManager::builder(network).build();
     let factories = CryptoFactories::default();
@@ -811,41 +790,31 @@ async fn recover_one_sided_transaction() {
         base_node_identity.node_id().short_str()
     );
 
-    let alice_temp_dir = tempdir().unwrap();
     let alice_connection = make_wallet_database_memory_connection();
     let shutdown = Shutdown::new();
-    let (mut alice_ts, alice_oms, _alice_comms, _alice_connectivity, alice_key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity,
-            vec![],
-            consensus_manager.clone(),
-            factories.clone(),
-            alice_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, alice_oms, _alice_connectivity, alice_key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity,
+        consensus_manager.clone(),
+        factories.clone(),
+        alice_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
-    let bob_temp_dir = tempdir().unwrap();
     let bob_connection = make_wallet_database_memory_connection();
-    let (_bob_ts, mut bob_oms, _bob_comms, _bob_connectivity, bob_key_manager_handle, _bob_db) =
-        setup_transaction_service(
-            bob_node_identity.clone(),
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            bob_connection,
-            bob_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (_bob_ts, mut bob_oms, _bob_connectivity, bob_key_manager_handle, _bob_db) = setup_transaction_service(
+        bob_node_identity.clone(),
+        consensus_manager,
+        factories.clone(),
+        bob_connection,
+        shutdown.to_signal(),
+    )
+    .await;
     let script = push_pubkey_script(bob_node_identity.public_key());
     let known_script = KnownOneSidedPaymentScript {
         script_hash: script.as_hash::<Blake2b<U32>>().unwrap().to_vec(),
         script_key_id: bob_key_manager_handle
-            .import_key(bob_node_identity.secret_key().clone())
+            .import_key(bob_node_identity.secret_key().clone(), None)
             .await
             .unwrap(),
         script,
@@ -866,8 +835,10 @@ async fn recover_one_sided_transaction() {
     let mut alice_oms_clone = alice_oms;
     alice_oms_clone.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&alice_key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
+
+    log::info!("Starting one-sided transaction");
 
     let value = 10000.into();
     let mut alice_ts_clone = alice_ts.clone();
@@ -890,6 +861,8 @@ async fn recover_one_sided_transaction() {
         .await
         .expect("Alice sending one-sided tx to Bob");
 
+    log::info!("One-sided transaction sent");
+
     let completed_tx = alice_ts
         .get_completed_transaction(tx_id)
         .await
@@ -902,7 +875,28 @@ async fn recover_one_sided_transaction() {
         .unwrap();
     // Bob should be able to claim 1 output.
     assert_eq!(1, recovered_outputs_1.len());
-    assert_eq!(value, recovered_outputs_1[0].output.value);
+    assert_eq!(value, recovered_outputs_1[0].output.value());
+
+    // The payment id should match the finalized and recovered tx fee
+    let shared_secret = bob_key_manager_handle
+        .get_diffie_hellman_shared_secret(
+            &bob_view_key.key_id,
+            &recovered_outputs_1[0]
+                .output
+                .to_transaction_output()
+                .unwrap()
+                .sender_offset_public_key,
+        )
+        .await
+        .unwrap();
+    let encryption_key = shared_secret_to_output_encryption_key(&shared_secret).unwrap();
+    let (_, _, payment_id) = EncryptedData::decrypt_data(
+        &encryption_key,
+        recovered_outputs_1[0].output.commitment(),
+        recovered_outputs_1[0].output.encrypted_data(),
+    )
+    .unwrap();
+    assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
 
     // Should ignore already existing outputs
     let recovered_outputs_2 = bob_oms
@@ -944,36 +938,26 @@ async fn recover_stealth_one_sided_transaction() {
         base_node_identity.node_id().short_str()
     );
 
-    let alice_temp_dir = tempdir().unwrap();
     let alice_connection = make_wallet_database_memory_connection();
     let shutdown = Shutdown::new();
-    let (mut alice_ts, alice_oms, _alice_comms, _alice_connectivity, alice_key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity,
-            vec![],
-            consensus_manager.clone(),
-            factories.clone(),
-            alice_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, alice_oms, _alice_connectivity, alice_key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity,
+        consensus_manager.clone(),
+        factories.clone(),
+        alice_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
-    let bob_temp_dir = tempdir().unwrap();
     let bob_connection = make_wallet_database_memory_connection();
-    let (_bob_ts, mut bob_oms, _bob_comms, _bob_connectivity, bob_key_manager_handle, _bob_db) =
-        setup_transaction_service(
-            bob_node_identity.clone(),
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            bob_connection,
-            bob_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (_bob_ts, mut bob_oms, _bob_connectivity, bob_key_manager_handle, _bob_db) = setup_transaction_service(
+        bob_node_identity.clone(),
+        consensus_manager,
+        factories.clone(),
+        bob_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
     let bob_view_key = bob_key_manager_handle.get_view_key().await.unwrap();
 
@@ -988,7 +972,7 @@ async fn recover_stealth_one_sided_transaction() {
     let mut alice_oms_clone = alice_oms;
     alice_oms_clone.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&alice_key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
 
     let value = 10000.into();
@@ -1024,7 +1008,28 @@ async fn recover_stealth_one_sided_transaction() {
         .unwrap();
     // Bob should be able to claim 1 output.
     assert_eq!(1, recovered_outputs_1.len());
-    assert_eq!(value, recovered_outputs_1[0].output.value);
+    assert_eq!(value, recovered_outputs_1[0].output.value());
+
+    // The payment id should match the finalized and recovered tx fee
+    let shared_secret = bob_key_manager_handle
+        .get_diffie_hellman_shared_secret(
+            &bob_view_key.key_id,
+            &recovered_outputs_1[0]
+                .output
+                .to_transaction_output()
+                .unwrap()
+                .sender_offset_public_key,
+        )
+        .await
+        .unwrap();
+    let encryption_key = shared_secret_to_output_encryption_key(&shared_secret).unwrap();
+    let (_, _, payment_id) = EncryptedData::decrypt_data(
+        &encryption_key,
+        recovered_outputs_1[0].output.commitment(),
+        recovered_outputs_1[0].output.encrypted_data(),
+    )
+    .unwrap();
+    assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
 
     // Should ignore already existing outputs
     let recovered_outputs_2 = bob_oms
@@ -1062,19 +1067,14 @@ async fn test_htlc_send_and_claim() {
     let alice_connection = make_wallet_database_memory_connection();
 
     let shutdown = Shutdown::new();
-    let alice_temp_dir = tempdir().unwrap();
-    let (mut alice_ts, mut alice_oms, _alice_comms, _alice_connectivity, key_manager_handle, alice_db) =
-        setup_transaction_service(
-            alice_node_identity,
-            vec![],
-            consensus_manager,
-            factories.clone(),
-            alice_connection,
-            alice_temp_dir,
-            Duration::from_secs(0),
-            shutdown.to_signal(),
-        )
-        .await;
+    let (mut alice_ts, mut alice_oms, _alice_connectivity, key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity,
+        consensus_manager,
+        factories.clone(),
+        alice_connection,
+        shutdown.to_signal(),
+    )
+    .await;
 
     let bob_temp_dir = tempdir().unwrap();
     let bob_db_path_string = bob_temp_dir.path().to_str().unwrap().to_string();
@@ -1100,7 +1100,7 @@ async fn test_htlc_send_and_claim() {
     .await;
     alice_oms.add_output(uo1.clone(), None).await.unwrap();
     alice_db
-        .mark_outputs_as_unspent(vec![(uo1.hash(&key_manager_handle).await.unwrap(), true)])
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
         .unwrap();
 
     let value = 10000.into();
@@ -1169,6 +1169,121 @@ async fn test_htlc_send_and_claim() {
             .pending_incoming_balance,
         htlc_amount
     );
+}
+
+#[tokio::test]
+async fn test_htlc_send_and_claim_payment_id_fee() {
+    let network = Network::LocalNet;
+    let consensus_manager = ConsensusManager::builder(network).build();
+    let factories = CryptoFactories::default();
+    // Alice's parameters
+    let alice_node_identity = Arc::new(NodeIdentity::random(
+        &mut OsRng,
+        get_next_memory_address(),
+        PeerFeatures::COMMUNICATION_NODE,
+    ));
+
+    let bob_node_identity = Arc::new(NodeIdentity::random(
+        &mut OsRng,
+        get_next_memory_address(),
+        PeerFeatures::COMMUNICATION_NODE,
+    ));
+    log::info!(
+        "manage_single_transaction: Alice: '{}', Base: '{}'",
+        alice_node_identity.node_id().short_str(),
+        bob_node_identity.node_id().short_str()
+    );
+
+    let alice_connection = make_wallet_database_memory_connection();
+
+    let shutdown = Shutdown::new();
+    let (mut alice_ts, mut alice_oms, _alice_connectivity, key_manager_handle, alice_db) = setup_transaction_service(
+        alice_node_identity,
+        consensus_manager.clone(),
+        factories.clone(),
+        alice_connection,
+        shutdown.to_signal(),
+    )
+    .await;
+
+    let bob_connection = make_wallet_database_memory_connection();
+    let (_bob_ts_interface, _bob_oms, _bob_connectivity, bob_key_manager_handle, _bob_db) = setup_transaction_service(
+        bob_node_identity.clone(),
+        consensus_manager,
+        factories.clone(),
+        bob_connection.clone(),
+        shutdown.to_signal(),
+    )
+    .await;
+
+    log::info!(
+        "manage_single_transaction: Bob: '{}'",
+        bob_node_identity.node_id().short_str(),
+    );
+
+    let initial_wallet_value = 25000.into();
+    let uo1 = make_input(
+        &mut OsRng,
+        initial_wallet_value,
+        &OutputFeatures::default(),
+        &key_manager_handle,
+    )
+    .await;
+    alice_oms.add_output(uo1.clone(), None).await.unwrap();
+    alice_db
+        .mark_outputs_as_unspent(vec![(uo1.output_hash(), true)])
+        .unwrap();
+
+    let value = 10000.into();
+
+    let bob_view_key = bob_key_manager_handle.get_view_key().await.unwrap();
+    let bob_address = TariAddress::new_dual_address_with_default_features(
+        bob_view_key.pub_key,
+        bob_node_identity.public_key().clone(),
+        network,
+    )
+    .unwrap();
+
+    let (tx_id, _pre_image, _output) = alice_ts
+        .send_sha_atomic_swap_transaction(
+            bob_address.clone(),
+            value,
+            UtxoSelectionCriteria::default(),
+            20.into(),
+            MemoField::new_empty(),
+        )
+        .await
+        .expect("Alice sending HTLC transaction");
+
+    let completed_tx = alice_ts
+        .get_completed_transaction(tx_id)
+        .await
+        .expect("Could not find completed HTLC tx");
+
+    let fees = completed_tx.fee;
+
+    assert_eq!(
+        alice_oms.get_balance().await.unwrap().pending_incoming_balance,
+        initial_wallet_value - fees
+    );
+
+    // The payment id should match the finalized and recovered tx fee
+    let mut payment_id_verified = false;
+    for output in completed_tx.transaction.body.outputs() {
+        let shared_secret = bob_key_manager_handle
+            .get_diffie_hellman_shared_secret(&bob_view_key.key_id, &output.sender_offset_public_key)
+            .await
+            .unwrap();
+        let encryption_key = shared_secret_to_output_encryption_key(&shared_secret).unwrap();
+        if let Ok((_, _, payment_id)) =
+            EncryptedData::decrypt_data(&encryption_key, output.commitment(), output.encrypted_data())
+        {
+            assert_eq!(completed_tx.fee, payment_id.get_fee().unwrap());
+            payment_id_verified = true;
+            break;
+        }
+    }
+    assert!(payment_id_verified);
 }
 
 #[tokio::test]
@@ -1642,7 +1757,7 @@ async fn broadcast_all_completed_transactions_on_startup() {
         amount: 5000 * uT,
         fee: MicroMinotari::from(20),
         transaction: tx.clone(),
-        status: TransactionStatus::Completed,
+        status: LegacyTransactionStatus::Completed,
         timestamp: Utc::now(),
         cancelled: None,
         direction: TransactionDirection::Outbound,
@@ -1663,13 +1778,13 @@ async fn broadcast_all_completed_transactions_on_startup() {
 
     let completed_tx2 = CompletedTransaction {
         tx_id: 2u64.into(),
-        status: TransactionStatus::MinedConfirmed,
+        status: LegacyTransactionStatus::MinedConfirmed,
         ..completed_tx1.clone()
     };
 
     let completed_tx3 = CompletedTransaction {
         tx_id: 3u64.into(),
-        status: TransactionStatus::Completed,
+        status: LegacyTransactionStatus::Completed,
         ..completed_tx1.clone()
     };
 
@@ -1790,13 +1905,11 @@ async fn test_update_faux_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(10000),
             alice_address.clone(),
-            ImportStatus::Imported,
+            LegacyImportStatus::Imported,
             None,
             None,
             None,
-            uo_1.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_1.to_transaction_output().unwrap(),
             MemoField::open_from_string("blah", TxType::PaymentToOther),
         )
         .await
@@ -1806,13 +1919,11 @@ async fn test_update_faux_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(20000),
             alice_address.clone(),
-            ImportStatus::OneSidedUnconfirmed,
+            LegacyImportStatus::OneSidedUnconfirmed,
             None,
             None,
             None,
-            uo_2.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_2.to_transaction_output().unwrap(),
             MemoField::open_from_string("one-sided 1", TxType::PaymentToOther),
         )
         .await
@@ -1822,13 +1933,11 @@ async fn test_update_faux_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(30000),
             alice_address,
-            ImportStatus::OneSidedConfirmed,
+            LegacyImportStatus::OneSidedConfirmed,
             None,
             None,
             None,
-            uo_3.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_3.to_transaction_output().unwrap(),
             MemoField::open_from_string("one-sided 2", TxType::PaymentToOther),
         )
         .await
@@ -1840,14 +1949,14 @@ async fn test_update_faux_tx_on_oms_validation() {
             .add_output_with_tx_id(tx_id, uo.clone(), None)
             .await
             .unwrap();
-        let _result = alice_ts_interface.oms_db.mark_outputs_as_unspent(vec![(
-            uo.hash(&alice_ts_interface.key_manager_handle).await.unwrap(),
-            true,
-        )]);
+        alice_ts_interface
+            .oms_db
+            .mark_outputs_as_unspent(vec![(uo.output_hash(), true)])
+            .unwrap();
         alice_ts_interface
             .oms_db
             .set_received_outputs_mined_height_and_statuses(vec![ReceivedOutputInfoForBatch {
-                commitment: uo.commitment(&alice_ts_interface.key_manager_handle).await.unwrap(),
+                commitment: uo.commitment().clone(),
                 mined_height: height,
                 mined_in_block: FixedHash::zero(),
                 confirmed: false,
@@ -1872,21 +1981,21 @@ async fn test_update_faux_tx_on_oms_validation() {
             .unwrap();
         if tx_id == tx_id_1 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::Imported);
+                assert_eq!(tx.status, LegacyTransactionStatus::Imported);
             } else {
                 panic!("Should find a complete Imported transaction");
             }
         }
         if tx_id == tx_id_2 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::OneSidedUnconfirmed);
+                assert_eq!(tx.status, LegacyTransactionStatus::OneSidedUnconfirmed);
             } else {
                 panic!("Should find a complete FauxUnconfirmed transaction");
             }
         }
         if tx_id == tx_id_3 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::OneSidedConfirmed);
+                assert_eq!(tx.status, LegacyTransactionStatus::OneSidedConfirmed);
             } else {
                 panic!("Should find a complete FauxConfirmed transaction");
             }
@@ -1911,13 +2020,17 @@ async fn test_update_faux_tx_on_oms_validation() {
                 .unwrap()
                 .unwrap();
             if let WalletTransaction::Completed(tx) = transaction {
-                if tx_id == tx_id_1 && tx.status == TransactionStatus::OneSidedUnconfirmed && !found_imported {
+                if tx_id == tx_id_1 && tx.status == LegacyTransactionStatus::OneSidedUnconfirmed && !found_imported {
                     found_imported = true;
                 }
-                if tx_id == tx_id_2 && tx.status == TransactionStatus::OneSidedUnconfirmed && !found_faux_unconfirmed {
+                if tx_id == tx_id_2 &&
+                    tx.status == LegacyTransactionStatus::OneSidedUnconfirmed &&
+                    !found_faux_unconfirmed
+                {
                     found_faux_unconfirmed = true;
                 }
-                if tx_id == tx_id_3 && tx.status == TransactionStatus::OneSidedConfirmed && !found_faux_confirmed {
+                if tx_id == tx_id_3 && tx.status == LegacyTransactionStatus::OneSidedConfirmed && !found_faux_confirmed
+                {
                     found_faux_confirmed = true;
                 }
             }
@@ -1972,13 +2085,11 @@ async fn test_update_coinbase_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(10000),
             alice_address.clone(),
-            ImportStatus::CoinbaseConfirmed,
+            LegacyImportStatus::CoinbaseConfirmed,
             None,
             None,
             None,
-            uo_1.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_1.to_transaction_output().unwrap(),
             MemoField::open_from_string("coinbase_confirmed", TxType::PaymentToOther),
         )
         .await
@@ -1988,13 +2099,11 @@ async fn test_update_coinbase_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(20000),
             alice_address.clone(),
-            ImportStatus::CoinbaseUnconfirmed,
+            LegacyImportStatus::CoinbaseUnconfirmed,
             None,
             None,
             None,
-            uo_2.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_2.to_transaction_output().unwrap(),
             MemoField::open_from_string("one-coinbase_unconfirmed 1", TxType::PaymentToOther),
         )
         .await
@@ -2004,13 +2113,11 @@ async fn test_update_coinbase_tx_on_oms_validation() {
         .import_utxo_with_status(
             MicroMinotari::from(30000),
             alice_address,
-            ImportStatus::CoinbaseUnconfirmed,
+            LegacyImportStatus::CoinbaseUnconfirmed,
             None,
             None,
             None,
-            uo_3.to_transaction_output(&alice_ts_interface.key_manager_handle)
-                .await
-                .unwrap(),
+            uo_3.to_transaction_output().unwrap(),
             MemoField::open_from_string("Coinbase_not_mined", TxType::PaymentToOther),
         )
         .await
@@ -2022,11 +2129,11 @@ async fn test_update_coinbase_tx_on_oms_validation() {
             .add_output_with_tx_id(tx_id, uo.clone(), None)
             .await
             .unwrap();
-        if uo.value == MicroMinotari::from(10000) {
+        if uo.value() == MicroMinotari::from(10000) {
             alice_ts_interface
                 .oms_db
                 .set_received_outputs_mined_height_and_statuses(vec![ReceivedOutputInfoForBatch {
-                    commitment: uo.commitment(&alice_ts_interface.key_manager_handle).await.unwrap(),
+                    commitment: uo.commitment().clone(),
                     mined_height: 5,
                     mined_in_block: FixedHash::zero(),
                     confirmed: false,
@@ -2034,11 +2141,11 @@ async fn test_update_coinbase_tx_on_oms_validation() {
                 }])
                 .unwrap();
         }
-        if uo.value == MicroMinotari::from(20000) {
+        if uo.value() == MicroMinotari::from(20000) {
             alice_ts_interface
                 .oms_db
                 .set_received_outputs_mined_height_and_statuses(vec![ReceivedOutputInfoForBatch {
-                    commitment: uo.commitment(&alice_ts_interface.key_manager_handle).await.unwrap(),
+                    commitment: uo.commitment().clone(),
                     mined_height: 10,
                     mined_in_block: FixedHash::zero(),
                     confirmed: false,
@@ -2064,21 +2171,21 @@ async fn test_update_coinbase_tx_on_oms_validation() {
             .unwrap();
         if tx_id == tx_id_1 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::CoinbaseConfirmed);
+                assert_eq!(tx.status, LegacyTransactionStatus::CoinbaseConfirmed);
             } else {
                 panic!("Should find a complete Imported transaction");
             }
         }
         if tx_id == tx_id_2 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::CoinbaseUnconfirmed);
+                assert_eq!(tx.status, LegacyTransactionStatus::CoinbaseUnconfirmed);
             } else {
                 panic!("Should find a complete FauxUnconfirmed transaction");
             }
         }
         if tx_id == tx_id_3 {
             if let WalletTransaction::Completed(tx) = &transaction {
-                assert_eq!(tx.status, TransactionStatus::CoinbaseUnconfirmed);
+                assert_eq!(tx.status, LegacyTransactionStatus::CoinbaseUnconfirmed);
             } else {
                 panic!("Should find a complete FauxConfirmed transaction");
             }
@@ -2103,13 +2210,19 @@ async fn test_update_coinbase_tx_on_oms_validation() {
                 .unwrap()
                 .unwrap();
             if let WalletTransaction::Completed(tx) = transaction {
-                if tx_id == tx_id_1 && tx.status == TransactionStatus::CoinbaseConfirmed && !coinbase_confirmed {
+                if tx_id == tx_id_1 && tx.status == LegacyTransactionStatus::CoinbaseConfirmed && !coinbase_confirmed {
                     coinbase_confirmed = true;
                 }
-                if tx_id == tx_id_2 && tx.status == TransactionStatus::CoinbaseUnconfirmed && !coinbase_unconfirmed {
+                if tx_id == tx_id_2 &&
+                    tx.status == LegacyTransactionStatus::CoinbaseUnconfirmed &&
+                    !coinbase_unconfirmed
+                {
                     coinbase_unconfirmed = true;
                 }
-                if tx_id == tx_id_3 && tx.status == TransactionStatus::CoinbaseNotInBlockChain && !coinbase_unmined {
+                if tx_id == tx_id_3 &&
+                    tx.status == LegacyTransactionStatus::CoinbaseNotInBlockChain &&
+                    !coinbase_unmined
+                {
                     coinbase_unmined = true;
                 }
             }
@@ -2144,7 +2257,7 @@ fn create_mock_completed_transaction(
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        status: TransactionStatus::Completed,
+        status: LegacyTransactionStatus::Completed,
         timestamp: Utc::now(),
         cancelled: None,
         direction,

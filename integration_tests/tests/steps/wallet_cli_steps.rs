@@ -27,10 +27,8 @@ use cucumber::{then, when};
 use minotari_app_grpc::tari_rpc::Empty;
 use minotari_app_utilities::utilities::UniPublicKey;
 use minotari_console_wallet::{
-    BurnMinotariArgs,
     CliCommands,
     CoinSplitArgs,
-    DiscoverPeerArgs,
     ExportUtxosArgs,
     ExportViewKeyAndSpendKeyArgs,
     MakeItRainArgs,
@@ -67,27 +65,6 @@ async fn get_balance_of_wallet(world: &mut TariWorld, wallet: String, _amount: u
     let seed_nodes = world.base_nodes.get(base_node).unwrap().seed_nodes.clone();
 
     spawn_wallet(world, wallet, Some(base_node.clone()), seed_nodes, None, Some(cli)).await
-}
-
-#[when(expr = "I create a burn transaction of {int} uT from {word} via command line")]
-async fn create_burn_tx_via_cli(world: &mut TariWorld, amount: u64, wallet: String) {
-    let wallet_ps = world.wallets.get_mut(&wallet).unwrap();
-    wallet_ps.kill();
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let mut cli = get_default_cli();
-
-    let args = BurnMinotariArgs {
-        amount: MicroMinotari(amount),
-        payment_id: format!("Burn, burn amount {amount} !!!"),
-    };
-    cli.command2 = Some(CliCommands::BurnMinotari(args));
-
-    let base_node = world.wallet_connected_to_base_node.get(&wallet).unwrap();
-    let seed_nodes = world.base_nodes.get(base_node).unwrap().seed_nodes.clone();
-
-    spawn_wallet(world, wallet, Some(base_node.clone()), seed_nodes, None, Some(cli)).await;
 }
 
 #[when(
@@ -128,7 +105,6 @@ async fn make_it_rain(
         destination: wallet_b_address,
         start_time: None,
         one_sided: false,
-        burn_tari: false,
         payment_id: format!("Make it raing amount {start_amount} from {wallet_a} to {wallet_b}"),
     };
 
@@ -205,29 +181,6 @@ async fn export_utxos(world: &mut TariWorld, wallet: String) {
     let base_node = world.wallet_connected_to_base_node.get(&wallet).unwrap();
 
     let seed_nodes = world.base_nodes.get(base_node).unwrap().seed_nodes.clone();
-    spawn_wallet(world, wallet, Some(base_node.clone()), seed_nodes, None, Some(cli)).await;
-}
-
-#[when(expr = "I discover peer {word} on wallet {word} via command line")]
-async fn discover_peer(world: &mut TariWorld, node: String, wallet: String) {
-    let wallet_ps = world.wallets.get_mut(&wallet).unwrap();
-    wallet_ps.kill();
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let mut cli = get_default_cli();
-
-    let mut node_client = world.get_node_client(&node).await.unwrap();
-    let node_identity = node_client.identify(Empty {}).await.unwrap().into_inner();
-
-    let args = DiscoverPeerArgs {
-        dest_public_key: UniPublicKey::from_str(node_identity.public_key.to_hex().as_str()).unwrap(),
-    };
-
-    cli.command2 = Some(CliCommands::DiscoverPeer(args));
-
-    let base_node = world.wallet_connected_to_base_node.get(&wallet).unwrap();
-    let seed_nodes = world.base_nodes.get(&node).unwrap().seed_nodes.clone();
     spawn_wallet(world, wallet, Some(base_node.clone()), seed_nodes, None, Some(cli)).await;
 }
 

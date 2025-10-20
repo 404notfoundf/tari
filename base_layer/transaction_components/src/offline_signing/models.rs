@@ -24,21 +24,25 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tari_common_types::{
     tari_address::TariAddress,
     transaction::TxId,
-    types::{CompressedCommitment, FixedHash},
+    types::{CompressedCommitment, CompressedPublicKey, FixedHash},
 };
-use tari_transaction_components::{
-    transaction_components::{KernelFeatures, MemoField, OutputFeatures, Transaction, WalletOutput},
+
+use crate::{
+    offline_signing::marshal_output_pair::MarshalOutputPair,
+    transaction_components::{KernelFeatures, MemoField, OutputFeatures, Transaction, TransactionError, WalletOutput},
     MicroMinotari,
 };
 
-use crate::transaction_service::{
-    error::TransactionServiceError,
-    offline_signing::marshal_output_pair::MarshalOutputPair,
-};
+const SUPPORTED_VERSION: &str = "2.0.0";
 
-const SUPPORTED_VERSION: &str = "1.0.0";
+pub fn get_supported_versions() -> Vec<Version> {
+    vec![
+        Version::parse(SUPPORTED_VERSION).unwrap(),
+        Version::parse("1.0.0").unwrap(),
+    ]
+}
 
-pub fn get_supported_version() -> Version {
+pub fn get_latest_version() -> Version {
     Version::parse(SUPPORTED_VERSION).unwrap()
 }
 
@@ -47,30 +51,30 @@ pub trait HasVersion {
 }
 
 pub trait TransactionResult: HasVersion + Serialize + DeserializeOwned + Sized {
-    fn from_json(s: &str) -> Result<Self, TransactionServiceError> {
+    fn from_json(s: &str) -> Result<Self, TransactionError> {
         let value: serde_json::Value =
-            serde_json::from_str(s).map_err(|e| TransactionServiceError::SerializationError(e.to_string()))?;
+            serde_json::from_str(s).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
         let version = value
             .get("version")
-            .ok_or_else(|| TransactionServiceError::SerializationError("Missing version".into()))?;
-        let version: Version = serde_json::from_value(version.clone())
-            .map_err(|e| TransactionServiceError::SerializationError(e.to_string()))?;
-        if version != get_supported_version() {
-            return Err(TransactionServiceError::SerializationError(format!(
+            .ok_or_else(|| TransactionError::SerializationError("Missing version".into()))?;
+        let version: Version =
+            serde_json::from_value(version.clone()).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
+        if !get_supported_versions().contains(&version) {
+            return Err(TransactionError::SerializationError(format!(
                 "Unsupported version. Expected '{}', got '{}'",
-                get_supported_version(),
+                get_supported_versions().first().expect("at least one version"),
                 version
             )));
         }
 
         let deserialized_obj: Self =
-            serde_json::from_str(s).map_err(|e| TransactionServiceError::SerializationError(e.to_string()))?;
+            serde_json::from_str(s).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
 
         Ok(deserialized_obj)
     }
 
-    fn to_json(&self) -> Result<String, TransactionServiceError> {
-        serde_json::to_string(&self).map_err(|e| TransactionServiceError::SerializationError(e.to_string()))
+    fn to_json(&self) -> Result<String, TransactionError> {
+        serde_json::to_string(&self).map_err(|e| TransactionError::SerializationError(e.to_string()))
     }
 }
 
@@ -111,6 +115,43 @@ pub struct OneSidedTransactionInfo {
     /// Sender address
     pub sender_address: TariAddress,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OneSidedMultisigTransactionInfo {
+    #[serde(flatten)]
+    pub base: OneSidedTransactionInfo,
+    pub public_keys: Vec<CompressedPublicKey>,
+    pub party_number: u8,
+}
+
+impl core::ops::Deref for OneSidedMultisigTransactionInfo {
+    type Target = OneSidedTransactionInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl core::ops::DerefMut for OneSidedMultisigTransactionInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
+impl OneSidedMultisigTransactionInfo {
+    pub fn new(base: OneSidedTransactionInfo, public_keys: Vec<CompressedPublicKey>, party_number: u8) -> Self {
+        Self {
+            base,
+            public_keys,
+            party_number,
+        }
+    }
+
+    pub fn into_base(self) -> OneSidedTransactionInfo {
+        self.base
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PrepareOneSidedTransactionForSigningResult {
     pub version: Version,
@@ -121,6 +162,36 @@ pub struct PrepareOneSidedTransactionForSigningResult {
 impl TransactionResult for PrepareOneSidedTransactionForSigningResult {}
 
 impl HasVersion for PrepareOneSidedTransactionForSigningResult {
+    fn get_version(&self) -> &Version {
+        &self.version
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrepareDepositMultisigTransactionResult {
+    pub version: Version,
+    pub tx_id: TxId,
+    pub info: OneSidedMultisigTransactionInfo,
+}
+
+impl TransactionResult for PrepareDepositMultisigTransactionResult {}
+
+impl HasVersion for PrepareDepositMultisigTransactionResult {
+    fn get_version(&self) -> &Version {
+        &self.version
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrepareWithdrawMultisigTransactionResult {
+    pub version: Version,
+    pub tx_id: TxId,
+    pub info: OneSidedTransactionInfo,
+}
+
+impl TransactionResult for PrepareWithdrawMultisigTransactionResult {}
+
+impl HasVersion for PrepareWithdrawMultisigTransactionResult {
     fn get_version(&self) -> &Version {
         &self.version
     }
@@ -144,6 +215,36 @@ pub struct SignedOneSidedTransactionResult {
 impl TransactionResult for SignedOneSidedTransactionResult {}
 
 impl HasVersion for SignedOneSidedTransactionResult {
+    fn get_version(&self) -> &Version {
+        &self.version
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignedOneSidedDepositMultisigTransactionResult {
+    pub version: Version,
+    pub request: PrepareDepositMultisigTransactionResult,
+    pub signed_transaction: SignedTransaction,
+}
+
+impl TransactionResult for SignedOneSidedDepositMultisigTransactionResult {}
+
+impl HasVersion for SignedOneSidedDepositMultisigTransactionResult {
+    fn get_version(&self) -> &Version {
+        &self.version
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignedOneSidedWithdrawMultisigTransactionResult {
+    pub version: Version,
+    pub request: PrepareWithdrawMultisigTransactionResult,
+    pub signed_transaction: SignedTransaction,
+}
+
+impl TransactionResult for SignedOneSidedWithdrawMultisigTransactionResult {}
+
+impl HasVersion for SignedOneSidedWithdrawMultisigTransactionResult {
     fn get_version(&self) -> &Version {
         &self.version
     }

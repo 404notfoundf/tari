@@ -37,7 +37,7 @@ use crate::{
         PeerFlags,
         PeerManagerError,
     },
-    types::{CommsDatabase, CommsPublicKey},
+    types::{CommsDatabase, CommsPublicKey, TransportProtocol},
 };
 
 const LOG_TARGET: &str = "comms::peer_manager::peer_storage_sql";
@@ -191,6 +191,7 @@ impl PeerStorageSql {
     ///  - Only returns a maximum number of syncable peers (corresponds with the max possible number of requestable
     ///    peers to sync)
     ///  - Uses 0 as max PEER_MANAGER_SYNC_PEERS
+    ///  - Peers has an address that is reachable - with supported transport protocols
     pub fn discovery_syncing(
         &self,
         mut n: usize,
@@ -211,6 +212,7 @@ impl PeerStorageSql {
             None,
             Some(STALE_PEER_THRESHOLD_DURATION),
             external_addresses_only,
+            &[],
         )?)
     }
 
@@ -221,14 +223,17 @@ impl PeerStorageSql {
             .get_n_not_banned_or_deleted_peers(PEER_MANAGER_SYNC_PEERS)?)
     }
 
-    /// Get available dial candidates that are communication nodes, not banned, not deleted,
+    /// Get available dial candidates that are communication nodes, not banned, not deleted, reachable,
     /// and not in the excluded node IDs list
     pub fn get_available_dial_candidates(
         &self,
         exclude_node_ids: &[NodeId],
         limit: Option<usize>,
+        transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self.peer_db.get_available_dial_candidates(exclude_node_ids, limit)?)
+        Ok(self
+            .peer_db
+            .get_available_dial_candidates(exclude_node_ids, limit, transport_protocols)?)
     }
 
     /// Compile a list of closest `n` active peers
@@ -243,6 +248,7 @@ impl PeerStorageSql {
         exclude_if_all_address_failed: bool,
         exclusion_distance: Option<NodeDistance>,
         external_addresses_only: bool,
+        transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, PeerManagerError> {
         Ok(self.peer_db.get_closest_n_active_peers(
             region_node_id,
@@ -254,22 +260,33 @@ impl PeerStorageSql {
             exclude_if_all_address_failed,
             exclusion_distance,
             external_addresses_only,
+            transport_protocols,
         )?)
     }
 
+    /// Get all seed peers
     pub fn get_seed_peers(&self) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self.peer_db.get_seed_peers()?)
+        let seed_peers = self.peer_db.get_seed_peers()?;
+        trace!(
+            target: LOG_TARGET,
+            "Get seed peers: {:?}",
+            seed_peers.iter().map(|p| p.node_id.short_str()).collect::<Vec<_>>(),
+        );
+        Ok(seed_peers)
     }
 
-    /// Compile a random list of communication node peers of size _n_ that are not banned or offline  and have at least
-    /// one external address
+    /// Compile a random list of communication node peers of size _n_ that are not banned or offline and
+    /// external addresses support protocols defined in the `transport_protocols` vector.
     pub fn random_peers(
         &self,
         n: usize,
         exclude_peers: &[NodeId],
         flags: Option<PeerFlags>,
+        transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self.peer_db.get_n_random_peers(n, exclude_peers, flags)?)
+        Ok(self
+            .peer_db
+            .get_n_random_peers(n, exclude_peers, flags, transport_protocols)?)
     }
 
     /// Get the closest `n` not failed, banned or deleted peers, ordered by their distance to the given node ID.
@@ -814,7 +831,7 @@ mod test {
         assert_eq!(peer_storage.all(None).unwrap().len(), 5);
         assert_eq!(
             peer_storage
-                .discovery_syncing(100, &[good_seed.node_id], Some(PeerFeatures::COMMUNICATION_NODE), false)
+                .discovery_syncing(100, &[good_seed.node_id], Some(PeerFeatures::COMMUNICATION_NODE), false,)
                 .unwrap()
                 .len(),
             1

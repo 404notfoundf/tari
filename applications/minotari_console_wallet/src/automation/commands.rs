@@ -23,10 +23,8 @@ use std::{
     cmp::{max, min},
     collections::HashMap,
     convert::TryInto,
-    fs,
-    fs::File,
-    io,
-    io::{BufRead, BufReader, LineWriter, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, LineWriter, Write},
     path::PathBuf,
     str::FromStr,
     time::{Duration, Instant},
@@ -45,11 +43,6 @@ use minotari_wallet::{
     },
     transaction_service::{
         handle::{TransactionEvent, TransactionServiceHandle},
-        offline_signing::models::{
-            PrepareOneSidedTransactionForSigningResult,
-            SignedOneSidedTransactionResult,
-            TransactionResult,
-        },
         storage::models::WalletTransaction,
     },
     utxo_scanner_service::handle::UtxoScannerEvent,
@@ -62,7 +55,6 @@ use serde::Serialize;
 use sha2::Sha256;
 use tari_common::configuration::Network;
 use tari_common_types::{
-    burnt_proof::BurntProof,
     emoji::EmojiId,
     epoch::VnEpoch,
     key_branches::TransactionKeyManagerBranch,
@@ -81,7 +73,6 @@ use tari_common_types::{
     },
     wallet_types::WalletType,
 };
-use tari_comms_dht::{envelope::NodeDestination, DhtDiscoveryRequester};
 use tari_core::blocks::pre_mine::get_pre_mine_items;
 use tari_crypto::{dhke::DiffieHellmanSharedSecret, ristretto::RistrettoSecretKey};
 use tari_p2p::{auto_update::AutoUpdateConfig, PeerSeedsConfig};
@@ -89,6 +80,14 @@ use tari_script::{push_pubkey_script, CompressedCheckSigSchnorrSignature};
 use tari_shutdown::Shutdown;
 use tari_transaction_components::{
     key_manager::{TariKeyId, TransactionKeyManagerInterface},
+    multisig::script::is_multisig_utxo,
+    offline_signing::models::{
+        PrepareDepositMultisigTransactionResult,
+        PrepareOneSidedTransactionForSigningResult,
+        PrepareWithdrawMultisigTransactionResult,
+        SignedOneSidedTransactionResult,
+        TransactionResult,
+    },
     tari_amount::{uT, MicroMinotari, Minotari},
     transaction_components::{
         covenants::Covenant,
@@ -156,26 +155,6 @@ pub(crate) const SPEND_STEP_4_LEADER: &str = "step_4_for_leader_from_";
 
 #[derive(Debug)]
 pub struct SentTransaction {}
-
-pub async fn burn_tari(
-    mut wallet_transaction_service: TransactionServiceHandle,
-    fee_per_gram: u64,
-    amount: MicroMinotari,
-    payment_id: MemoField,
-    sidechain_deployment_key: Option<PrivateKey>,
-) -> Result<(TxId, BurntProof), CommandError> {
-    wallet_transaction_service
-        .burn_tari(
-            amount,
-            UtxoSelectionCriteria::default(),
-            fee_per_gram * uT,
-            payment_id,
-            None,
-            sidechain_deployment_key,
-        )
-        .await
-        .map_err(CommandError::TransactionServiceError)
-}
 
 /// encumbers a n-of-m transaction
 #[allow(clippy::too_many_arguments)]
@@ -392,30 +371,6 @@ pub async fn coin_split(
     Ok(tx_id)
 }
 
-pub async fn discover_peer(
-    mut dht_service: DhtDiscoveryRequester,
-    dest_public_key: CompressedPublicKey,
-) -> Result<(), CommandError> {
-    let start = Instant::now();
-    println!("🌎 Peer discovery started.");
-    match dht_service
-        .discover_peer(
-            dest_public_key.clone(),
-            NodeDestination::PublicKey(Box::new(dest_public_key)),
-        )
-        .await
-    {
-        Ok(peer) => {
-            println!("⚡️ Discovery succeeded in {}ms.", start.elapsed().as_millis());
-            println!("{peer}");
-        },
-        Err(err) => {
-            println!("💀 Discovery failed: '{err:?}'");
-        },
-    }
-
-    Ok(())
-}
 // casting here is okay. If the txns per second for this primary debug tool is a bit off its okay.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::too_many_lines)]
@@ -526,11 +481,6 @@ pub async fn make_it_rain(
                                 payment_id_clone,
                             )
                             .await
-                        },
-                        MakeItRainTransactionType::BurnTari => {
-                            burn_tari(tx_service, fee, amount, payment_id_clone, None)
-                                .await
-                                .map(|(tx_id, _)| tx_id)
                         },
                     };
                     let submit_time = Instant::now();
@@ -698,7 +648,6 @@ pub async fn command_runner(
 
     let mut transaction_service = wallet.transaction_service.clone();
     let mut output_service = wallet.output_manager_service.clone();
-    let dht_service = wallet.dht_service.discovery_service_requester().clone();
     let key_manager_service = wallet.key_manager_service.clone();
 
     let mut tx_ids = Vec::new();
@@ -720,35 +669,6 @@ pub async fn command_runner(
                     println!("{balance}");
                 },
                 Err(e) => eprintln!("GetBalance error! {e}"),
-            },
-            DiscoverPeer(args) => {
-                if let Err(e) = discover_peer(dht_service.clone(), args.dest_public_key.into()).await {
-                    eprintln!("DiscoverPeer error! {e}");
-                }
-            },
-            BurnMinotari(args) => {
-                match burn_tari(
-                    transaction_service.clone(),
-                    config.fee_per_gram,
-                    args.amount,
-                    MemoField::open_from_string(&args.payment_id, TxType::Burn),
-                    None,
-                )
-                .await
-                {
-                    Ok((tx_id, proof)) => {
-                        debug!(target: LOG_TARGET, "burn minotari concluded with tx_id {tx_id}");
-                        println!("Burnt {} Minotari in tx_id: {}", args.amount, tx_id);
-                        println!("The following can be used to claim the burnt funds:");
-                        println!();
-                        println!("claim_public_key: {}", proof.reciprocal_claim_public_key);
-                        println!("commitment: {}", proof.commitment.to_public_key()?);
-                        println!("ownership_proof: {:?}", proof.ownership_proof);
-                        println!("ownership_proof: {:?}", proof.range_proof);
-                        tx_ids.push(tx_id);
-                    },
-                    Err(e) => eprintln!("BurnMinotari error! {e}"),
-                }
             },
             PreMineSpendGetOutputStatus => {
                 let pre_mine_outputs = get_all_embedded_pre_mine_outputs()?;
@@ -1540,7 +1460,7 @@ pub async fn command_runner(
                         },
                     };
                     let commitment_mask_key_id = &key_manager_service
-                        .import_key(commitment_mask_private_key.clone())
+                        .import_key(commitment_mask_private_key.clone(), None)
                         .await?;
                     match key_manager_service
                         .verify_mask(
@@ -1878,7 +1798,8 @@ pub async fn command_runner(
                     } else {
                         for (i, utxo) in unblinded_utxos.iter().enumerate() {
                             println!(
-                                "{}. Value: {}, Spending Key: {:?}, Script Key: {:?}, Features: {}",
+                                "{}. Value: {}, Spending Key: {:?}, Script Key: {:?}, Features: {}, Commitment: {}, \
+                                 isMultisig: {}",
                                 i + 1,
                                 utxo.0.value,
                                 if args.with_private_keys {
@@ -1891,7 +1812,9 @@ pub async fn command_runner(
                                 } else {
                                     "*hidden*".to_string()
                                 },
-                                utxo.0.features
+                                utxo.0.features,
+                                utxo.1.to_hex(),
+                                is_multisig_utxo(&utxo.0.script)
                             );
                         }
                     }
@@ -1973,7 +1896,7 @@ pub async fn command_runner(
                 Ok(utxos) => {
                     let utxos: Vec<WalletOutput> = utxos.into_iter().map(|v| v.wallet_output).collect();
                     let count = utxos.len();
-                    let values: Vec<MicroMinotari> = utxos.iter().map(|utxo| utxo.value).collect();
+                    let values: Vec<MicroMinotari> = utxos.iter().map(|utxo| utxo.value()).collect();
                     let sum: MicroMinotari = values.iter().sum();
                     println!("Total number of UTXOs: {count}");
                     println!("Total value of UTXOs : {sum}");
@@ -2348,6 +2271,7 @@ pub async fn command_runner(
                 println!("removing temp wallet in: {temp_path:?}");
                 fs::remove_dir_all(temp_path)?;
             },
+
             ShowPayRef(args) => {
                 // Show transaction details first
                 match transaction_service
@@ -2429,14 +2353,12 @@ pub async fn command_runner(
             },
             ListTx => {
                 debug!(target: LOG_TARGET, "payref_debug: List all transactions command starting execution");
-
                 match transaction_service
                     .get_completed_transactions(None, None, None, 0)
                     .await
                 {
                     Ok(txs) => {
                         debug!(target: LOG_TARGET, "ListTxs command got {} transactions", txs.len());
-
                         if txs.is_empty() {
                             println!("No transactions.");
                             continue;
@@ -2477,6 +2399,74 @@ pub async fn command_runner(
                     Err(e) => eprintln!("ListTxs error! {e}"),
                 }
             },
+
+            GetMultisigUtxoData(args) => {
+                let mut transaction_service = wallet.transaction_service.clone();
+
+                let output = transaction_service.get_multisig_utxo_data(args.utxo_commitment).await?;
+
+                if let Some(file) = args.output_file {
+                    if let Some(parent) = file.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| CommandError::JsonFile(format!("Failed to create directory: {}", e)))?;
+                    }
+
+                    let signature_json = serde_json::to_string(&output).map_err(|e| {
+                        println!("Failed to convert signature to JSON: {}", e);
+                        CommandError::General(format!("Failed to convert signature to JSON: {}", e))
+                    })?;
+
+                    fs::write(&file, signature_json)
+                        .map_err(|err| CommandError::FileWriteError { file_path: file, err })?;
+                }
+            },
+
+            SendMultisigUtxo(args) => {
+                let mut transaction_service = wallet.transaction_service.clone();
+                let mut schnorr_signatures = Vec::new();
+
+                for signature in &args.schnorr_signatures {
+                    let sig = <CompressedCheckSigSchnorrSignature as tari_utilities::message_format::MessageFormat>::from_binary(signature)
+                        .map_err(|e| CommandError::General(format!("Failed to parse Schnorr signature: {}", e)))?;
+
+                    schnorr_signatures.push(sig);
+                }
+
+                let tx_id = transaction_service
+                    .send_multisig_utxo(args.utxo_commitment, args.recipient_address, schnorr_signatures)
+                    .await?;
+
+                tx_ids.push(tx_id);
+                debug!(target: LOG_TARGET, "Utxo was sent with tx_id {}", tx_id);
+            },
+
+            CreateMultisigUtxo(args) => {
+                if args.party_number as usize > args.public_keys.len() {
+                    return Err(CommandError::General(
+                        "party_number must be less than or equal to the number of public keys".to_string(),
+                    ));
+                }
+
+                let public_keys = args
+                    .public_keys
+                    .iter()
+                    .map(|pk| CompressedPublicKey::from(pk.clone()))
+                    .collect::<Vec<_>>();
+
+                let result = transaction_service
+                    .create_multisig_utxo(args.amount, args.party_number, public_keys, args.recipient_address)
+                    .await;
+
+                match result {
+                    Ok(tx_id) => {
+                        tx_ids.push(tx_id);
+                        debug!(target: LOG_TARGET, "Utxo changed to multisig with tx_id {}", tx_id);
+                    },
+                    Err(e) => {
+                        eprintln!("Error creating multisig UTXO: {}", e);
+                    },
+                }
+            },
             PrepareOneSidedTransactionForSigning(args) => {
                 let destination = args.destination.clone();
                 let payment_id =
@@ -2506,6 +2496,55 @@ pub async fn command_runner(
                     Err(e) => eprintln!("PrepareOneSidedTransactionForSigning error! {e}"),
                 }
             },
+            PrepareDepositMultisigTransaction(args) => {
+                let mut wallet_transaction_service = transaction_service.clone();
+
+                let recipient = TariAddress::from_bytes(args.recipient_address.to_vec().as_slice())
+                    .map_err(|e| CommandError::InvalidArgument(format!("Invalid recipient address: {e}")))?;
+
+                let public_keys = args
+                    .public_keys
+                    .into_iter()
+                    .map(|pk_bytes| {
+                        CompressedPublicKey::from_canonical_bytes(pk_bytes.0.as_bytes())
+                            .map_err(|e| CommandError::InvalidArgument(format!("Invalid public key: {e}")))
+                    })
+                    .collect::<Result<Vec<_>, CommandError>>()?;
+
+                let result = wallet_transaction_service
+                    .prepare_deposit_multisig_transaction(args.amount, args.party_number, public_keys, recipient)
+                    .await?;
+
+                println!("Prepared deposit multisig transaction: {:?}", result);
+            },
+
+            PrepareWithdrawMultisigTransaction(args) => {
+                let mut wallet_transaction_service = transaction_service.clone();
+
+                let recipient = TariAddress::from_bytes(args.recipient_address.to_vec().as_slice())
+                    .map_err(|e| CommandError::InvalidArgument(format!("Invalid recipient address: {e}")))?;
+                let mut schnorr_signatures = Vec::new();
+                for signature in &args.schnorr_signatures {
+                    let sig = <CompressedCheckSigSchnorrSignature as tari_utilities::message_format::MessageFormat>::from_binary(signature)
+                        .map_err(|e| CommandError::General(format!("Failed to parse Schnorr signature: {}", e)))?;
+
+                    schnorr_signatures.push(sig);
+                }
+
+                if schnorr_signatures.is_empty() {
+                    return Err(CommandError::InvalidArgument("signatures cannot be empty".to_string()));
+                }
+
+                let commitment = CompressedCommitment::from_hex(&args.utxo_commitment)
+                    .map_err(|e| CommandError::InvalidArgument(format!("Invalid UTXO commitment: {e}")))?;
+
+                let result = wallet_transaction_service
+                    .prepare_withdraw_multisig_transaction(commitment, schnorr_signatures, recipient)
+                    .await?;
+
+                println!("Prepared withdraw multisig transaction: {:?}", result);
+            },
+
             SignOneSidedTransaction(args) => {
                 let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
                     file_path: args.input_file.clone(),
@@ -2540,6 +2579,76 @@ pub async fn command_runner(
                     Err(e) => eprintln!("SignOneSidedTransaction error! {e}"),
                 }
             },
+
+            SignOneSidedDepositMultisigTransaction(args) => {
+                let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
+                    file_path: args.input_file.clone(),
+                    err,
+                })?;
+                let max_size = 10_000_000; // 10MB limit
+                if metadata.len() > max_size {
+                    return Err(CommandError::InvalidArgument("Input file too large".to_string()));
+                }
+
+                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
+                    file_path: args.input_file,
+                    err,
+                })?;
+                let request = PrepareDepositMultisigTransactionResult::from_json(&data)?;
+
+                let mut wallet_transaction_service = transaction_service.clone();
+                let result = wallet_transaction_service
+                    .sign_one_sided_deposit_multisig_transaction(request)
+                    .await
+                    .map_err(CommandError::TransactionServiceError);
+                match result {
+                    Ok(data) => {
+                        let json_data = data
+                            .to_json()
+                            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+                        fs::write(&args.output_file, json_data).map_err(|err| CommandError::FileWriteError {
+                            file_path: args.output_file,
+                            err,
+                        })?;
+                    },
+                    Err(e) => eprintln!("SignOneSidedDepositMultisigTransaction error! {e}"),
+                }
+            },
+
+            SignOneSidedWithdrawMultisigTransaction(args) => {
+                let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
+                    file_path: args.input_file.clone(),
+                    err,
+                })?;
+                let max_size = 10_000_000; // 10MB limit
+                if metadata.len() > max_size {
+                    return Err(CommandError::InvalidArgument("Input file too large".to_string()));
+                }
+
+                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
+                    file_path: args.input_file,
+                    err,
+                })?;
+                let request = PrepareWithdrawMultisigTransactionResult::from_json(&data)?;
+
+                let mut wallet_transaction_service = transaction_service.clone();
+                let result = wallet_transaction_service
+                    .sign_one_sided_withdraw_multisig_transaction(request)
+                    .await
+                    .map_err(CommandError::TransactionServiceError);
+                match result {
+                    Ok(data) => {
+                        let json_data = data
+                            .to_json()
+                            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+                        fs::write(&args.output_file, json_data).map_err(|err| CommandError::FileWriteError {
+                            file_path: args.output_file,
+                            err,
+                        })?;
+                    },
+                    Err(e) => eprintln!("SignOneSidedWithdrawMultisigTransaction error! {e}"),
+                }
+            },
             BroadcastSignedOneSidedTransaction(args) => {
                 let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
                     file_path: args.input_file,
@@ -2562,6 +2671,61 @@ pub async fn command_runner(
                         tx_ids.push(tx_id);
                     },
                     Err(e) => eprintln!("BroadcastSignedOneSidedTransaction error! {e}"),
+                }
+            },
+            SignMessage(args) => {
+                let mut commitment_bytes = [0u8; 32];
+                let hex_msg = args.message.trim().trim_start_matches("0x");
+                let msg_bytes = Vec::<u8>::from_hex(hex_msg)
+                    .map_err(|e| CommandError::General(format!("message must be 32-byte hex: {}", e)))?;
+                commitment_bytes.clone_from_slice(&msg_bytes);
+                let sender_offset = args.sender_offset_key.as_ref().map(|pk| &pk.0);
+
+                let signature = key_manager_service
+                    .sign_message_with_spend_key(&commitment_bytes, sender_offset)
+                    .await?;
+
+                if let Some(file) = args.output_file {
+                    if let Some(parent) = file.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| CommandError::JsonFile(format!("Failed to create directory: {}", e)))?;
+                    }
+
+                    let signature_binary = tari_utilities::message_format::MessageFormat::to_binary(&signature)
+                        .map_err(|e| CommandError::General(format!("Failed to convert signature to binary: {}", e)))?;
+                    let signature_json = serde_json::to_string(&signature_binary.to_hex())
+                        .map_err(|e| CommandError::JsonFile(e.to_string()))?;
+
+                    fs::write(&file, signature_json)
+                        .map_err(|err| CommandError::FileWriteError { file_path: file, err })?;
+                }
+            },
+
+            SignScriptMessage(args) => {
+                let mut commitment_bytes = [0u8; 32];
+                let hex_msg = args.message.trim().trim_start_matches("0x");
+                let msg_bytes = Vec::<u8>::from_hex(hex_msg)
+                    .map_err(|e| CommandError::General(format!("message must be 32-byte hex: {}", e)))?;
+                commitment_bytes.clone_from_slice(&msg_bytes);
+
+                let sender_offset = args.sender_offset_key.as_ref().map(|pk| &pk.0);
+                let signature = key_manager_service
+                    .sign_script_message_with_spend_key(&commitment_bytes, sender_offset)
+                    .await?;
+
+                if let Some(file) = args.output_file {
+                    if let Some(parent) = file.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| CommandError::JsonFile(format!("Failed to create directory: {}", e)))?;
+                    }
+
+                    let signature_binary = tari_utilities::message_format::MessageFormat::to_binary(&signature)
+                        .map_err(|e| CommandError::General(format!("Failed to convert signature to binary: {}", e)))?;
+                    let signature_json = serde_json::to_string(&signature_binary.to_hex())
+                        .map_err(|e| CommandError::JsonFile(e.to_string()))?;
+
+                    fs::write(&file, signature_json)
+                        .map_err(|err| CommandError::FileWriteError { file_path: file, err })?;
                 }
             },
         }
@@ -2707,7 +2871,6 @@ fn get_embedded_pre_mine_outputs(
     } else {
         get_all_embedded_pre_mine_outputs()?
     };
-
     let mut fetched_outputs = Vec::with_capacity(output_indexes.len());
     for index in output_indexes {
         if index >= utxos.len() {

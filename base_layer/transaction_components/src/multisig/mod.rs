@@ -1,4 +1,4 @@
-// Copyright 2020, The Tari Project
+// Copyright 2025 The Tari Project
 //
 // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
 // following conditions are met:
@@ -19,34 +19,6 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-use std::{
-    marker::PhantomData,
-    task::{Context, Poll},
-};
-
-use futures::future;
-use tower::Service;
-
-/// A service which is used as a placeholder type. This service will panic if used.
-pub struct PlaceholderService<TReq, TResp, TErr>(PhantomData<(TReq, TResp, TErr)>);
-
-impl<TReq, TResp, TErr> Service<TReq> for PlaceholderService<TReq, TResp, TErr> {
-    type Error = TErr;
-    type Future = future::Ready<Result<Self::Response, Self::Error>>;
-    type Response = TResp;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        panic!("poll_ready called on PlaceholderService")
-    }
-
-    fn call(&mut self, _: TReq) -> Self::Future {
-        panic!("call called on PlaceholderService")
-    }
-}
-
-impl<TReq, TResp, TErr> Clone for PlaceholderService<TReq, TResp, TErr> {
-    fn clone(&self) -> Self {
-        Self(PhantomData)
-    }
-}
+pub mod script;
+pub mod session;
+pub mod types;

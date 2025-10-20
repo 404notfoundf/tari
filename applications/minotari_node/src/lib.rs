@@ -31,6 +31,7 @@ mod builder;
 pub mod cli;
 mod commands;
 pub mod config;
+mod consensus_constants_tracker;
 mod grpc;
 mod grpc_method;
 #[cfg(feature = "metrics")]
@@ -46,6 +47,7 @@ use std::{process, sync::Arc};
 use commands::{cli_loop::CliLoop, command::CommandContext};
 use futures::FutureExt;
 pub use grpc_method::GrpcMethod;
+pub use http::HttpCacheConfig;
 use log::*;
 use minotari_app_grpc::{
     authentication::ServerAuthenticationInterceptor,

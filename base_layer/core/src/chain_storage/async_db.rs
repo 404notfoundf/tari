@@ -37,7 +37,15 @@ use tari_common_types::{
         HashOutput,
     },
 };
-use tari_node_components::blocks::{Block, BlockHeader, NewBlockTemplate};
+use tari_node_components::blocks::{
+    Block,
+    BlockHeader,
+    BlockHeaderAccumulatedData,
+    ChainBlock,
+    ChainHeader,
+    HistoricalBlock,
+    NewBlockTemplate,
+};
 use tari_transaction_components::{
     tari_proof_of_work::PowAlgorithm,
     transaction_components::{OutputType, TransactionInput, TransactionKernel, TransactionOutput},
@@ -46,16 +54,10 @@ use tari_utilities::epoch_time::EpochTime;
 
 use super::{MinedInfo, TemplateRegistrationEntry, ValidatorNodeRegistrationInfo};
 use crate::{
-    blocks::{
-        BlockAccumulatedData,
-        BlockHeaderAccumulatedData,
-        ChainBlock,
-        ChainHeader,
-        HistoricalBlock,
-        UpdateBlockAccumulatedData,
-    },
+    blocks::{BlockAccumulatedData, UpdateBlockAccumulatedData},
     chain_storage::{
         blockchain_database::MmrRoots,
+        kernel_merkle_proof::KernelMerkleProof,
         utxo_mined_info::{InputMinedInfo, OutputMinedInfo},
         BlockAddResult,
         BlockchainBackend,
@@ -71,6 +73,7 @@ use crate::{
     common::rolling_vec::RollingVec,
     proof_of_work::TargetDifficultyWindow,
 };
+
 const LOG_TARGET: &str = "c::bn::async_db";
 
 fn trace_log<F, R>(name: &str, f: F) -> R
@@ -183,6 +186,8 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
     make_async_fn!(fetch_kernel_by_excess_sig(excess_sig: CompressedSignature) -> Option<(TransactionKernel, HashOutput)>, "fetch_kernel_by_excess_sig");
 
     make_async_fn!(fetch_kernels_in_block(hash: HashOutput) -> Vec<TransactionKernel>, "fetch_kernels_in_block");
+
+    make_async_fn!(generate_kernel_merkle_proof(excess_sig: CompressedSignature) -> KernelMerkleProof, "generate_kernel_merkle_proof");
 
     //---------------------------------- MMR --------------------------------------------//
     make_async_fn!(prepare_new_block(template: NewBlockTemplate) -> Block, "prepare_new_block");

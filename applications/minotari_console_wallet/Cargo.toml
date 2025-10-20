@@ -2,6 +2,7 @@
 name = "minotari_console_wallet"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -14,7 +15,6 @@ tari_common = { workspace = true }
 tari_common_types = { workspace = true }
 tari_transaction_components = { workspace = true }
 tari_comms = { workspace = true }
-tari_comms_dht = { workspace = true }
 tari_core = { workspace = true}
 tari_crypto = { workspace = true }
 tari_libtor = { workspace = true, optional = true }
@@ -71,7 +71,8 @@ tonic = "0.13.1"
 unicode-width = "0.1"
 url = "2.3.1"
 zxcvbn = "2"
-tui = { version = "^0.19", default-features = false, features = ["crossterm"] }
+tui = { version = "^0.19", default-features = false, features = ["crossterm"]}
+
 
 [build-dependencies]
 tari_features = { workspace = true }

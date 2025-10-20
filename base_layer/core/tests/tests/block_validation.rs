@@ -30,7 +30,7 @@ use serial_test::serial;
 use tari_common::configuration::Network;
 use tari_common_types::types::FixedHash;
 use tari_core::{
-    blocks::{BlockHeaderAccumulatedData, ChainBlock},
+    blocks::BlockHeaderAccumulatedDataBuilder,
     chain_storage::{BlockchainDatabase, BlockchainDatabaseConfig, ChainStorageError, Validators},
     consensus::BaseNodeConsensusManager,
     proof_of_work::{
@@ -51,7 +51,7 @@ use tari_core::{
         ValidationError,
     },
 };
-use tari_node_components::blocks::{Block, BlockHeaderValidationError, BlockValidationError};
+use tari_node_components::blocks::{Block, BlockHeaderValidationError, BlockValidationError, ChainBlock};
 use tari_script::{inputs, script};
 use tari_test_utils::unpack_enum;
 use tari_transaction_components::{
@@ -288,12 +288,12 @@ async fn inputs_are_not_malleable() {
     let mut malicious_test_params = TestParams::new(&blockchain.key_manager).await;
 
     // Oh noes - they've managed to get hold of the private script and spend keys
-    malicious_test_params.commitment_mask_key_id = spent_output.commitment_mask_key_id;
+    malicious_test_params.commitment_mask_key_id = spent_output.commitment_mask_key_id().clone();
     let modified_so = blockchain
         .key_manager
-        .get_script_offset(&vec![spent_output.script_key_id.clone()], &vec![malicious_test_params
-            .script_key_id
-            .clone()])
+        .get_script_offset(&vec![spent_output.script_key_id().clone()], &vec![
+            malicious_test_params.script_key_id.clone(),
+        ])
         .await
         .unwrap();
     // so is calculated as ks-ko
@@ -307,10 +307,10 @@ async fn inputs_are_not_malleable() {
     let malicious_wallet_output = malicious_test_params
         .create_input(
             UtxoTestParams {
-                value: spent_output.value,
-                script: spent_output.script.clone(),
+                value: spent_output.value(),
+                script: spent_output.script().clone(),
                 input_data: Some(inputs![malicious_script_public_key]),
-                features: spent_output.features,
+                features: spent_output.features().clone(),
                 ..Default::default()
             },
             &blockchain.key_manager,
@@ -546,11 +546,11 @@ OutputFeatures::default()),
             FixedHash::zero(),
         )
         .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(genesis.accumulated_data())
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(genesis.accumulated_data())
         .with_hash(new_block.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(new_block.header.total_kernel_offset.clone())
-        .build()
+        .build(rules.consensus_constants(new_block.header.height))
         .unwrap();
 
     let chain_block = ChainBlock::try_construct(Arc::new(new_block), accumulated_data).unwrap();
@@ -587,7 +587,7 @@ OutputFeatures::default()),
         script!(Nop).unwrap(),
         OutputFeatures::default(),
         &test_params1,
-        outputs[1].value,
+        outputs[1].value(),
         &key_manager,
     )
     .await
@@ -596,7 +596,7 @@ OutputFeatures::default()),
         script!(Nop).unwrap(),
         OutputFeatures::default(),
         &test_params2,
-        outputs[2].value,
+        outputs[2].value(),
         &key_manager,
     )
     .await
@@ -619,11 +619,11 @@ OutputFeatures::default()),
             FixedHash::zero(),
         )
         .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(genesis.accumulated_data())
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(genesis.accumulated_data())
         .with_hash(new_block.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(new_block.header.total_kernel_offset.clone())
-        .build()
+        .build(rules.consensus_constants(new_block.header.height))
         .unwrap();
 
     let chain_block = ChainBlock::try_construct(Arc::new(new_block), accumulated_data).unwrap();
@@ -652,11 +652,11 @@ OutputFeatures::default()),
             FixedHash::zero(),
         )
         .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(genesis.accumulated_data())
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(genesis.accumulated_data())
         .with_hash(new_block.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(new_block.header.total_kernel_offset.clone())
-        .build()
+        .build(rules.consensus_constants(new_block.header.height))
         .unwrap();
 
     let chain_block = ChainBlock::try_construct(Arc::new(new_block), accumulated_data).unwrap();
@@ -683,11 +683,11 @@ OutputFeatures::default()),
             FixedHash::zero(),
         )
         .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(genesis.accumulated_data())
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(genesis.accumulated_data())
         .with_hash(new_block.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(new_block.header.total_kernel_offset.clone())
-        .build()
+        .build(rules.consensus_constants(new_block.header.height))
         .unwrap();
 
     let chain_block = ChainBlock::try_construct(Arc::new(new_block), accumulated_data).unwrap();
@@ -976,7 +976,7 @@ async fn test_block_sync_body_validator() {
         script!(Nop).unwrap(),
         OutputFeatures::default(),
         &test_params1,
-        outputs[1].value,
+        outputs[1].value(),
         &key_manager,
     )
     .await
@@ -985,7 +985,7 @@ async fn test_block_sync_body_validator() {
         script!(Nop).unwrap(),
         OutputFeatures::default(),
         &test_params2,
-        outputs[2].value,
+        outputs[2].value(),
         &key_manager,
     )
     .await

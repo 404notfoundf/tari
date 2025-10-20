@@ -2,6 +2,7 @@
 name = "minotari_app_utilities"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -25,6 +26,7 @@ serde = "1.0.126"
 thiserror = "^1.0.26"
 dialoguer = { version = "0.10" }
 tonic = "0.13.1"
+tari_p2p.workspace = true
 
 [build-dependencies]
 tari_common = { workspace = true, features = [

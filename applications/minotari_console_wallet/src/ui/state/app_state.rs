@@ -48,7 +48,7 @@ use tari_common::configuration::Network;
 use tari_common_types::{
     payment_reference::generate_payment_reference,
     tari_address::TariAddress,
-    transaction::{TransactionDirection, TransactionStatus, TxId},
+    transaction::{LegacyTransactionStatus, TransactionDirection, TxId},
     types::{CompressedPublicKey, PrivateKey},
     wallet_types::WalletType,
 };
@@ -75,7 +75,7 @@ use crate::{
             tasks::{send_burn_transaction_task, send_register_template_transaction_task},
             wallet_event_monitor::WalletEventMonitor,
         },
-        ui_burnt_proof::UiBurntProof,
+        ui_burnt_proof::UiBurnProof,
         ui_error::UiError,
     },
 };
@@ -146,7 +146,7 @@ impl AppState {
 
     pub async fn refresh_burnt_proofs_state(&mut self) -> Result<(), UiError> {
         let mut inner = self.inner.write().await;
-        inner.refresh_burnt_proofs_state().await?;
+        inner.refresh_burn_proofs_state().await?;
         drop(inner);
         self.update_cache().await;
         Ok(())
@@ -183,16 +183,16 @@ impl AppState {
         address_string
     }
 
-    pub async fn delete_burnt_proof(&mut self, proof_id: u32) -> Result<(), UiError> {
+    pub async fn delete_burnt_proof(&mut self, proof_id: i32) -> Result<(), UiError> {
         let mut inner = self.inner.write().await;
 
         inner
             .wallet
             .db
-            .delete_burnt_proof(proof_id)
+            .delete_burn_proof(proof_id)
             .map_err(UiError::WalletStorageError)?;
 
-        inner.refresh_burnt_proofs_state().await?;
+        inner.refresh_burn_proofs_state().await?;
         drop(inner);
         self.update_cache().await;
 
@@ -278,7 +278,6 @@ impl AppState {
             fee_per_gram,
             sidechain_deploy_key,
             tx_service_handle,
-            inner.wallet.db.clone(),
             result_tx,
         )
         .await;
@@ -358,20 +357,8 @@ impl AppState {
         &self.cached_data.my_identity
     }
 
-    pub fn get_burnt_proofs(&self) -> &[UiBurntProof] {
+    pub fn get_burn_proofs(&self) -> &[UiBurnProof] {
         self.cached_data.burnt_proofs.as_slice()
-    }
-
-    pub fn get_burnt_proof_by_index(&self, idx: usize) -> Option<&UiBurntProof> {
-        self.cached_data.burnt_proofs.get(idx)
-    }
-
-    pub fn get_burnt_proofs_slice(&self, start: usize, end: usize) -> &[UiBurntProof] {
-        if self.cached_data.burnt_proofs.is_empty() || start >= end {
-            return &[];
-        }
-
-        &self.cached_data.burnt_proofs[start..end]
     }
 
     pub fn get_pending_txs(&self) -> &Vec<CompletedTransactionInfo> {
@@ -399,7 +386,7 @@ impl AppState {
             self.cached_data
                 .completed_txs
                 .iter()
-                .filter(|tx| !matches!(tx.status, TransactionStatus::CoinbaseNotInBlockChain))
+                .filter(|tx| !matches!(tx.status, LegacyTransactionStatus::CoinbaseNotInBlockChain))
                 .collect()
         } else {
             self.cached_data.completed_txs.iter().collect()
@@ -540,8 +527,8 @@ impl AppStateInner {
                 .transaction_service
                 .get_pending_inbound_transactions()
                 .await?
-                .iter()
-                .map(|t| CompletedTransaction::from(t.clone()))
+                .into_iter()
+                .map(CompletedTransaction::from)
                 .collect::<Vec<CompletedTransaction>>(),
         );
         pending_transactions.extend(
@@ -549,17 +536,17 @@ impl AppStateInner {
                 .transaction_service
                 .get_pending_outbound_transactions()
                 .await?
-                .iter()
-                .map(|t| CompletedTransaction::from_outbound(t.clone(), Vec::new()))
+                .into_iter()
+                .map(|t| CompletedTransaction::from_outbound(t, Vec::new()))
                 .collect::<Vec<CompletedTransaction>>(),
         );
         pending_transactions.sort_by(|a: &CompletedTransaction, b: &CompletedTransaction| {
             b.timestamp.partial_cmp(&a.timestamp).unwrap()
         });
         self.data.pending_txs = pending_transactions
-            .iter()
+            .into_iter()
             .map(|tx| {
-                CompletedTransactionInfo::from_completed_transaction(tx.clone(), &self.get_transaction_weight())
+                CompletedTransactionInfo::from_completed_transaction(tx, &self.get_transaction_weight())
                     .map_err(|e| UiError::TransactionError(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -733,14 +720,14 @@ impl AppStateInner {
                 )
                 .map_err(|e| UiError::TransactionError(e.to_string()))?;
                 if let Some(index) = self.data.pending_txs.iter().position(|i| i.tx_id == tx_id) {
-                    if tx.status == TransactionStatus::Pending && tx.cancelled.is_none() {
+                    if tx.status == LegacyTransactionStatus::Pending && tx.cancelled.is_none() {
                         self.data.pending_txs[index] = tx;
                         self.updated = true;
                         return Ok(());
                     } else {
                         let _completed_transaction_info = self.data.pending_txs.remove(index);
                     }
-                } else if tx.status == TransactionStatus::Pending && tx.cancelled.is_none() {
+                } else if tx.status == LegacyTransactionStatus::Pending && tx.cancelled.is_none() {
                     self.data.pending_txs.push(tx);
                     self.data.pending_txs.sort_by(|a, b| {
                         b.timestamp
@@ -771,20 +758,20 @@ impl AppStateInner {
         Ok(())
     }
 
-    pub async fn refresh_burnt_proofs_state(&mut self) -> Result<(), UiError> {
-        let db_burnt_proofs = self.wallet.db.fetch_burnt_proofs()?;
-        let mut ui_proofs: Vec<UiBurntProof> = vec![];
+    pub async fn refresh_burn_proofs_state(&mut self) -> Result<(), UiError> {
+        // Sorted by created_at DESC in the DB query
+        let db_burn_proofs = self.wallet.db.get_all_burn_proofs()?;
+        let mut ui_proofs = Vec::with_capacity(db_burn_proofs.len());
 
-        for proof in db_burnt_proofs {
-            ui_proofs.push(UiBurntProof {
-                id: proof.0,
-                reciprocal_claim_public_key: proof.1,
-                payload: proof.2,
-                burned_at: proof.3,
+        for proof in db_burn_proofs {
+            ui_proofs.push(UiBurnProof {
+                id: proof.id,
+                proof: proof.burn_proof,
+                encoded_merkle_proof: proof.kernel_merkle_proof,
+                kernel: proof.kernel,
+                burned_at: proof.created_at,
             });
         }
-
-        ui_proofs.sort_by(|a, b| a.burned_at.cmp(&b.burned_at));
 
         self.data.burnt_proofs = ui_proofs;
         self.updated = true;
@@ -829,7 +816,7 @@ impl AppStateInner {
     }
 
     pub fn get_shutdown_signal(&self) -> ShutdownSignal {
-        self.wallet.comms.shutdown_signal()
+        self.wallet.shutdown_signal.clone()
     }
 
     pub fn get_transaction_service_event_stream(&self) -> TransactionEventReceiver {
@@ -881,7 +868,7 @@ pub struct CompletedTransactionInfo {
     pub fee: MicroMinotari,
     pub excess_signature: String,
     pub maturity: u64,
-    pub status: TransactionStatus,
+    pub status: LegacyTransactionStatus,
     pub timestamp: NaiveDateTime,
     pub mined_timestamp: Option<NaiveDateTime>,
     pub cancelled: Option<TxCancellationReason>,
@@ -964,7 +951,7 @@ struct AppStateData {
     completed_txs: Vec<CompletedTransactionInfo>,
     confirmations: HashMap<TxId, u64>,
     my_identity: MyIdentity,
-    burnt_proofs: Vec<UiBurntProof>,
+    burnt_proofs: Vec<UiBurnProof>,
     balance: Balance,
     base_node_state: BaseNodeState,
     all_events: VecDeque<EventListItem>,
@@ -1052,7 +1039,7 @@ pub enum UiTransactionSendStatus {
 #[derive(Clone, Debug)]
 pub enum UiTransactionBurnStatus {
     Initiated,
-    TransactionComplete((u32, String, String)),
+    TransactionComplete,
     Error(String),
 }
 

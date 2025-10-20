@@ -70,7 +70,7 @@ pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> Result<EpochTime, Vali
     }
 
     let mid_index = timestamps.len() / 2;
-    let median_timestamp = if timestamps.len() % 2 == 0 {
+    let median_timestamp = if timestamps.len().is_multiple_of(2) {
         trace!(
             target: LOG_TARGET,
             "No median timestamp available, estimating median as avg of [{}] and [{}]",
@@ -562,9 +562,9 @@ mod test {
                 RangeProofType::RevealedValue,
                 &key_manager,
             ));
-            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel =
-                test_helpers::create_coinbase_kernel(&coinbase.commitment_mask_key_id, &key_manager).await;
+                test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager).await;
 
             let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
@@ -588,10 +588,12 @@ mod test {
                 &key_manager,
             )
             .await;
-            coinbase.features.maturity = 0;
-            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            let mut features = coinbase.features().clone();
+            features.maturity = 0;
+            coinbase.set_features(features);
+            let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel =
-                test_helpers::create_coinbase_kernel(&coinbase.commitment_mask_key_id, &key_manager).await;
+                test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager).await;
 
             let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
@@ -618,10 +620,10 @@ mod test {
                 &key_manager,
             )
             .await;
-            coinbase.value = 123.into();
-            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            coinbase.set_value(123.into(), &key_manager).await.unwrap();
+            let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel =
-                test_helpers::create_coinbase_kernel(&coinbase.commitment_mask_key_id, &key_manager).await;
+                test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager).await;
 
             let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();

@@ -21,6 +21,7 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::{
+    collections::HashMap,
     convert::TryInto,
     time::{Duration, Instant},
 };
@@ -32,7 +33,7 @@ use minotari_node_wallet_client::BaseNodeWalletClient;
 use tari_common_types::{
     seeds::seed_words::get_birthday_from_unix_epoch_in_seconds,
     tari_address::TariAddress,
-    transaction::{ImportStatus, TxId},
+    transaction::{LegacyImportStatus, TxId},
     types::{BlockHash, FixedHash, HashOutput},
     wallet_types::WalletType,
 };
@@ -219,6 +220,7 @@ where
             self.resources.db.clear_scanned_blocks()?;
             let wallet_birthday = match self.resources.db.get_wallet_type()? {
                 Some(WalletType::ProvidedKeys(wallet)) => Some(wallet.birthday.unwrap_or_default()),
+                Some(WalletType::Ledger(_)) => Some(0), // Ledger wallets have no birthday, so start from genesis
                 _ => None,
             };
             let scanning_start_height_hash = self
@@ -568,6 +570,7 @@ where
                 .map_err(|e| anyhow!("Not a valid commitment: {}", e.to_string()))?;
 
             let encrypted = EncryptedData::from_bytes(&output.encrypted_data)?;
+
             // Received output use the DH of view key and sender offset.
             let offset_pub_key = CompressedKey::from_canonical_bytes(&output.sender_offset_public_key)
                 .map_err(|e| anyhow!("Sender offset is not a valid public key:{}", e.to_string()))?;
@@ -597,14 +600,11 @@ where
             }
         }
         let scanned_time = start.elapsed();
-        let start = Instant::now();
 
-        let one_sided_time = start.elapsed();
         trace!(
             target: LOG_TARGET,
-            "Scanned for outputs: outputs took {} ms , one-sided took {} ms",
+            "Scanned for outputs: outputs took {} ms",
             scanned_time.as_millis(),
-            one_sided_time.as_millis(),
         );
         Ok(found_outputs)
     }
@@ -612,34 +612,63 @@ where
     async fn scan_for_outputs(
         &mut self,
         outputs: Vec<TransactionOutput>,
-    ) -> Result<Vec<(WalletOutput, ImportStatus, TxId, TransactionOutput)>, anyhow::Error> {
+    ) -> Result<Vec<(WalletOutput, LegacyImportStatus, TxId, TransactionOutput)>, anyhow::Error> {
         let start = Instant::now();
-        let mut found_outputs: Vec<(WalletOutput, ImportStatus, TxId, TransactionOutput)> = self
-            .resources
-            .output_manager_service
-            .scan_outputs_for_one_sided_payments(outputs.clone().into_iter().map(|o| (o, None)).collect())
-            .await?
-            .into_iter()
-            .map(|ro| -> Result<_, anyhow::Error> {
-                let status = if ro.output.features.is_coinbase() {
-                    ImportStatus::CoinbaseUnconfirmed
-                } else {
-                    ImportStatus::OneSidedUnconfirmed
-                };
-                let output = outputs
-                    .iter()
-                    .find(|o| o.hash() == ro.hash)
-                    .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
-                Ok((ro.output, status, ro.tx_id, output.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let one_sided_time = start.elapsed();
-        let other_outputs = outputs
+        let outputs_by_hash: HashMap<_, _> = outputs.iter().cloned().map(|o| (o.hash(), o)).collect();
+        let mut found_outputs = Vec::new();
+
+        found_outputs.append(
+            &mut self
+                .resources
+                .output_manager_service
+                .scan_outputs_for_one_sided_payments(outputs.clone().into_iter().map(|o| (o, None)).collect())
+                .await?
+                .into_iter()
+                .map(|ro| -> Result<_, anyhow::Error> {
+                    let status = if ro.output.is_coinbase() {
+                        LegacyImportStatus::CoinbaseUnconfirmed
+                    } else {
+                        LegacyImportStatus::OneSidedUnconfirmed
+                    };
+                    let output = outputs_by_hash
+                        .get(&ro.hash)
+                        .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
+                    Ok((ro.output, status, ro.tx_id, output.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+
+        let output_without_one_sided: Vec<(TransactionOutput, Option<TxId>)> = outputs
             .iter()
             .filter(|o| !found_outputs.iter().any(|f| f.3.hash() == o.hash()))
             .map(|o| (o.clone(), None))
             .collect();
+
+        let one_sided_time = start.elapsed();
         let start = Instant::now();
+        found_outputs.append(
+            &mut self
+                .resources
+                .output_manager_service
+                .scan_outputs_for_multisig(output_without_one_sided.clone())
+                .await?
+                .into_iter()
+                .map(|ro| -> Result<_, anyhow::Error> {
+                    let status = LegacyImportStatus::Imported;
+                    let output = outputs_by_hash
+                        .get(&ro.hash)
+                        .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
+                    Ok((ro.output, status, ro.tx_id, output.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+
+        let other_outputs: Vec<(TransactionOutput, Option<TxId>)> = output_without_one_sided
+            .iter()
+            .filter(|o| !found_outputs.iter().any(|f| f.3.hash() == o.0.hash()))
+            .map(|o| (o.0.clone(), o.1))
+            .collect();
+
         found_outputs.append(
             &mut self
                 .resources
@@ -648,14 +677,13 @@ where
                 .await?
                 .into_iter()
                 .map(|ro| -> Result<_, anyhow::Error> {
-                    let status = if ro.output.features.is_coinbase() {
-                        ImportStatus::CoinbaseUnconfirmed
+                    let status = if ro.output.is_coinbase() {
+                        LegacyImportStatus::CoinbaseUnconfirmed
                     } else {
-                        ImportStatus::Imported
+                        LegacyImportStatus::Imported
                     };
-                    let output = outputs
-                        .iter()
-                        .find(|o| o.hash() == ro.hash)
+                    let output = outputs_by_hash
+                        .get(&ro.hash)
                         .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
                     Ok((ro.output, status, ro.tx_id, output.clone()))
                 })
@@ -669,24 +697,25 @@ where
             scanned_time.as_millis(),
             one_sided_time.as_millis(),
         );
+
         Ok(found_outputs)
     }
 
     async fn import_utxos_to_transaction_service(
         &mut self,
-        utxos: &[(WalletOutput, ImportStatus, TxId, TransactionOutput)],
+        utxos: &[(WalletOutput, LegacyImportStatus, TxId, TransactionOutput)],
         current_height: u64,
         mined_timestamp: DateTime<Utc>,
     ) -> Result<(u64, MicroMinotari), anyhow::Error> {
         let mut num_recovered = 0u64;
         let mut total_amount = MicroMinotari::from(0);
         for (wo, import_status, tx_id, to) in utxos {
-            let source_address = if wo.features.is_coinbase() {
+            let source_address = if wo.is_coinbase() {
                 // It's a coinbase, so we know we mined it (we do mining with cold wallets).
                 self.resources.one_sided_tari_address.clone()
-            } else if let Some(address) = wo.payment_id.get_sender_address() {
+            } else if let Some(address) = wo.payment_id().get_sender_address() {
                 address
-            } else if wo.payment_id.is_transaction_info() {
+            } else if wo.payment_id().is_transaction_info() {
                 self.resources.one_sided_tari_address.clone()
             } else {
                 TariAddress::default()
@@ -705,7 +734,7 @@ where
             {
                 Ok(_) => {
                     num_recovered = num_recovered.saturating_add(1);
-                    total_amount += wo.value;
+                    total_amount += wo.value();
                 },
                 Err(WalletError::TransactionServiceError(TransactionServiceError::TransactionStorageError(
                     TransactionStorageError::DuplicateOutput,
@@ -746,7 +775,7 @@ where
         &mut self,
         wallet_output: WalletOutput,
         source_address: TariAddress,
-        import_status: ImportStatus,
+        import_status: LegacyImportStatus,
         tx_id: TxId,
         current_height: u64,
         mined_timestamp: DateTime<Utc>,
@@ -756,21 +785,21 @@ where
             .resources
             .transaction_service
             .import_utxo_with_status(
-                wallet_output.value,
+                wallet_output.value(),
                 source_address,
                 import_status.clone(),
                 Some(tx_id),
                 Some(current_height),
                 Some(mined_timestamp),
                 scanned_output,
-                wallet_output.payment_id,
+                wallet_output.payment_id().clone(),
             )
             .await?;
 
         info!(
             target: LOG_TARGET,
             "{:?}: UTXO with value {},  imported into wallet as 'ImportStatus::{}'",
-            self.mode, wallet_output.value, import_status
+            self.mode, wallet_output.value(), import_status
         );
 
         Ok(tx_id)

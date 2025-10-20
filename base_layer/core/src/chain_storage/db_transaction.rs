@@ -28,12 +28,12 @@ use std::{
 
 use primitive_types::U512;
 use tari_common_types::types::{BlockHash, CompressedCommitment, HashOutput};
-use tari_node_components::blocks::{Block, BlockHeader};
+use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
 use tari_transaction_components::transaction_components::{OutputType, TransactionKernel, TransactionOutput};
 use tari_utilities::hex::Hex;
 
 use crate::{
-    blocks::{BlockHeaderAccumulatedData, ChainBlock, ChainHeader, UpdateBlockAccumulatedData},
+    blocks::UpdateBlockAccumulatedData,
     chain_storage::{error::ChainStorageError, HorizonData, Reorg},
 };
 #[derive(Debug)]
@@ -481,6 +481,15 @@ pub enum DbValue {
     HeaderHeight(Box<BlockHeader>),
     HeaderHash(Box<BlockHeader>),
     OrphanBlock(Box<Block>),
+}
+
+impl DbValue {
+    pub fn into_header(self) -> Option<BlockHeader> {
+        match self {
+            DbValue::HeaderHeight(bh) | DbValue::HeaderHash(bh) => Some(*bh),
+            DbValue::OrphanBlock(_) => None,
+        }
+    }
 }
 
 impl Display for DbValue {

@@ -623,7 +623,10 @@ pub async fn create_transaction_with<KM: TransactionKeyManagerInterface>(
     }
 
     for (output, script_offset_key_id) in outputs {
-        tx_builder.with_output(output, script_offset_key_id).await.unwrap();
+        tx_builder
+            .with_output(output, script_offset_key_id, None)
+            .await
+            .unwrap();
     }
     let finalized = tx_builder.build().await.unwrap();
 
@@ -715,7 +718,10 @@ async fn create_test_transaction_internal<KM: TransactionKeyManagerInterface>(
             .unwrap();
 
         outputs.push(output.clone());
-        tx_builder.with_output(output, sender_offset.key_id).await.unwrap();
+        tx_builder
+            .with_output(output, sender_offset.key_id, None)
+            .await
+            .unwrap();
     }
     for mut utxo in schema.to_outputs {
         let sender_offset = key_manager
@@ -723,19 +729,21 @@ async fn create_test_transaction_internal<KM: TransactionKeyManagerInterface>(
             .await
             .unwrap();
         let metadata_message = TransactionOutput::metadata_signature_message(&utxo);
-        utxo.metadata_signature = key_manager
-            .get_metadata_signature(
-                &utxo.commitment_mask_key_id,
-                &utxo.value.into(),
-                &sender_offset.key_id,
-                &utxo.version,
-                &metadata_message,
-                utxo.features.range_proof_type,
-            )
-            .await
-            .unwrap();
+        utxo.set_metadata_signature(
+            key_manager
+                .get_metadata_signature(
+                    utxo.commitment_mask_key_id(),
+                    &(utxo.value()).into(),
+                    &sender_offset.key_id,
+                    &utxo.version(),
+                    &metadata_message,
+                    utxo.features().range_proof_type,
+                )
+                .await
+                .unwrap(),
+        );
 
-        tx_builder.with_output(utxo, sender_offset.key_id).await.unwrap();
+        tx_builder.with_output(utxo, sender_offset.key_id, None).await.unwrap();
     }
 
     tx_builder

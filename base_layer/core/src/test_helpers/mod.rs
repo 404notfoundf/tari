@@ -44,11 +44,11 @@ use tari_comms::{
         PeerFeatures,
         PeerFlags,
     },
-    types::CommsPublicKey,
+    types::{CommsPublicKey, TransportProtocol},
     PeerManager,
 };
 use tari_crypto::keys::SecretKey;
-use tari_node_components::blocks::{Block, BlockHeader};
+use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainHeader};
 use tari_transaction_components::{
     consensus::consensus_constants::ConsensusConstants,
     generate_coinbase_with_wallet_output,
@@ -67,11 +67,12 @@ use tari_transaction_key_manager::MemoryDbKeyManager;
 use tari_utilities::epoch_time::EpochTime;
 
 use crate::{
-    blocks::{BlockHeaderAccumulatedData, ChainHeader},
+    blocks::BlockHeaderAccumulatedDataBuilder,
     chain_storage::{BlockchainBackend, BlockchainDatabase},
     consensus::BaseNodeConsensusManager,
     proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty},
 };
+
 #[macro_use]
 mod block_spec;
 pub mod blockchain;
@@ -99,8 +100,14 @@ pub fn create_orphan_block(
 pub async fn default_coinbase_entities(key_manager: &MemoryDbKeyManager) -> (TariKeyId, TariAddress) {
     let wallet_private_spend_key = PrivateKey::random(&mut OsRng);
     let wallet_private_view_key = PrivateKey::random(&mut OsRng);
-    let _key = key_manager.import_key(wallet_private_view_key.clone()).await.unwrap();
-    let script_key_id = key_manager.import_key(wallet_private_spend_key.clone()).await.unwrap();
+    let _key = key_manager
+        .import_key(wallet_private_view_key.clone(), None)
+        .await
+        .unwrap();
+    let script_key_id = key_manager
+        .import_key(wallet_private_spend_key.clone(), None)
+        .await
+        .unwrap();
     let wallet_payment_address = TariAddress::new_dual_address_with_default_features(
         CompressedPublicKey::from_secret_key(&wallet_private_view_key),
         CompressedPublicKey::from_secret_key(&wallet_private_spend_key),
@@ -233,7 +240,7 @@ fn create_test_peer() -> Peer {
 pub fn create_peer_manager() -> Arc<PeerManager> {
     let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
     let peers_db = PeerDatabaseSql::new(db_connection, &create_test_peer()).unwrap();
-    Arc::new(PeerManager::new(peers_db).unwrap())
+    Arc::new(PeerManager::new(peers_db, TransportProtocol::get_all()).unwrap())
 }
 
 pub fn create_chain_header(header: BlockHeader, prev_accum: &BlockHeaderAccumulatedData) -> ChainHeader {
@@ -243,11 +250,11 @@ pub fn create_chain_header(header: BlockHeader, prev_accum: &BlockHeaderAccumula
         Difficulty::from_u64(Difficulty::min().as_u64() + 1).unwrap(),
     )
     .unwrap();
-    let accumulated_data = BlockHeaderAccumulatedData::builder(prev_accum)
+    let accumulated_data = BlockHeaderAccumulatedDataBuilder::from_previous(prev_accum)
         .with_hash(header.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
         .with_total_kernel_offset(header.total_kernel_offset.clone())
-        .build()
+        .build(&create_consensus_constants(header.height))
         .unwrap();
     ChainHeader::try_construct(header, accumulated_data).unwrap()
 }

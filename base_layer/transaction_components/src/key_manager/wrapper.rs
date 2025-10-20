@@ -20,7 +20,10 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::sync::Arc;
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
 use blake2::Blake2b;
 use digest::consts::U64;
@@ -35,10 +38,11 @@ use tari_common_types::{
         CompressedSignature,
         PrivateKey,
         RangeProof,
+        WalletMessageSchnorrSignature,
     },
     wallet_types::WalletType,
 };
-use tari_crypto::{hashing::DomainSeparatedHash, ristretto::RistrettoComSig};
+use tari_crypto::hashing::DomainSeparatedHash;
 use tari_script::{CompressedCheckSigSchnorrSignature, TariScript};
 use tokio::sync::RwLock;
 
@@ -81,7 +85,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
     /// Creates a new key manager.
     /// * `master_seed` is the primary seed that will be used to derive all unique branch keys with their indexes
     /// * `db` implements `KeyManagerBackend` and is used for persistent storage of branches and indices.
-    pub async fn new(
+    pub async fn new_with_legacy_storage(
         master_seed: CipherSeed,
         db: TBackend,
         crypto_factories: CryptoFactories,
@@ -89,7 +93,19 @@ where TBackend: TransactionKeyManagerBackend + 'static
     ) -> Result<Self, KeyManagerServiceError> {
         Ok(TransactionKeyManagerWrapper {
             transaction_key_manager_inner: Arc::new(RwLock::new(
-                TransactionKeyManagerInner::new(master_seed, db, crypto_factories, wallet_type).await?,
+                TransactionKeyManagerInner::new(master_seed, Some(db), crypto_factories, wallet_type).await?,
+            )),
+        })
+    }
+
+    pub async fn new(
+        master_seed: CipherSeed,
+        crypto_factories: CryptoFactories,
+        wallet_type: Arc<WalletType>,
+    ) -> Result<Self, KeyManagerServiceError> {
+        Ok(TransactionKeyManagerWrapper {
+            transaction_key_manager_inner: Arc::new(RwLock::new(
+                TransactionKeyManagerInner::new(master_seed, None, crypto_factories, wallet_type).await?,
             )),
         })
     }
@@ -97,6 +113,11 @@ where TBackend: TransactionKeyManagerBackend + 'static
     /// Get the wallet type
     pub async fn get_wallet_type(&self) -> Arc<WalletType> {
         self.transaction_key_manager_inner.read().await.get_wallet_type()
+    }
+
+    /// Get the birthday of the wallet seed
+    pub async fn get_birthday(&self) -> u16 {
+        self.transaction_key_manager_inner.read().await.master_seed().birthday()
     }
 }
 
@@ -143,11 +164,27 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .await
     }
 
-    async fn import_key(&self, private_key: PrivateKey) -> Result<TariKeyId, KeyManagerServiceError> {
+    async fn import_key(
+        &self,
+        private_key: PrivateKey,
+        encryption_key: Option<TariKeyId>,
+    ) -> Result<TariKeyId, KeyManagerServiceError> {
         self.transaction_key_manager_inner
             .read()
             .await
-            .import_key(private_key)
+            .import_key(private_key, encryption_key)
+            .await
+    }
+
+    async fn create_encrypted_key_from_existing_key(
+        &self,
+        key_id: &TariKeyId,
+        encryption_key: Option<TariKeyId>,
+    ) -> Result<TariKeyId, KeyManagerServiceError> {
+        self.transaction_key_manager_inner
+            .read()
+            .await
+            .create_encrypted_key_from_existing_key(key_id, encryption_key)
             .await
     }
 
@@ -192,6 +229,18 @@ where TBackend: TransactionKeyManagerBackend + 'static
         self.transaction_key_manager_inner.read().await.get_spend_key().await
     }
 
+    async fn sign_message_with_spend_key(
+        &self,
+        message: &[u8],
+        sender_offset_pub_key: Option<&CompressedPublicKey>,
+    ) -> Result<WalletMessageSchnorrSignature, KeyManagerServiceError> {
+        self.transaction_key_manager_inner
+            .read()
+            .await
+            .sign_message(message, sender_offset_pub_key)
+            .await
+    }
+
     async fn get_comms_key(&self) -> Result<TariKeyAndId, KeyManagerServiceError> {
         self.transaction_key_manager_inner.read().await.get_comms_key().await
     }
@@ -222,7 +271,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
         &self,
         secret_key_id: &TariKeyId,
         public_key: &CompressedPublicKey,
-    ) -> Result<CommsDHKE, TransactionError> {
+    ) -> Result<CommsDHKE, KeyManagerServiceError> {
         self.transaction_key_manager_inner
             .read()
             .await
@@ -381,12 +430,12 @@ where TBackend: TransactionKeyManagerBackend + 'static
         &self,
         commitment: &CompressedCommitment,
         encrypted_data: &EncryptedData,
-        custom_recovery_key_id: Option<&TariKeyId>,
-    ) -> Result<(TariKeyId, MicroMinotari, MemoField), TransactionError> {
+        sender_offset_public_key: &CompressedPublicKey,
+    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField)>, TransactionError> {
         self.transaction_key_manager_inner
             .read()
             .await
-            .try_output_key_recovery(commitment, encrypted_data, custom_recovery_key_id)
+            .try_output_key_recovery(commitment, encrypted_data, sender_offset_public_key)
             .await
     }
 
@@ -394,7 +443,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
         &self,
         commitment: &CompressedCommitment,
         encrypted_data: &EncryptedData,
-        custom_recovery_key_id: Option<&TariKeyId>,
+        custom_recovery_key_id: Option<PrivateKey>,
     ) -> Result<bool, TransactionError> {
         self.transaction_key_manager_inner
             .read()
@@ -489,6 +538,18 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .await
     }
 
+    async fn sign_script_message_with_spend_key(
+        &self,
+        message: &[u8],
+        sender_offset_pub_key: Option<&CompressedPublicKey>,
+    ) -> Result<CompressedCheckSigSchnorrSignature, KeyManagerServiceError> {
+        self.transaction_key_manager_inner
+            .read()
+            .await
+            .sign_script_message_with_spend_key(message, sender_offset_pub_key)
+            .await
+    }
+
     async fn sign_with_nonce_and_challenge(
         &self,
         private_key_id: &TariKeyId,
@@ -553,16 +614,16 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .await
     }
 
-    async fn generate_burn_proof(
+    async fn generate_burn_claim_signature(
         &self,
         commitment_mask_key_id: &TariKeyId,
-        amount: &PrivateKey,
+        value: u64,
         claim_public_key: &CompressedPublicKey,
-    ) -> Result<RistrettoComSig, TransactionError> {
+    ) -> Result<CompressedSignature, TransactionError> {
         self.transaction_key_manager_inner
             .read()
             .await
-            .generate_burn_proof(commitment_mask_key_id, amount, claim_public_key)
+            .generate_burn_claim_proof_signature(commitment_mask_key_id, value, claim_public_key)
             .await
     }
 
@@ -575,6 +636,18 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .read()
             .await
             .stealth_address_script_spending_key(commitment_mask_key_id, spend_key)
+            .await
+    }
+
+    async fn add_offset_to_spend_key(
+        &self,
+        spend_key_id: &TariKeyId,
+        sender_offset_pub_key: &CompressedPublicKey,
+    ) -> Result<TariKeyId, KeyManagerServiceError> {
+        self.transaction_key_manager_inner
+            .write()
+            .await
+            .add_offset_to_spend_key(spend_key_id, sender_offset_pub_key)
             .await
     }
 
@@ -613,5 +686,11 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .await
             .get_private_key(key_id)
             .await
+    }
+}
+
+impl<KM> Debug for TransactionKeyManagerWrapper<KM> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Key Manager").finish()
     }
 }

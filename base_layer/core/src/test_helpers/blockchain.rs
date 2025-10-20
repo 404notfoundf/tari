@@ -40,7 +40,7 @@ use tari_common_types::{
     tari_address::TariAddress,
     types::{BadBlock, CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput},
 };
-use tari_node_components::blocks::{Block, BlockHeader};
+use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
 use tari_sidechain::ShardGroup;
 use tari_storage::lmdb_store::LMDBConfig;
 use tari_test_utils::paths::create_temporary_data_path;
@@ -54,9 +54,9 @@ use tari_transaction_components::{
 use tari_transaction_key_manager::{create_memory_db_key_manager, MemoryDbKeyManager};
 use tari_utilities::ByteArray;
 
-use super::{create_block, mine_to_difficulty};
+use super::{create_block, create_consensus_constants, mine_to_difficulty};
 use crate::{
-    blocks::{BlockAccumulatedData, BlockHeaderAccumulatedData, ChainBlock, ChainHeader},
+    blocks::{BlockAccumulatedData, BlockHeaderAccumulatedDataBuilder},
     chain_storage::{
         create_lmdb_database,
         AccumulatedDataRebuildStatus,
@@ -650,13 +650,13 @@ pub async fn create_chained_blocks<T: Into<BlockSpecs>, TDB: BlockchainBackend>(
 
 fn mine_block(block: Block, prev_block_accum: &BlockHeaderAccumulatedData, difficulty: Difficulty) -> Arc<ChainBlock> {
     let block = mine_to_difficulty(block, difficulty).unwrap();
-    let accum = BlockHeaderAccumulatedData::builder(prev_block_accum)
+    let accum = BlockHeaderAccumulatedDataBuilder::from_previous(prev_block_accum)
         .with_hash(block.hash())
         .with_achieved_target_difficulty(
             AchievedTargetDifficulty::try_construct(PowAlgorithm::Sha3x, difficulty, difficulty).unwrap(),
         )
         .with_total_kernel_offset(block.header.total_kernel_offset.clone())
-        .build()
+        .build(&create_consensus_constants(block.header.height))
         .unwrap();
     Arc::new(ChainBlock::try_construct(Arc::new(block), accum).unwrap())
 }

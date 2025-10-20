@@ -62,6 +62,7 @@ use tokio::sync::watch;
 
 use crate::{
     bootstrap::BaseNodeBootstrapper,
+    consensus_constants_tracker::ConsensusConstantsTracker,
     grpc::readiness_grpc_server::ReadinessStatusHandler,
     ApplicationConfig,
     DatabaseType,
@@ -179,11 +180,10 @@ impl BaseNodeContext {
 
 /// Sets up and initializes the base node, creating the context and database
 /// ## Parameters
-/// `config` - The configuration for the base node
+/// `app_config` - The configuration for the base node
 /// `node_identity` - The node identity information of the base node
-/// `wallet_node_identity` - The node identity information of the base node's wallet
 /// `interrupt_signal` - The signal used to stop the application
-/// `readiness_status` - The readiness status of the base node
+/// `readiness_status_handler` - Handles readiness status reporting for the base node
 /// ## Returns
 /// Result containing the NodeContainer, String will contain the reason on error
 pub async fn configure_and_initialize_node(
@@ -216,10 +216,8 @@ pub async fn configure_and_initialize_node(
 /// and state machine
 /// ## Parameters
 /// `backend` - Backend interface
-/// `network` - The NetworkType (rincewind, mainnet, local)
+/// `app_config` - The configuration for the base node
 /// `base_node_identity` - The node identity information of the base node
-/// `wallet_node_identity` - The node identity information of the base node's wallet
-/// `config` - The configuration for the base node
 /// `interrupt_signal` - The signal used to stop the application
 /// ## Returns
 /// Result containing the BaseNodeContext, String will contain the reason on error
@@ -267,6 +265,19 @@ async fn build_node_context(
             ExitError::new(ExitCode::DatabaseError, err)
         }
     })?;
+
+    // Check for consensus constants changes before starting the node
+    let consensus_tracker = ConsensusConstantsTracker::new(&app_config.base_node.data_dir);
+    let current_constants = rules.consensus_constants_vec();
+    let current_height = blockchain_db
+        .get_chain_metadata()
+        .map(|o| o.best_block_height())
+        .unwrap_or_default();
+
+    if let Err(error_msg) = consensus_tracker.check_for_changes(current_constants, current_height) {
+        error!(target: LOG_TARGET, "{}", error_msg);
+        eprintln!("\n{}\n", error_msg);
+    }
 
     let mempool_validator = TransactionFullValidator::new(
         factories.clone(),

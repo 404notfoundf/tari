@@ -35,6 +35,7 @@ use tari_common_types::{
         BlockHash,
         CompressedCommitment,
         CompressedPublicKey,
+        FixedHash,
         HashOutput,
         PrivateKey,
         UncompressedCommitment,
@@ -266,11 +267,9 @@ where
         match request {
             OutputManagerRequest::AddOutput((uo, spend_priority)) => self
                 .add_output(None, *uo, spend_priority)
-                .await
                 .map(|_| OutputManagerResponse::OutputAdded),
             OutputManagerRequest::AddOutputWithTxId((tx_id, uo, spend_priority)) => self
                 .add_output(Some(tx_id), *uo, spend_priority)
-                .await
                 .map(|_| OutputManagerResponse::OutputAdded),
             OutputManagerRequest::EncumberAggregateUtxo {
                 tx_id,
@@ -303,7 +302,7 @@ where
                     use_output,
                 )
                 .await
-                .map(|val| (OutputManagerResponse::EncumberAggregateUtxo(Box::new(val)))),
+                .map(|val| OutputManagerResponse::EncumberAggregateUtxo(Box::new(val))),
             OutputManagerRequest::SpendBackupPreMineUtxo {
                 tx_id,
                 fee_per_gram,
@@ -327,7 +326,6 @@ where
                 .map(OutputManagerResponse::SpendBackupPreMineUtxo),
             OutputManagerRequest::AddUnvalidatedOutput((tx_id, uo, spend_priority)) => self
                 .add_unvalidated_output(tx_id, *uo, spend_priority)
-                .await
                 .map(|_| OutputManagerResponse::OutputAdded),
             OutputManagerRequest::UpdateOutputMetadataSignature(uo) => self
                 .update_output_metadata_signature(*uo)
@@ -370,6 +368,7 @@ where
                 fee_per_gram,
                 lock_height,
                 payment_id,
+                minimum_value_promise,
             } => self
                 .create_pay_to_self_transaction(
                     tx_id,
@@ -379,6 +378,7 @@ where
                     fee_per_gram,
                     lock_height,
                     payment_id,
+                    minimum_value_promise,
                 )
                 .await
                 .map(OutputManagerResponse::PayToSelfTransaction),
@@ -395,7 +395,6 @@ where
             OutputManagerRequest::ConfirmPendingTransaction(tx_id, change) => {
                 let change_outputs = change.unwrap_or(Vec::new());
                 self.confirm_encumberance(tx_id, change_outputs)
-                    .await
                     .map(|_| OutputManagerResponse::PendingTransactionConfirmed)
             },
             OutputManagerRequest::CancelTransaction(tx_id) => self
@@ -409,6 +408,10 @@ where
                 let outputs = self.fetch_unspent_outputs()?;
                 Ok(OutputManagerResponse::UnspentOutputs(outputs))
             },
+            OutputManagerRequest::GetOutputsByQuery(query) => {
+                let outputs = self.fetch_outputs_by_query(query)?;
+                Ok(OutputManagerResponse::SpentOutputs(outputs))
+            },
             OutputManagerRequest::ValidateTxos => {
                 self.validate_outputs().map(OutputManagerResponse::TxoValidationStarted)
             },
@@ -418,6 +421,14 @@ where
             OutputManagerRequest::GetInvalidOutputs => {
                 let outputs = self.fetch_invalid_outputs()?.into_iter().map(|v| v.into()).collect();
                 Ok(OutputManagerResponse::InvalidOutputs(outputs))
+            },
+            OutputManagerRequest::GetManyOutputs { outputs } => {
+                let outputs = self
+                    .fetch_many_outputs(&outputs)?
+                    .into_iter()
+                    .map(|v| v.into())
+                    .collect();
+                Ok(OutputManagerResponse::Outputs(outputs))
             },
             OutputManagerRequest::PreviewCoinJoin((commitments, fee_per_gram)) => {
                 Ok(OutputManagerResponse::CoinPreview(
@@ -484,6 +495,10 @@ where
                 .scan_outputs_for_one_sided_payments(outputs)
                 .await
                 .map(OutputManagerResponse::ScanOutputs),
+            OutputManagerRequest::ScanOutputsForMultisig(outputs) => self
+                .scan_outputs_for_multisig(outputs)
+                .await
+                .map(OutputManagerResponse::ScanOutputs),
             OutputManagerRequest::AddKnownOneSidedPaymentScript(known_script) => self
                 .add_known_script(known_script)
                 .map(|_| OutputManagerResponse::AddKnownOneSidedPaymentScript),
@@ -496,20 +511,7 @@ where
                     output: Box::new(wallet_output),
                 })
             },
-            OutputManagerRequest::CreatePayToSelfWithOutputs {
-                outputs,
-                fee_per_gram,
-                selection_criteria,
-                payment_id,
-            } => {
-                let (tx_id, transaction) = self
-                    .create_pay_to_self_containing_outputs(outputs, selection_criteria, fee_per_gram, payment_id)
-                    .await?;
-                Ok(OutputManagerResponse::CreatePayToSelfWithOutputs {
-                    transaction: Box::new(transaction),
-                    tx_id,
-                })
-            },
+
             OutputManagerRequest::CreateClaimShaAtomicSwapTransaction(output_hash, pre_image, fee_per_gram) => {
                 self.claim_sha_atomic_swap_with_hash(output_hash, pre_image, fee_per_gram)
                     .await
@@ -521,6 +523,20 @@ where
             OutputManagerRequest::GetOutputInfoByTxId(tx_id) => {
                 let output_statuses_by_tx_id = self.get_output_info_by_tx_id(tx_id)?;
                 Ok(OutputManagerResponse::OutputInfoByTxId(output_statuses_by_tx_id))
+            },
+
+            OutputManagerRequest::FetchUnspentOutputs(hashes) => {
+                let mut outputs = Vec::new();
+                for hash in hashes {
+                    if let Some(output) = self.fetch_unspent_outputs_from_node(hash).await? {
+                        outputs.push(output);
+                    }
+                }
+                Ok(OutputManagerResponse::FetchUnspentOutputs(outputs))
+            },
+            OutputManagerRequest::ConfirmEncumberance(tx_id, change_outputs) => {
+                self.confirm_encumberance(tx_id, change_outputs)?;
+                Ok(OutputManagerResponse::ConfirmEncumberance)
             },
             OutputManagerRequest::ClearShortTermEncumberances => self
                 .clear_short_term_encumberances()
@@ -693,7 +709,7 @@ where
     }
 
     /// Add a key manager recoverable output to the outputs table and mark it as `Unspent`.
-    pub async fn add_output(
+    pub fn add_output(
         &mut self,
         tx_id: Option<TxId>,
         output: WalletOutput,
@@ -701,18 +717,10 @@ where
     ) -> Result<(), OutputManagerError> {
         debug!(
             target: LOG_TARGET,
-            "Add output of value {} to Output Manager", output.value
+            "Add output of value {} to Output Manager", output.value()
         );
 
-        let output = DbWalletOutput::from_wallet_output(
-            output,
-            &self.resources.key_manager,
-            spend_priority,
-            OutputSource::default(),
-            tx_id,
-            None,
-        )
-        .await?;
+        let output = DbWalletOutput::from_wallet_output(output, spend_priority, OutputSource::default(), tx_id, None);
         debug!(
             target: LOG_TARGET,
             "saving output of hash {} to Output Manager",
@@ -727,7 +735,7 @@ where
 
     /// Add a key manager output to the outputs table and marks is as `EncumberedToBeReceived`. This is so that it will
     /// require a successful validation to confirm that it indeed spendable.
-    pub async fn add_unvalidated_output(
+    pub fn add_unvalidated_output(
         &mut self,
         tx_id: TxId,
         output: WalletOutput,
@@ -735,17 +743,10 @@ where
     ) -> Result<(), OutputManagerError> {
         debug!(
             target: LOG_TARGET,
-            "Add unvalidated output of value {} to Output Manager with TxId {}", output.value, tx_id
+            "Add unvalidated output of value {} to Output Manager with TxId {}", output.value(), tx_id
         );
-        let output = DbWalletOutput::from_wallet_output(
-            output,
-            &self.resources.key_manager,
-            spend_priority,
-            OutputSource::default(),
-            Some(tx_id),
-            None,
-        )
-        .await?;
+        let output =
+            DbWalletOutput::from_wallet_output(output, spend_priority, OutputSource::default(), Some(tx_id), None);
         trace!(target: LOG_TARGET, "TxId: {tx_id}, {output:?}");
         self.resources.db.add_unvalidated_output(tx_id, output)?;
 
@@ -930,9 +931,10 @@ where
         }
         debug!(
             target: LOG_TARGET,
-            "Calculating fee for tx with: Fee per gram: {}. Num selected inputs: {}",
-            amount,
-            input_selection.num_selected()
+            "Calculated fee for tx: Fee per gram: {}. Fee {}. Num inputs: {}.",
+            fee_per_gram,
+            input_selection.as_final_fee(),
+            input_selection.num_selected(),
         );
 
         self.resources
@@ -944,8 +946,7 @@ where
         Ok(builder)
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn create_pay_to_self_containing_outputs(
+    pub async fn create_transaction_with_outputs_internal(
         &mut self,
         outputs: Vec<WalletOutputBuilder>,
         selection_criteria: UtxoSelectionCriteria,
@@ -953,9 +954,11 @@ where
         payment_id: MemoField,
     ) -> Result<(TxId, Transaction), OutputManagerError> {
         let total_value = outputs.iter().map(|o| o.value()).sum();
+
         let nop_script = script![Nop]?;
         let weighting = self.resources.consensus_constants.transaction_weight_params();
         let mut features_and_scripts_byte_size = 0;
+
         for output in &outputs {
             let (features, covenant, script) = (
                 output
@@ -972,7 +975,6 @@ where
                     .get_serialized_size()
                     .map_err(|e| OutputManagerError::ServiceError(e.to_string()))?,
             );
-
             features_and_scripts_byte_size += weighting.round_up_features_and_scripts_size(features + covenant + script)
         }
 
@@ -1005,6 +1007,7 @@ where
         }
 
         let mut db_outputs = vec![];
+
         for mut wallet_output in outputs {
             let sender_offset_key = self
                 .resources
@@ -1014,39 +1017,31 @@ where
             wallet_output = wallet_output
                 .sign_as_sender_and_receiver(&self.resources.key_manager, &sender_offset_key.key_id)
                 .await?;
-
             let ub = wallet_output.try_build(&self.resources.key_manager).await?;
+
             builder
-                .with_output(ub.clone(), sender_offset_key.key_id.clone())
+                .with_output(ub.clone(), sender_offset_key.key_id.clone(), None)
                 .await
                 .map_err(|e| OutputManagerError::BuildError(e.to_string()))?;
-            db_outputs.push(
-                DbWalletOutput::from_wallet_output(
-                    ub,
-                    &self.resources.key_manager,
-                    None,
-                    OutputSource::default(),
-                    None,
-                    None,
-                )
-                .await?,
-            )
+            db_outputs.push(DbWalletOutput::from_wallet_output(
+                ub,
+                None,
+                OutputSource::default(),
+                None,
+                None,
+            ));
         }
 
         let finalized = builder.build().await?;
         let tx_id = TxId::new_random();
         if let Some(wallet_output) = finalized.change {
-            db_outputs.push(
-                DbWalletOutput::from_wallet_output(
-                    wallet_output,
-                    &self.resources.key_manager,
-                    None,
-                    OutputSource::default(),
-                    Some(tx_id),
-                    None,
-                )
-                .await?,
-            );
+            db_outputs.push(DbWalletOutput::from_wallet_output(
+                wallet_output,
+                None,
+                OutputSource::default(),
+                Some(tx_id),
+                None,
+            ));
         }
 
         self.resources
@@ -1111,13 +1106,14 @@ where
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: start");
         // Fetch the output from the blockchain or use provided
         let output = match use_output {
-            UseOutput::FromBlockchain(output_hash) => {
-                self.fetch_utxo_from_node(output_hash).await?.ok_or_else(|| {
+            UseOutput::FromBlockchain(output_hash) => self
+                .fetch_unspent_outputs_from_node(output_hash)
+                .await?
+                .ok_or_else(|| {
                     OutputManagerError::ServiceError(format!(
                         "Output with hash {output_hash} not found in blockchain (TxId: {tx_id})"
                     ))
-                })?
-            },
+                })?,
             UseOutput::AsProvided(ref val) => *val.clone(),
         };
         if output.commitment != expected_commitment {
@@ -1175,24 +1171,15 @@ where
                         script_signatures.len()
                     )));
                 }
-                let commitment_mask_key_id = self.resources.key_manager.import_key(commitment_mask).await?;
+                let commitment_mask_key_id = self.resources.key_manager.import_key(commitment_mask, None).await?;
                 (
-                    WalletOutput::new_with_rangeproof(
-                        output.version,
+                    WalletOutput::new_from_transaction_output(
                         amount,
                         commitment_mask_key_id,
-                        output.features,
-                        output.script,
-                        ExecutionStack::new(script_signatures),
-                        script_key.key_id.clone(), // Only of the master wallet
-                        output.sender_offset_public_key,
-                        output.metadata_signature,
-                        0,
-                        output.covenant,
-                        output.encrypted_data,
-                        output.minimum_value_promise,
-                        output.proof,
                         payment_id.clone(),
+                        output,
+                        ExecutionStack::new(script_signatures),
+                        script_key.key_id,
                     ),
                     payment_id,
                 )
@@ -1207,7 +1194,7 @@ where
             )));
         };
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: decrypt secrets, created unblinded input");
-        trace!(target: LOG_TARGET, "encumber_aggregate_utxo: {:?}", input.input_data);
+        trace!(target: LOG_TARGET, "encumber_aggregate_utxo: {:?}", input.input_data());
 
         // The entire input will be spent to a single recipient with no change
         let output_features = OutputFeatures {
@@ -1229,7 +1216,7 @@ where
             );
         let fee = self.get_fee_calc();
         let fee = fee.calculate(fee_per_gram, 1, 1, 1, metadata_byte_size);
-        let amount = input.value - fee;
+        let amount = input.value().saturating_sub(fee);
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: created script, with fee {fee}");
 
         // Create sender transaction protocol builder with recipient data and no change
@@ -1253,7 +1240,7 @@ where
             .await?;
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: created sender transaction protocol");
 
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
 
         // Prepare receiver part of the transaction
 
@@ -1284,10 +1271,14 @@ where
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: created dh shared secret");
 
         let spending_key = shared_secret_to_output_spending_key(&shared_secret)?;
-        let spending_key_id = self.resources.key_manager.import_key(spending_key).await?;
+        let spending_key_id = self.resources.key_manager.import_key(spending_key, None).await?;
 
         let encryption_private_key = shared_secret_to_output_encryption_key(&shared_secret)?;
-        let encryption_key_id = self.resources.key_manager.import_key(encryption_private_key).await?;
+        let encryption_key_id = self
+            .resources
+            .key_manager
+            .import_key(encryption_private_key, None)
+            .await?;
 
         let sender_offset_public_key_self = self
             .resources
@@ -1350,6 +1341,7 @@ where
                 recipient_address.clone(),
                 output.clone(),
                 Some(sender_offset_private_key_id_self.key_id),
+                Some(encryption_key_id),
             )
             .await?;
 
@@ -1357,7 +1349,7 @@ where
         let finalized = builder.build().await?;
 
         let total_metadata_ephemeral_public_key = aggregated_metadata_ephemeral_public_key_shares +
-            &output.metadata_signature.ephemeral_pubkey().to_public_key()?;
+            output.metadata_signature().ephemeral_pubkey().to_public_key()?;
         trace!(target: LOG_TARGET, "encumber_aggregate_utxo: created output with partial metadata signature");
 
         info!(target: LOG_TARGET, "Finalized partial one-side transaction TxId: {tx_id}");
@@ -1436,11 +1428,15 @@ where
         minimum_value_promise: MicroMinotari,
     ) -> Result<(Transaction, MicroMinotari, MicroMinotari), OutputManagerError> {
         // Fetch the output from the blockchain
-        let output = self.fetch_utxo_from_node(output_hash).await?.ok_or_else(|| {
-            OutputManagerError::ServiceError(format!(
-                "Output with hash {output_hash} not found in blockchain (TxId: {tx_id})"
-            ))
-        })?;
+        let output = self
+            .fetch_unspent_outputs_from_node(output_hash)
+            .await?
+            .ok_or_else(|| {
+                OutputManagerError::ServiceError(format!(
+                    "Output with hash {} not found in blockchain (TxId: {})",
+                    output_hash, tx_id
+                ))
+            })?;
         if output.commitment != expected_commitment {
             return Err(OutputManagerError::ServiceError(format!(
                 "Output commitment does not match expected commitment (TxId: {tx_id})"
@@ -1468,26 +1464,18 @@ where
             EncryptedData::decrypt_data(&encryption_private_key, &output.commitment, &output.encrypted_data)
         {
             if output.verify_mask(&self.resources.factories.range_proof, &spending_key, amount.as_u64())? {
-                let spending_key_id = self.resources.key_manager.import_key(spending_key).await?;
+                let spending_key_id = self.resources.key_manager.import_key(spending_key, None).await?;
                 let script_key = self
                     .pre_mine_script_key_from_payment_id(payment_id.clone(), tx_id)
                     .await?;
-                WalletOutput::new_with_rangeproof(
-                    output.version,
+
+                WalletOutput::new_from_transaction_output(
                     amount,
                     spending_key_id,
-                    output.features,
-                    output.script,
-                    ExecutionStack::default(),
-                    script_key.key_id,
-                    output.sender_offset_public_key,
-                    output.metadata_signature,
-                    0,
-                    output.covenant,
-                    output.encrypted_data,
-                    output.minimum_value_promise,
-                    output.proof,
                     payment_id,
+                    output,
+                    Default::default(),
+                    script_key.key_id,
                 )
             } else {
                 return Err(OutputManagerError::ServiceError(format!(
@@ -1518,7 +1506,7 @@ where
             );
         let fee = self.get_fee_calc();
         let fee = fee.calculate(fee_per_gram, 1, 1, 1, metadata_byte_size);
-        let amount = input.value - fee;
+        let amount = input.value().saturating_sub(fee);
 
         // Create sender transaction protocol builder with recipient data and no change
         let mut tx_builder = TransactionBuilder::new(
@@ -1532,6 +1520,7 @@ where
             .with_fee_per_gram(fee_per_gram)
             .with_kernel_features(KernelFeatures::empty())
             .with_prevent_fee_gt_amount(self.resources.config.prevent_fee_gt_amount)
+            .with_memo(payment_id.clone())
             .with_input(input.clone())
             .await?;
         let sender_offset_private_key_id_self = self
@@ -1540,7 +1529,7 @@ where
             .get_next_key(TransactionKeyManagerBranch::OneSidedSenderOffset.get_branch_key())
             .await?;
 
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
 
         // Prepare receiver part of the transaction
 
@@ -1561,10 +1550,14 @@ where
             .await?;
 
         let commitment_mask_key = shared_secret_to_output_spending_key(&shared_secret)?;
-        let commitment_mask_key_id = self.resources.key_manager.import_key(commitment_mask_key).await?;
+        let commitment_mask_key_id = self.resources.key_manager.import_key(commitment_mask_key, None).await?;
 
         let encryption_private_key = shared_secret_to_output_encryption_key(&shared_secret)?;
-        let encryption_key_id = self.resources.key_manager.import_key(encryption_private_key).await?;
+        let encryption_key_id = self
+            .resources
+            .key_manager
+            .import_key(encryption_private_key, None)
+            .await?;
 
         let sender_offset_public_key = self
             .resources
@@ -1617,6 +1610,7 @@ where
                 self.resources.one_sided_tari_address.clone(),
                 output.clone(),
                 Some(sender_offset_private_key_id_self.key_id),
+                Some(encryption_key_id),
             )
             .await?;
 
@@ -1638,6 +1632,7 @@ where
         fee_per_gram: MicroMinotari,
         lock_height: Option<u64>,
         payment_id: MemoField,
+        minimum_value_promise: MicroMinotari,
     ) -> Result<(MicroMinotari, Transaction), OutputManagerError> {
         let covenant = Covenant::default();
 
@@ -1678,7 +1673,8 @@ where
             .with_lock_height(lock_height.unwrap_or(0))
             .with_fee_per_gram(fee_per_gram)
             .with_prevent_fee_gt_amount(self.resources.config.prevent_fee_gt_amount)
-            .with_kernel_features(KernelFeatures::empty());
+            .with_kernel_features(KernelFeatures::empty())
+            .with_memo(payment_id.clone());
 
         for kmo in input_selection.iter() {
             tx_builder.with_input(kmo.wallet_output.clone()).await?;
@@ -1691,11 +1687,12 @@ where
                 covenant,
                 payment_id,
                 input_selection.as_final_fee(),
+                minimum_value_promise,
             )
             .await?;
 
         tx_builder
-            .with_output(output.wallet_output.clone(), sender_offset_key_id.clone())
+            .with_output(output.wallet_output.clone(), sender_offset_key_id.clone(), None)
             .await
             .map_err(|e| OutputManagerError::BuildError(e.to_string()))?;
 
@@ -1706,15 +1703,8 @@ where
         let fee = finalized.fee;
         trace!(target: LOG_TARGET, "Finalize send-to-self transaction ({tx_id}).");
         if let Some(change) = finalized.change {
-            let change_output = DbWalletOutput::from_wallet_output(
-                change,
-                &self.resources.key_manager,
-                None,
-                OutputSource::default(),
-                Some(tx_id),
-                None,
-            )
-            .await?;
+            let change_output =
+                DbWalletOutput::from_wallet_output(change, None, OutputSource::default(), Some(tx_id), None);
             outputs.push(change_output);
         }
 
@@ -1725,7 +1715,7 @@ where
         self.resources
             .db
             .encumber_outputs(tx_id, input_selection.into_selected(), outputs)?;
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
         trace!(target: LOG_TARGET, "Finalize send-to-self transaction ({tx_id}).");
         let tx = finalized.transaction;
 
@@ -1734,24 +1724,20 @@ where
 
     /// Confirm that a transaction has finished being negotiated between parties so the short-term encumberance can be
     /// made official
-    async fn confirm_encumberance(
+    fn confirm_encumberance(
         &mut self,
         tx_id: TxId,
         change_outputs: Vec<WalletOutput>,
     ) -> Result<(), OutputManagerError> {
         let mut change = Vec::new();
         for output in change_outputs {
-            change.push(
-                DbWalletOutput::from_wallet_output(
-                    output,
-                    &self.resources.key_manager,
-                    None,
-                    OutputSource::default(),
-                    Some(tx_id),
-                    None,
-                )
-                .await?,
-            );
+            change.push(DbWalletOutput::from_wallet_output(
+                output,
+                None,
+                OutputSource::default(),
+                Some(tx_id),
+                None,
+            ));
         }
         self.resources.db.confirm_encumbered_outputs(tx_id, change)?;
         Ok(())
@@ -1803,15 +1789,20 @@ where
             selection_criteria.excluding_onesided = self.resources.config.autoignore_onesided_utxos;
         }
 
+        selection_criteria.excluding_multisig = true;
+
         debug!(
             target: LOG_TARGET,
             "select_utxos selection criteria: {selection_criteria}"
         );
         let start_new = Instant::now();
-        let uo = self
-            .resources
-            .db
-            .fetch_unspent_outputs_for_spending(&selection_criteria, amount, tip_height)?;
+        let uo: Vec<DbWalletOutput> =
+            self.resources
+                .db
+                .fetch_unspent_outputs_for_spending(&selection_criteria, amount, tip_height)?;
+
+        // OutputSource
+
         let uo_len = uo.len();
         trace!(
             target: LOG_TARGET,
@@ -1850,9 +1841,9 @@ where
         let mut fee_without_change = MicroMinotari::from(0);
         let mut fee_with_change = MicroMinotari::from(0);
         for o in uo {
-            utxos_total_value += o.wallet_output.value;
+            utxos_total_value += o.wallet_output.value();
 
-            trace!(target: LOG_TARGET, "-- utxos_total_value = {utxos_total_value:?}");
+            trace!(target: LOG_TARGET, "-- utxos_total_value = {utxos_total_value}");
             utxos.push(o);
             // The assumption here is that the only output will be the payment output and change if required
             fee_without_change = fee_calc.calculate(
@@ -1873,7 +1864,7 @@ where
                 total_output_features_and_scripts_byte_size + default_features_and_scripts_size,
             );
 
-            trace!(target: LOG_TARGET, "-- amt+fee = {amount:?} {fee_with_change}");
+            trace!(target: LOG_TARGET, "-- amt+fee = {amount} + {fee_with_change}");
             if utxos_total_value > amount + fee_with_change {
                 requires_change_output = true;
                 break;
@@ -1932,6 +1923,10 @@ where
         Ok(self.resources.db.get_invalid_outputs()?)
     }
 
+    pub fn fetch_many_outputs(&self, outputs: &[FixedHash]) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
+        Ok(self.resources.db.fetch_many_outputs(outputs)?)
+    }
+
     fn default_features_and_scripts_size(&self) -> Result<usize, OutputManagerError> {
         Ok(self
             .resources
@@ -1960,7 +1955,7 @@ where
 
         let accumulated_amount = src_outputs
             .iter()
-            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value);
+            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
         let fee = self.get_fee_calc().calculate(
             fee_per_gram,
@@ -2008,7 +2003,7 @@ where
 
         let accumulated_amount = src_outputs
             .iter()
-            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value);
+            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
         let aftertax_amount = accumulated_amount.saturating_sub(fee);
         let amount_per_split = MicroMinotari(aftertax_amount.as_u64() / number_of_splits as u64);
@@ -2103,7 +2098,7 @@ where
         // accumulated value amount from given source outputs
         let accumulated_amount_with_fee = src_outputs
             .iter()
-            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value);
+            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
         let fee = self.get_fee_calc().calculate(
             fee_per_gram,
@@ -2165,11 +2160,12 @@ where
                     Covenant::default(),
                     MemoField::open_from_string(&format!("{number_of_splits} even coin splits"), TxType::CoinSplit),
                     fee,
+                    MicroMinotari::zero(),
                 )
                 .await?;
 
             tx_builder
-                .with_output(output.wallet_output.clone(), sender_offset_key_id)
+                .with_output(output.wallet_output.clone(), sender_offset_key_id, None)
                 .await
                 .map_err(|e| OutputManagerError::BuildError(e.to_string()))?;
 
@@ -2191,7 +2187,7 @@ where
         self.resources
             .db
             .encumber_outputs(tx_id, src_outputs.clone(), dest_outputs)?;
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
 
         trace!(
             target: LOG_TARGET,
@@ -2230,7 +2226,7 @@ where
         // accumulated value amount from given source outputs
         let accumulated_amount = src_outputs
             .iter()
-            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value);
+            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
         if total_split_amount >= accumulated_amount {
             return Err(OutputManagerError::NotEnoughFunds);
@@ -2325,11 +2321,12 @@ where
                     Covenant::default(),
                     payment_id.clone(),
                     final_fee,
+                    MicroMinotari::zero(),
                 )
                 .await?;
 
             tx_builder
-                .with_output(output.wallet_output.clone(), sender_offset_key_id)
+                .with_output(output.wallet_output.clone(), sender_offset_key_id, None)
                 .await
                 .map_err(|e| OutputManagerError::BuildError(e.to_string()))?;
 
@@ -2359,24 +2356,20 @@ where
             // obtaining output for the `change`
 
             // appending `change` output to the result
-            dest_outputs.push(
-                DbWalletOutput::from_wallet_output(
-                    change,
-                    &self.resources.key_manager,
-                    None,
-                    OutputSource::default(),
-                    Some(tx_id),
-                    None,
-                )
-                .await?,
-            );
+            dest_outputs.push(DbWalletOutput::from_wallet_output(
+                change,
+                None,
+                OutputSource::default(),
+                Some(tx_id),
+                None,
+            ));
         }
 
         // encumbering transaction
         self.resources
             .db
             .encumber_outputs(tx_id, src_outputs.clone(), dest_outputs)?;
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
 
         trace!(
             target: LOG_TARGET,
@@ -2399,6 +2392,7 @@ where
         covenant: Covenant,
         payment_id: MemoField,
         fee: MicroMinotari,
+        minimum_value_promise: MicroMinotari,
     ) -> Result<(DbWalletOutput, TariKeyId), OutputManagerError> {
         let (commitment_mask_key, script_key) = self
             .resources
@@ -2420,7 +2414,6 @@ where
             .key_manager
             .encrypt_data_for_recovery(&commitment_mask_key.key_id, None, amount.as_u64(), payment_id.clone())
             .await?;
-        let minimum_value_promise = MicroMinotari::zero();
         let metadata_message = TransactionOutput::metadata_signature_message_from_parts(
             &TransactionOutputVersion::get_current_version(),
             &script,
@@ -2465,13 +2458,11 @@ where
                 &self.resources.key_manager,
             )
             .await?,
-            &self.resources.key_manager,
             None,
             OutputSource::default(),
             None,
             None,
-        )
-        .await?;
+        );
 
         Ok((output, sender_offset.key_id))
     }
@@ -2495,7 +2486,7 @@ where
 
         let accumulated_amount_with_fee = src_outputs
             .iter()
-            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value);
+            .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
         let fee =
             self.get_fee_calc()
@@ -2548,11 +2539,12 @@ where
                 Covenant::default(),
                 payment_id.clone(),
                 fee,
+                MicroMinotari::zero(),
             )
             .await?;
 
         tx_builder
-            .with_output(output.wallet_output.clone(), sender_offset_key_id)
+            .with_output(output.wallet_output.clone(), sender_offset_key_id, None)
             .await?;
 
         let finalized = tx_builder.build().await?;
@@ -2570,7 +2562,7 @@ where
         self.resources
             .db
             .encumber_outputs(tx_id, src_outputs.clone(), vec![output])?;
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
 
         trace!(
             target: LOG_TARGET,
@@ -2607,7 +2599,7 @@ where
         Ok(builder)
     }
 
-    async fn fetch_utxo_from_node(
+    pub async fn fetch_unspent_outputs_from_node(
         &mut self,
         hash: HashOutput,
     ) -> Result<Option<TransactionOutput>, OutputManagerError> {
@@ -2640,25 +2632,15 @@ where
             EncryptedData::decrypt_data(&encryption_key, &output.commitment, &output.encrypted_data)
         {
             if output.verify_mask(&self.resources.factories.range_proof, &spending_key, amount.as_u64())? {
-                let spending_key_id = self.resources.key_manager.import_key(spending_key).await?;
-                let rewound_output = WalletOutput::new_with_rangeproof(
-                    output.version,
+                let commitment_mask_key_id = self.resources.key_manager.import_key(spending_key, None).await?;
+
+                let recovered_output = WalletOutput::new_from_transaction_output(
                     amount,
-                    spending_key_id,
-                    output.features,
-                    output.script,
+                    commitment_mask_key_id,
+                    payment_id,
+                    output,
                     inputs!(pre_image),
                     self.resources.key_manager.get_spend_key().await?.key_id,
-                    output.sender_offset_public_key,
-                    output.metadata_signature,
-                    // Although technically the script does have a script lock higher than 0, this does not apply
-                    // to us as we are claiming the Hashed part which has a 0 time lock
-                    0,
-                    output.covenant,
-                    output.encrypted_data,
-                    output.minimum_value_promise,
-                    output.proof,
-                    payment_id,
                 );
 
                 // Create builder with no recipients (other than ourselves)
@@ -2678,7 +2660,7 @@ where
                     .with_tx_type(TxType::ClaimAtomicSwap)
                     .with_kernel_features(KernelFeatures::empty())
                     .with_prevent_fee_gt_amount(self.resources.config.prevent_fee_gt_amount)
-                    .with_input(rewound_output)
+                    .with_input(recovered_output)
                     .await?;
 
                 let mut outputs = Vec::new();
@@ -2692,18 +2674,16 @@ where
                 if let Some(wallet_output) = finalized.change {
                     let change_output = DbWalletOutput::from_wallet_output(
                         wallet_output,
-                        &self.resources.key_manager,
                         None,
                         OutputSource::AtomicSwap,
                         Some(tx_id),
                         None,
-                    )
-                    .await?;
+                    );
                     outputs.push(change_output);
                 }
 
                 self.resources.db.encumber_outputs(tx_id, Vec::new(), outputs)?;
-                self.confirm_encumberance(tx_id, Vec::new()).await?;
+                self.confirm_encumberance(tx_id, Vec::new())?;
                 let tx = finalized.transaction;
 
                 Ok((tx_id, fee, amount - fee, tx))
@@ -2726,7 +2706,7 @@ where
     ) -> Result<(TxId, MicroMinotari, MicroMinotari, Transaction), OutputManagerError> {
         let output = self.resources.db.get_unspent_output(output_hash)?.wallet_output;
 
-        let amount = output.value;
+        let amount = output.value();
 
         // Create builder with no recipients (other than ourselves)
         let mut builder = TransactionBuilder::new(
@@ -2756,21 +2736,14 @@ where
         let fee = finalized.fee;
 
         if let Some(wallet_output) = finalized.change {
-            let change_output = DbWalletOutput::from_wallet_output(
-                wallet_output,
-                &self.resources.key_manager,
-                None,
-                OutputSource::HtlcRefund,
-                Some(tx_id),
-                None,
-            )
-            .await?;
+            let change_output =
+                DbWalletOutput::from_wallet_output(wallet_output, None, OutputSource::HtlcRefund, Some(tx_id), None);
             outputs.push(change_output);
         }
         let tx = finalized.transaction;
 
         self.resources.db.encumber_outputs(tx_id, Vec::new(), outputs)?;
-        self.confirm_encumberance(tx_id, Vec::new()).await?;
+        self.confirm_encumberance(tx_id, Vec::new())?;
         Ok((tx_id, fee, amount - fee, tx))
     }
 
@@ -2837,23 +2810,16 @@ where
                             &spending_key,
                             committed_value.into(),
                         )? {
-                            let spending_key_id = self.resources.key_manager.import_key(spending_key).await?;
-                            let rewound_output = WalletOutput::new_with_rangeproof(
-                                output.version,
+                            let commitment_mask_key_id =
+                                self.resources.key_manager.import_key(spending_key, None).await?;
+
+                            let rewound_output = WalletOutput::new_from_transaction_output(
                                 committed_value,
-                                spending_key_id,
-                                output.features,
-                                output.script,
+                                commitment_mask_key_id,
+                                payment_id,
+                                output,
                                 ExecutionStack::new(vec![]),
                                 script_private_key,
-                                output.sender_offset_public_key,
-                                output.metadata_signature,
-                                0,
-                                output.covenant,
-                                output.encrypted_data,
-                                output.minimum_value_promise,
-                                output.proof,
-                                payment_id,
                             );
 
                             scanned_outputs.push((rewound_output, OutputSource::OneSided, tx_id));
@@ -2875,7 +2841,7 @@ where
                         let commitment_mask_key_id = &self
                             .resources
                             .key_manager
-                            .import_key(commitment_mask_private_key.clone())
+                            .import_key(commitment_mask_private_key.clone(), None)
                             .await?;
 
                         if output.verify_mask(
@@ -2900,36 +2866,92 @@ where
                                 key: SerializedKeyString::from(commitment_mask_key_id.to_string()),
                             };
 
-                            let rewound_output = WalletOutput::new_with_rangeproof(
-                                output.version,
+                            let recovered_output = WalletOutput::new_from_transaction_output(
                                 committed_value,
                                 commitment_mask_key_id.clone(),
-                                output.features,
-                                output.script,
+                                payment_id,
+                                output,
                                 ExecutionStack::new(vec![]),
                                 script_key,
-                                output.sender_offset_public_key,
-                                output.metadata_signature,
-                                0,
-                                output.covenant,
-                                output.encrypted_data,
-                                output.minimum_value_promise,
-                                output.proof,
-                                payment_id,
                             );
 
-                            scanned_outputs.push((rewound_output, OutputSource::StealthOneSided, tx_id));
+                            scanned_outputs.push((recovered_output, OutputSource::StealthOneSided, tx_id));
                         }
                     }
                 }
             }
         }
 
-        self.import_onesided_outputs(scanned_outputs).await
+        self.import_onesided_outputs(scanned_outputs)
+    }
+
+    // Scanning outputs addressed to this wallet
+    #[allow(clippy::too_many_lines)]
+    async fn scan_outputs_for_multisig(
+        &mut self,
+        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+    ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
+        // 1. Get all your wallet's public keys (or just the spend key for now)
+        let mut scanned_outputs = vec![];
+
+        for (output, tx_id) in outputs {
+            // 2. Check if the script is a multisig script
+
+            if let [Opcode::CheckMultiSigVerify(_m, _n, pubkeys, _msg), Opcode::PushPubKey(scanned_pk)] =
+                output.script.as_slice()
+            {
+                debug!(
+                    target: LOG_TARGET,
+                    "Found multisig script in output with tx_id: {:?}, pubkeys: {:?}",
+                    tx_id,
+                    pubkeys
+                );
+
+                if let Some((commitment_mask_key_id, committed_value, payment_id)) = self
+                    .resources
+                    .key_manager
+                    .try_output_key_recovery(
+                        output.commitment(),
+                        output.encrypted_data(),
+                        &output.sender_offset_public_key,
+                    )
+                    .await?
+                {
+                    let script_spending_key = self
+                        .resources
+                        .key_manager
+                        .stealth_address_script_spending_key(
+                            &commitment_mask_key_id,
+                            &self.resources.key_manager.get_spend_key().await?.pub_key,
+                        )
+                        .await?;
+
+                    if script_spending_key != **scanned_pk {
+                        continue;
+                    }
+
+                    let script_key = TariKeyId::Derived {
+                        key: SerializedKeyString::from(commitment_mask_key_id.to_string()),
+                    };
+
+                    let recovered_output = WalletOutput::new_from_transaction_output(
+                        committed_value,
+                        commitment_mask_key_id,
+                        payment_id,
+                        output,
+                        ExecutionStack::new(vec![]),
+                        script_key,
+                    );
+                    scanned_outputs.push((recovered_output, OutputSource::Multisig, tx_id));
+                }
+            }
+        }
+
+        self.import_onesided_outputs(scanned_outputs)
     }
 
     // Import scanned outputs into the wallet
-    async fn import_onesided_outputs(
+    fn import_onesided_outputs(
         &self,
         scanned_outputs: Vec<(WalletOutput, OutputSource, Option<TxId>)>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
@@ -2937,15 +2959,7 @@ where
 
         for (output, output_source, tx_id) in scanned_outputs {
             let tx_id = tx_id.unwrap_or(TxId::new_random());
-            let db_output = DbWalletOutput::from_wallet_output(
-                output.clone(),
-                &self.resources.key_manager,
-                None,
-                output_source,
-                Some(tx_id),
-                None,
-            )
-            .await?;
+            let db_output = DbWalletOutput::from_wallet_output(output.clone(), None, output_source, Some(tx_id), None);
             let hash = db_output.hash;
 
             match self
@@ -2958,7 +2972,7 @@ where
                         target: LOG_TARGET,
                         "One-sided payment Output {} with value {} recovered",
                         db_output.commitment.to_hex(),
-                        db_output.wallet_output.value,
+                        db_output.wallet_output.value(),
                     );
 
                     rewound_outputs.push(RecoveredOutput { output, tx_id, hash })

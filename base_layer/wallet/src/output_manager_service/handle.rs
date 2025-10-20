@@ -49,11 +49,14 @@ use tower::Service;
 use crate::output_manager_service::{
     error::OutputManagerError,
     service::{Balance, OutputInfoByTxId, UseOutput},
-    storage::models::{DbWalletOutput, KnownOneSidedPaymentScript, SpendingPriority},
+    storage::{
+        database::OutputBackendQuery,
+        models::{DbWalletOutput, KnownOneSidedPaymentScript, SpendingPriority},
+    },
     UtxoSelectionCriteria,
 };
+
 /// API Request enum
-#[allow(clippy::large_enum_variant)]
 pub enum OutputManagerRequest {
     GetBalance,
     GetBalancePaymentId(Vec<u8>),
@@ -100,17 +103,16 @@ pub enum OutputManagerRequest {
         fee_per_gram: MicroMinotari,
         lock_height: Option<u64>,
         payment_id: MemoField,
-    },
-    CreatePayToSelfWithOutputs {
-        outputs: Vec<WalletOutputBuilder>,
-        fee_per_gram: MicroMinotari,
-        selection_criteria: UtxoSelectionCriteria,
-        payment_id: MemoField,
+        minimum_value_promise: MicroMinotari,
     },
     CancelTransaction(TxId),
     GetSpentOutputs,
+    GetOutputsByQuery(OutputBackendQuery),
     GetUnspentOutputs,
     GetInvalidOutputs,
+    GetManyOutputs {
+        outputs: Vec<FixedHash>,
+    },
     ValidateTxos,
     RevalidateTxos,
     CreateCoinSplit((Vec<CompressedCommitment>, MicroMinotari, usize, MicroMinotari)),
@@ -136,6 +138,7 @@ pub enum OutputManagerRequest {
 
     ScanForRecoverableOutputs(Vec<(TransactionOutput, Option<TxId>)>),
     ScanOutputs(Vec<(TransactionOutput, Option<TxId>)>),
+    ScanOutputsForMultisig(Vec<(TransactionOutput, Option<TxId>)>),
     AddKnownOneSidedPaymentScript(KnownOneSidedPaymentScript),
     CreateOutputWithFeatures {
         value: MicroMinotari,
@@ -146,6 +149,8 @@ pub enum OutputManagerRequest {
     CreateClaimShaAtomicSwapTransaction(HashOutput, CompressedPublicKey, MicroMinotari),
     CreateHtlcRefundTransaction(HashOutput, MicroMinotari),
     GetOutputInfoByTxId(TxId),
+    FetchUnspentOutputs(Vec<HashOutput>),
+    ConfirmEncumberance(TxId, Vec<WalletOutput>),
     ClearShortTermEncumberances,
 }
 
@@ -157,10 +162,10 @@ impl fmt::Display for OutputManagerRequest {
         match self {
             GetBalance => write!(f, "GetBalance"),
             GetBalancePaymentId(_) => write!(f, "GetBalance for user payment id"),
-            AddOutput((v, _)) => write!(f, "AddOutput ({})", v.value),
-            AddOutputWithTxId((t, v, _)) => write!(f, "AddOutputWithTxId ({}: {})", t, v.value),
+            AddOutput((v, _)) => write!(f, "AddOutput ({})", v.value()),
+            AddOutputWithTxId((t, v, _)) => write!(f, "AddOutputWithTxId ({}: {})", t, v.value()),
             AddUnvalidatedOutput((t, v, _)) => {
-                write!(f, "AddUnvalidatedOutput ({}: {})", t, v.value)
+                write!(f, "AddUnvalidatedOutput ({}: {})", t, v.value())
             },
             UpdateOutputMetadataSignature(v) => write!(
                 f,
@@ -251,7 +256,6 @@ impl fmt::Display for OutputManagerRequest {
             CreateOutputWithFeatures { value, features } => {
                 write!(f, "CreateOutputWithFeatures({value}, {features})")
             },
-            CreatePayToSelfWithOutputs { .. } => write!(f, "CreatePayToSelfWithOutputs"),
             ReinstateCancelledInboundTx(_) => write!(f, "ReinstateCancelledInboundTx"),
             CreateClaimShaAtomicSwapTransaction(output, pre_image, fee_per_gram) => write!(
                 f,
@@ -262,8 +266,15 @@ impl fmt::Display for OutputManagerRequest {
                 "CreateHtlcRefundTransaction(output hash: {output}, , fee_per_gram: {fee_per_gram} )"
             ),
 
-            GetOutputInfoByTxId(t) => write!(f, "GetOutputInfoByTxId: {t}"),
+            GetOutputInfoByTxId(t) => write!(f, "GetOutputInfoByTxId: {}", t),
+            FetchUnspentOutputs(hashes) => write!(f, "FetchUnspentOutputs: {:?}", hashes),
+            ConfirmEncumberance(tx_id, change_outputs) => {
+                write!(f, "ConfirmEncumberance: {}, {:?}", tx_id, change_outputs)
+            },
             ClearShortTermEncumberances => write!(f, "ClearShortTermEncumberances"),
+            GetOutputsByQuery(query) => write!(f, "GetOutputsByQuery: {:?}", query),
+            ScanOutputsForMultisig(outputs) => write!(f, "ScanOutputsForMultisig: {:?}", outputs),
+            GetManyOutputs { outputs } => write!(f, "GetManyOutputs ({})", outputs.len()),
         }
     }
 }
@@ -317,6 +328,8 @@ pub enum OutputManagerResponse<KM> {
     ClaimHtlcTransaction((TxId, MicroMinotari, MicroMinotari, Transaction)),
     OutputInfoByTxId(OutputInfoByTxId),
     CoinPreview((Vec<MicroMinotari>, MicroMinotari)),
+    FetchUnspentOutputs(Vec<TransactionOutput>),
+    ConfirmEncumberance,
     ClearShortTermEncumberances,
 }
 
@@ -593,6 +606,17 @@ where KM: TransactionKeyManagerInterface
         }
     }
 
+    pub async fn get_many_outputs(&mut self, outputs: Vec<FixedHash>) -> Result<Vec<WalletOutput>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetManyOutputs { outputs })
+            .await??
+        {
+            OutputManagerResponse::Outputs(s) => Ok(s),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
     pub async fn get_spent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetSpentOutputs).await?? {
             OutputManagerResponse::SpentOutputs(s) => Ok(s),
@@ -603,6 +627,21 @@ where KM: TransactionKeyManagerInterface
     /// Sorted from lowest value to highest
     pub async fn get_unspent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetUnspentOutputs).await?? {
+            OutputManagerResponse::UnspentOutputs(s) => Ok(s),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
+    /// Sorted from lowest value to highest
+    pub async fn get_outputs_by_query(
+        &mut self,
+        query: OutputBackendQuery,
+    ) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetOutputsByQuery(query))
+            .await??
+        {
             OutputManagerResponse::UnspentOutputs(s) => Ok(s),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
@@ -780,6 +819,20 @@ where KM: TransactionKeyManagerInterface
         }
     }
 
+    pub async fn scan_outputs_for_multisig(
+        &mut self,
+        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+    ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::ScanOutputsForMultisig(outputs))
+            .await??
+        {
+            OutputManagerResponse::ScanOutputs(outputs) => Ok(outputs),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
     pub async fn add_known_script(&mut self, script: KnownOneSidedPaymentScript) -> Result<(), OutputManagerError> {
         match self
             .handle
@@ -787,28 +840,6 @@ where KM: TransactionKeyManagerInterface
             .await??
         {
             OutputManagerResponse::AddKnownOneSidedPaymentScript => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
-    pub async fn create_send_to_self_with_output(
-        &mut self,
-        outputs: Vec<WalletOutputBuilder>,
-        fee_per_gram: MicroMinotari,
-        input_selection: UtxoSelectionCriteria,
-        payment_id: MemoField,
-    ) -> Result<(TxId, Transaction), OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::CreatePayToSelfWithOutputs {
-                outputs,
-                fee_per_gram,
-                selection_criteria: input_selection,
-                payment_id,
-            })
-            .await??
-        {
-            OutputManagerResponse::CreatePayToSelfWithOutputs { transaction, tx_id } => Ok((tx_id, *transaction)),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
     }
@@ -916,6 +947,7 @@ where KM: TransactionKeyManagerInterface
         fee_per_gram: MicroMinotari,
         lock_height: Option<u64>,
         payment_id: MemoField,
+        minimum_value_promise: MicroMinotari,
     ) -> Result<(MicroMinotari, Transaction), OutputManagerError> {
         match self
             .handle
@@ -927,6 +959,7 @@ where KM: TransactionKeyManagerInterface
                 fee_per_gram,
                 lock_height,
                 payment_id,
+                minimum_value_promise,
             })
             .await??
         {
@@ -958,6 +991,32 @@ where KM: TransactionKeyManagerInterface
             OutputManagerResponse::OutputInfoByTxId(output_info_by_tx_id) => Ok(output_info_by_tx_id),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
+    }
+
+    pub async fn fetch_unspent_outputs_from_node(
+        &mut self,
+        hashes: Vec<HashOutput>,
+    ) -> Result<Vec<TransactionOutput>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::FetchUnspentOutputs(hashes))
+            .await??
+        {
+            OutputManagerResponse::FetchUnspentOutputs(outputs) => Ok(outputs),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
+    pub async fn confirm_encumberance(
+        &mut self,
+        tx_id: TxId,
+        change_outputs: Vec<WalletOutput>,
+    ) -> Result<(), OutputManagerError> {
+        self.handle
+            .call(OutputManagerRequest::ConfirmEncumberance(tx_id, change_outputs))
+            .await??;
+
+        Ok(())
     }
 
     pub async fn clear_short_term_encumberances(&mut self) -> Result<(), OutputManagerError> {

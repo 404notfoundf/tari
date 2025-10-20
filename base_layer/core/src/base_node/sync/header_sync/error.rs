@@ -28,9 +28,10 @@ use tari_comms::{
     peer_manager::NodeId,
     protocol::rpc::{RpcError, RpcStatus},
 };
+use tari_node_components::blocks::BlockError;
 use tari_transaction_components::{BanPeriod, BanReason};
 
-use crate::{blocks::BlockError, chain_storage::ChainStorageError, validation::ValidationError};
+use crate::{chain_storage::ChainStorageError, validation::ValidationError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlockHeaderSyncError {
@@ -114,7 +115,8 @@ impl BlockHeaderSyncError {
             // short ban
             err @ BlockHeaderSyncError::MaxLatencyExceeded { .. } |
             err @ BlockHeaderSyncError::RpcError { .. } |
-            err @ BlockHeaderSyncError::RpcRequestError { .. } => Some(BanReason {
+            err @ BlockHeaderSyncError::RpcRequestError { .. } |
+            err @ BlockHeaderSyncError::PeerSentInaccurateChainMetadata { .. } => Some(BanReason {
                 reason: format!("{err}"),
                 ban_duration: BanPeriod::Short,
             }),
@@ -128,7 +130,6 @@ impl BlockHeaderSyncError {
             err @ BlockHeaderSyncError::InvalidProtocolResponse(_) |
             err @ BlockHeaderSyncError::ChainLinkBroken { .. } |
             err @ BlockHeaderSyncError::BlockError(_) |
-            err @ BlockHeaderSyncError::PeerSentInaccurateChainMetadata { .. } |
             err @ BlockHeaderSyncError::PeerSentTooManyHeaders(_) => Some(BanReason {
                 reason: format!("{err}"),
                 ban_duration: BanPeriod::Long,

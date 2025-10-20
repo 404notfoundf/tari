@@ -3,6 +3,7 @@ name = "minotari_node"
 description = "The tari full base node implementation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -109,3 +110,4 @@ tikv-jemalloc-ctl= { version ="0.6", features = ["use_std","stats"] }
 tikv-jemalloc-sys= { version ="0.6", features = ["profiling"]}
 # 用于生成与 pprof 兼容的内存剖析数据
 jemalloc_pprof= { version ="0.8", features = ["symbolize", "flamegraph"]}
+tempfile = "3.1.0"

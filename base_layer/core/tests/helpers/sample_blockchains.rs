@@ -24,12 +24,12 @@
 #![allow(clippy::indexing_slicing)]
 use tari_common::configuration::Network;
 use tari_core::{
-    blocks::ChainBlock,
     chain_storage::{BlockchainDatabase, BlockchainDatabaseConfig, Validators},
     consensus::{BaseNodeConsensusManager, BaseNodeConsensusManagerBuilder},
     test_helpers::blockchain::{create_store_with_consensus, TempDatabase},
     validation::DifficultyCalculator,
 };
+use tari_node_components::blocks::ChainBlock;
 use tari_transaction_components::{
     consensus::{ConsensusConstants, ConsensusConstantsBuilder},
     tari_amount::{uT, T},
@@ -119,7 +119,7 @@ pub async fn create_blockchain_db_no_cut_through() -> (
     .unwrap();
     // Block 3
     let txs = vec![
-        txn_schema!(from: vec![outputs[2][1].clone(), outputs[2][2].clone()], to: vec![outputs[2][2].value/2]),
+        txn_schema!(from: vec![outputs[2][1].clone(), outputs[2][2].clone()], to: vec![outputs[2][2].value()/2]),
         txn_schema!(from: vec![outputs[2][4].clone(), outputs[2][3].clone()], to: vec![40*T], fee: 100*uT),
     ];
     generate_new_block(
@@ -174,7 +174,7 @@ pub async fn create_blockchain_db_no_cut_through() -> (
 
 pub fn consensus_constants(network: Network) -> ConsensusConstantsBuilder {
     ConsensusConstantsBuilder::new(network)
-        .with_emission_amounts(100_000_000.into(), &EMISSION, 10, 1000)
+        .with_emission_amounts(100_000_000.into(), EMISSION.to_vec(), 10, 1000)
         .with_coinbase_lockheight(1)
 }
 

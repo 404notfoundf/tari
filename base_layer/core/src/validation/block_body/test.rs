@@ -260,15 +260,13 @@ async fn it_allows_multiple_coinbases() {
         .with_range_proof_type(RangeProofType::RevealedValue)
         .build_with_reward(
             blockchain.rules().consensus_constants(1),
-            coinbase.value,
+            coinbase.value(),
             MemoField::new_empty(),
         )
         .await
         .unwrap();
 
-    block
-        .body
-        .add_output(coinbase_output.to_transaction_output(&blockchain.km).await.unwrap());
+    block.body.add_output(coinbase_output.to_transaction_output().unwrap());
     block.body.sort();
 
     let (block, _) = blockchain
@@ -349,7 +347,9 @@ async fn it_checks_input_maturity() {
 
     let (_, coinbase_a) = blockchain.add_next_tip(block_spec!("A")).await.unwrap();
     let mut schema = txn_schema!(from: vec![coinbase_a.clone()], to: vec![50 * T]);
-    schema.from[0].features.maturity = 100;
+    let mut features = schema.from[0].features().clone();
+    features.maturity = 100;
+    schema.from[0].set_features(features);
     let (txs, _) = schema_to_transaction(&[schema], &blockchain.km).await;
 
     let (block, _) = blockchain
@@ -472,7 +472,7 @@ async fn it_rejects_invalid_input_metadata() {
     let (_, coinbase_a) = blockchain.add_next_tip(block_spec!("A")).await.unwrap();
 
     let mut schema1 = txn_schema!(from: vec![coinbase_a.clone()], to: vec![50 * T, 12 * T]);
-    schema1.from[0].sender_offset_public_key = Default::default();
+    schema1.from[0].set_sender_offset_public_key(Default::default());
     let (txs, _) = schema_to_transaction(&[schema1], &blockchain.km).await;
     let txs = txs.into_iter().map(|t| Arc::try_unwrap(t).unwrap()).collect::<Vec<_>>();
     let (block, _) = blockchain.create_next_tip(block_spec!("B", transactions: txs)).await;
@@ -533,7 +533,7 @@ mod body_only {
         let (_, coinbase_a) = blockchain.add_next_tip(block_spec!("A")).await.unwrap();
 
         let mut schema1 = txn_schema!(from: vec![coinbase_a.clone()], to: vec![50 * T, 12 * T]);
-        schema1.from[0].sender_offset_public_key = Default::default();
+        schema1.from[0].set_sender_offset_public_key(Default::default());
         let (txs, _) = schema_to_transaction(&[schema1], &blockchain.km).await;
         let txs = txs.into_iter().map(|t| Arc::try_unwrap(t).unwrap()).collect::<Vec<_>>();
         let (block, _) = blockchain
@@ -599,7 +599,7 @@ mod orphan_validator {
         let rules = BaseNodeConsensusManager::builder(Network::LocalNet)
             .add_consensus_constants(
                 ConsensusConstantsBuilder::new(Network::LocalNet)
-                    .with_permitted_output_types(&[OutputType::Coinbase])
+                    .with_permitted_output_types(vec![OutputType::Coinbase])
                     .with_coinbase_lockheight(0)
                     .build(),
             )
@@ -628,12 +628,16 @@ mod orphan_validator {
         let rules = BaseNodeConsensusManager::builder(Network::LocalNet)
             .add_consensus_constants(
                 ConsensusConstantsBuilder::new(Network::LocalNet)
-                    .with_permitted_range_proof_types(&[
-                        (OutputType::Standard, &[RangeProofType::RevealedValue]),
-                        (OutputType::Coinbase, &[RangeProofType::RevealedValue]),
-                        (OutputType::Burn, &[RangeProofType::RevealedValue]),
-                        (OutputType::ValidatorNodeRegistration, &[RangeProofType::RevealedValue]),
-                        (OutputType::CodeTemplateRegistration, &[RangeProofType::RevealedValue]),
+                    .with_permitted_range_proof_types(vec![
+                        (OutputType::Standard, vec![RangeProofType::RevealedValue]),
+                        (OutputType::Coinbase, vec![RangeProofType::RevealedValue]),
+                        (OutputType::Burn, vec![RangeProofType::RevealedValue]),
+                        (OutputType::ValidatorNodeRegistration, vec![
+                            RangeProofType::RevealedValue,
+                        ]),
+                        (OutputType::CodeTemplateRegistration, vec![
+                            RangeProofType::RevealedValue,
+                        ]),
                     ])
                     .with_coinbase_lockheight(0)
                     .build(),
@@ -663,14 +667,16 @@ mod orphan_validator {
         let rules = BaseNodeConsensusManager::builder(Network::LocalNet)
             .add_consensus_constants(
                 ConsensusConstantsBuilder::new(Network::LocalNet)
-                    .with_permitted_range_proof_types(&[
-                        (OutputType::Standard, &[RangeProofType::BulletProofPlus]),
-                        (OutputType::Coinbase, &[RangeProofType::BulletProofPlus]),
-                        (OutputType::Burn, &[RangeProofType::BulletProofPlus]),
-                        (OutputType::ValidatorNodeRegistration, &[
+                    .with_permitted_range_proof_types(vec![
+                        (OutputType::Standard, vec![RangeProofType::BulletProofPlus]),
+                        (OutputType::Coinbase, vec![RangeProofType::BulletProofPlus]),
+                        (OutputType::Burn, vec![RangeProofType::BulletProofPlus]),
+                        (OutputType::ValidatorNodeRegistration, vec![
                             RangeProofType::BulletProofPlus,
                         ]),
-                        (OutputType::CodeTemplateRegistration, &[RangeProofType::BulletProofPlus]),
+                        (OutputType::CodeTemplateRegistration, vec![
+                            RangeProofType::BulletProofPlus,
+                        ]),
                     ])
                     .with_coinbase_lockheight(0)
                     .build(),
@@ -697,7 +703,7 @@ mod orphan_validator {
         let rules = BaseNodeConsensusManager::builder(Network::LocalNet)
             .add_consensus_constants(
                 ConsensusConstantsBuilder::new(Network::LocalNet)
-                    .with_permitted_range_proof_types(&[(OutputType::CodeTemplateRegistration, &[
+                    .with_permitted_range_proof_types(vec![(OutputType::CodeTemplateRegistration, vec![
                         RangeProofType::BulletProofPlus,
                     ])])
                     .with_coinbase_lockheight(0)

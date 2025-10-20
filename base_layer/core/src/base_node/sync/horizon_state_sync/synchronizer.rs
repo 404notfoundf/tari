@@ -32,7 +32,7 @@ use log::*;
 use tari_common_types::types::{CompressedCommitment, FixedHash, RangeProofService};
 use tari_comms::{connectivity::ConnectivityRequester, peer_manager::NodeId, protocol::rpc::RpcClient, PeerConnection};
 use tari_crypto::commitment::HomomorphicCommitment;
-use tari_node_components::blocks::BlockHeader;
+use tari_node_components::blocks::{BlockHeader, ChainHeader};
 use tari_transaction_components::{
     transaction_components::{transaction_output::batch_verify_range_proofs, TransactionKernel, TransactionOutput},
     validation::{aggregate_body::validate_individual_output, helpers::validate_output_version},
@@ -52,7 +52,7 @@ use crate::{
         BlockchainSyncConfig,
         SyncPeer,
     },
-    blocks::{ChainHeader, UpdateBlockAccumulatedData},
+    blocks::UpdateBlockAccumulatedData,
     chain_storage::{async_db::AsyncBlockchainDb, BlockchainBackend, ChainStorageError, MmrTree},
     common::rolling_avg::RollingAverageTime,
     consensus::BaseNodeConsensusManager,
@@ -733,7 +733,7 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
                 },
             }
 
-            if utxo_counter % 100 == 0 {
+            if utxo_counter.is_multiple_of(100) {
                 let info = HorizonSyncInfo::new(vec![sync_peer.node_id().clone()], HorizonSyncStatus::Outputs {
                     current: utxo_counter,
                     total: self.num_outputs,

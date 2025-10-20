@@ -10,6 +10,7 @@ use tari_transaction_components::{
         self,
         BlockHeader,
         FeePerGramStat,
+        GenerateKernelMerkleProofResponse,
         GetUtxosDeletedInfoResponse,
         GetUtxosMinedInfoResponse,
         SyncUtxosByBlockResponse,
@@ -24,7 +25,9 @@ use crate::client::models::TxSubmissionResponse;
 #[async_trait::async_trait]
 pub trait BaseNodeWalletClient: Send + Sync + Clone + 'static {
     async fn get_address(&self) -> String;
+
     async fn is_online(&self) -> bool;
+
     async fn get_tip_info(&self) -> Result<models::TipInfoResponse, Error>;
 
     async fn get_header_by_height(&self, height: u64) -> Result<Option<BlockHeader>, Error>;
@@ -60,6 +63,11 @@ pub trait BaseNodeWalletClient: Send + Sync + Clone + 'static {
     ) -> Result<models::TxQueryResponse, Error>;
 
     async fn get_mempool_fee_per_gram_stats(&self, count: u64) -> Result<FeePerGramStat, Error>;
+    async fn get_kernel_merkle_proof(
+        &self,
+        excess_sig_nonce: &[u8],
+        excess_sig: &[u8],
+    ) -> Result<GenerateKernelMerkleProofResponse, anyhow::Error>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
