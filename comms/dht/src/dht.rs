@@ -304,20 +304,20 @@ impl Dht {
         S::Future: Send,
     {
         ServiceBuilder::new()
-            .layer(MessageLoggingLayer::new(format!(
-                "Pre Broadcast [{}]",
-                self.node_identity.node_id().short_str()
-            )))
+            // .layer(MessageLoggingLayer::new(format!(
+                // "Pre Broadcast [{}]",
+                // self.node_identity.node_id().short_str()
+            // )))
             .layer(outbound::BroadcastLayer::new(
                 Arc::clone(&self.node_identity),
                 self.dht_requester(),
                 self.discovery_service_requester(),
                 &self.config,
             ))
-            .layer(MessageLoggingLayer::new(format!(
-                "Outbound [{}]",
-                self.node_identity.node_id().short_str()
-            )))
+            // .layer(MessageLoggingLayer::new(format!(
+            //     "Outbound [{}]",
+            //     self.node_identity.node_id().short_str()
+            // )))
             .layer(outbound::SerializeLayer)
             .into_inner()
     }
