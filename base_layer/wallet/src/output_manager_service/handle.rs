@@ -19,8 +19,9 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-use std::{collections::HashMap, fmt, fmt::Formatter, sync::Arc};
+use std::{collections::HashMap, fmt, fmt::Formatter, ops::Range, sync::Arc};
 
+use log::warn;
 use tari_common_types::{
     tari_address::TariAddress,
     transaction::TxId,
@@ -29,7 +30,6 @@ use tari_common_types::{
 use tari_script::{CompressedCheckSigSchnorrSignature, TariScript};
 use tari_service_framework::reply_channel::SenderService;
 use tari_transaction_components::{
-    key_manager::TransactionKeyManagerInterface,
     transaction_components::{
         covenants::Covenant,
         MemoField,
@@ -42,6 +42,7 @@ use tari_transaction_components::{
     MicroMinotari,
     TransactionBuilder,
 };
+use tari_transaction_key_manager::legacy_key_manager::{wallet_types::FeeType, LegacyTransactionKeyManagerInterface};
 use tari_utilities::hex::Hex;
 use tokio::sync::broadcast;
 use tower::Service;
@@ -52,21 +53,30 @@ use crate::output_manager_service::{
     storage::{
         database::OutputBackendQuery,
         models::{DbWalletOutput, KnownOneSidedPaymentScript, SpendingPriority},
+        sqlite_db::CoinBucket,
     },
     UtxoSelectionCriteria,
 };
 
+const LOG_TARGET: &str = "wallet::output_manager_service::handle";
+
 /// API Request enum
 pub enum OutputManagerRequest {
     GetBalance,
+    GetCoinBuckets {
+        ranges: Vec<Range<u64>>,
+    },
     GetBalancePaymentId(Vec<u8>),
     AddOutput((Box<WalletOutput>, Option<SpendingPriority>)),
     AddOutputWithTxId((TxId, Box<WalletOutput>, Option<SpendingPriority>)),
     AddUnvalidatedOutput((TxId, Box<WalletOutput>, Option<SpendingPriority>)),
     UpdateOutputMetadataSignature(Box<TransactionOutput>),
-    ConfirmPendingTransaction(TxId, Option<Vec<WalletOutput>>),
-    EncumberAggregateUtxo {
+    ConfirmPendingTransaction {
         tx_id: TxId,
+        tx_id_update: Option<TxId>,
+        change_outputs: Option<Vec<WalletOutput>>,
+    },
+    EncumberAggregateUtxo {
         fee_per_gram: MicroMinotari,
         expected_commitment: CompressedCommitment,
         script_input_shares: HashMap<CompressedPublicKey, CompressedCheckSigSchnorrSignature>,
@@ -80,7 +90,6 @@ pub enum OutputManagerRequest {
         payment_id: MemoField,
     },
     SpendBackupPreMineUtxo {
-        tx_id: TxId,
         fee_per_gram: MicroMinotari,
         output_hash: HashOutput,
         expected_commitment: CompressedCommitment,
@@ -95,8 +104,15 @@ pub enum OutputManagerRequest {
         script: TariScript,
         covenant: Covenant,
     },
-    CreatePayToSelfTransaction {
+    GetTransactionBuilderRangeLimitedCoinJoin {
         tx_id: TxId,
+        selection_criteria: UtxoSelectionCriteria,
+        output_features: Box<OutputFeatures>,
+        fee: FeeType,
+        script: TariScript,
+        covenant: Covenant,
+    },
+    CreatePayToSelfTransaction {
         amount: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
         output_features: Box<OutputFeatures>,
@@ -105,7 +121,8 @@ pub enum OutputManagerRequest {
         payment_id: MemoField,
         minimum_value_promise: MicroMinotari,
     },
-    CancelTransaction(TxId),
+    CancelPendingTransaction(TxId),
+    CancelCompletedTransaction(TxId),
     GetSpentOutputs,
     GetOutputsByQuery(OutputBackendQuery),
     GetUnspentOutputs,
@@ -136,9 +153,9 @@ pub enum OutputManagerRequest {
         num_outputs: usize,
     },
 
-    ScanForRecoverableOutputs(Vec<(TransactionOutput, Option<TxId>)>),
-    ScanOutputs(Vec<(TransactionOutput, Option<TxId>)>),
-    ScanOutputsForMultisig(Vec<(TransactionOutput, Option<TxId>)>),
+    ScanForRecoverableOutputs(Vec<TransactionOutput>),
+    ScanOutputs(Vec<TransactionOutput>),
+    ScanOutputsForMultisig(Vec<TransactionOutput>),
     AddKnownOneSidedPaymentScript(KnownOneSidedPaymentScript),
     CreateOutputWithFeatures {
         value: MicroMinotari,
@@ -150,7 +167,6 @@ pub enum OutputManagerRequest {
     CreateHtlcRefundTransaction(HashOutput, MicroMinotari),
     GetOutputInfoByTxId(TxId),
     FetchUnspentOutputs(Vec<HashOutput>),
-    ConfirmEncumberance(TxId, Vec<WalletOutput>),
     ClearShortTermEncumberances,
 }
 
@@ -161,6 +177,13 @@ impl fmt::Display for OutputManagerRequest {
         use OutputManagerRequest::*;
         match self {
             GetBalance => write!(f, "GetBalance"),
+            GetCoinBuckets { ranges } => {
+                let buckets = ranges
+                    .iter()
+                    .map(|v| format!("range: {}..{}", v.start, v.end))
+                    .collect::<Vec<_>>();
+                write!(f, "GetCoinBuckets: buckets {:?}", buckets)
+            },
             GetBalancePaymentId(_) => write!(f, "GetBalance for user payment id"),
             AddOutput((v, _)) => write!(f, "AddOutput ({})", v.value()),
             AddOutputWithTxId((t, v, _)) => write!(f, "AddOutputWithTxId ({}: {})", t, v.value()),
@@ -180,7 +203,6 @@ impl fmt::Display for OutputManagerRequest {
                 write!(f, "ScrapeWallet (tx_id: {tx_id}, fee_per_gram: {fee_per_gram})")
             },
             EncumberAggregateUtxo {
-                tx_id,
                 expected_commitment,
                 original_maturity,
                 use_output,
@@ -192,29 +214,32 @@ impl fmt::Display for OutputManagerRequest {
                 };
                 write!(
                     f,
-                    "Encumber aggregate utxo with tx_id: {} and output: ({},{}) with original maturity: {}",
-                    tx_id,
+                    "Encumber aggregate utxo with output: ({},{}) with original maturity: {}",
                     expected_commitment.to_hex(),
                     output_hash,
                     original_maturity,
                 )
             },
             SpendBackupPreMineUtxo {
-                tx_id,
                 output_hash,
                 expected_commitment,
                 ..
             } => write!(
                 f,
-                "spending backup pre-mine utxo with tx_id: {} and output: ({},{})",
-                tx_id,
+                "spending backup pre-mine utxo with output: ({},{})",
                 expected_commitment.to_hex(),
                 output_hash
             ),
-            ConfirmPendingTransaction(v, _) => write!(f, "ConfirmPendingTransaction ({v})"),
-            GetTransactionBuilder { .. } => write!(f, "PrepareToSendTransaction "),
+            ConfirmPendingTransaction {
+                tx_id, tx_id_update, ..
+            } => {
+                write!(f, "ConfirmPendingTransaction ({tx_id} replace with {:?})", tx_id_update)
+            },
+            GetTransactionBuilder { .. } => write!(f, "GetTransactionBuilder "),
+            GetTransactionBuilderRangeLimitedCoinJoin { .. } => write!(f, "GetTransactionBuilderRangeLimitedCoinJoin "),
             CreatePayToSelfTransaction { .. } => write!(f, "CreatePayToSelfTransaction",),
-            CancelTransaction(v) => write!(f, "CancelTransaction ({v})"),
+            CancelPendingTransaction(v) => write!(f, "CancelPendingTransaction ({v})"),
+            CancelCompletedTransaction(v) => write!(f, "CancelCompletedTransaction ({v})"),
             GetSpentOutputs => write!(f, "GetSpentOutputs"),
             GetUnspentOutputs => write!(f, "GetUnspentOutputs"),
             GetInvalidOutputs => write!(f, "GetInvalidOutputs"),
@@ -268,12 +293,9 @@ impl fmt::Display for OutputManagerRequest {
 
             GetOutputInfoByTxId(t) => write!(f, "GetOutputInfoByTxId: {}", t),
             FetchUnspentOutputs(hashes) => write!(f, "FetchUnspentOutputs: {:?}", hashes),
-            ConfirmEncumberance(tx_id, change_outputs) => {
-                write!(f, "ConfirmEncumberance: {}, {:?}", tx_id, change_outputs)
-            },
             ClearShortTermEncumberances => write!(f, "ClearShortTermEncumberances"),
             GetOutputsByQuery(query) => write!(f, "GetOutputsByQuery: {:?}", query),
-            ScanOutputsForMultisig(outputs) => write!(f, "ScanOutputsForMultisig: {:?}", outputs),
+            ScanOutputsForMultisig(_) => write!(f, "ScanOutputsForMultisig"),
             GetManyOutputs { outputs } => write!(f, "GetManyOutputs ({})", outputs.len()),
         }
     }
@@ -283,37 +305,39 @@ impl fmt::Display for OutputManagerRequest {
 #[derive(Debug, Clone)]
 pub enum OutputManagerResponse<KM> {
     Balance(Balance),
+    GetCoinBuckets(Vec<CoinBucket>),
+    GetRangeLimitedOutputs(Vec<DbWalletOutput>),
     OutputAdded,
     ConvertedToTransactionOutput(Box<TransactionOutput>),
     OutputMetadataSignatureUpdated,
+    TxIdReplaced,
     // RecipientTransactionGenerated(ReceiverTransactionProtocol),
-    EncumberAggregateUtxo(
-        Box<(
-            Transaction,
-            MicroMinotari,
-            MicroMinotari,
-            CompressedPublicKey,
-            CompressedPublicKey,
-            CompressedPublicKey,
-            CompressedPublicKey,
-        )>,
-    ),
-    SpendBackupPreMineUtxo((Transaction, MicroMinotari, MicroMinotari)),
+    EncumberAggregateUtxo {
+        tx_id: TxId,
+        transaction: Box<Transaction>,
+        amount: MicroMinotari,
+        fee: MicroMinotari,
+        total_script_public_key: Box<CompressedPublicKey>,
+        total_metadata_ephemeral_public_key: Box<CompressedPublicKey>,
+        total_script_nonce: Box<CompressedPublicKey>,
+        shared_secret_public_key: Box<CompressedPublicKey>,
+    },
+    SpendBackupPreMineUtxo((TxId, Transaction, MicroMinotari, MicroMinotari)),
     OutputConfirmed,
     PendingTransactionConfirmed,
-    PayToSelfTransaction((MicroMinotari, Transaction)),
+    PayToSelfTransaction((MicroMinotari, Transaction, TxId)),
     TransactionBuilderToSend(Box<TransactionBuilder<KM>>),
     TransactionCancelled,
     SpentOutputs(Vec<DbWalletOutput>),
     UnspentOutputs(Vec<DbWalletOutput>),
-    Outputs(Vec<WalletOutput>),
+    Outputs(Vec<(DbWalletOutput, WalletOutput)>),
     InvalidOutputs(Vec<WalletOutput>),
     BaseNodePublicKeySet,
     TxoValidationStarted(u64),
     Transaction((TxId, Transaction, MicroMinotari)),
     PublicRewindKeys(Box<PublicRewindKeys>),
     RecoveryByte(u8),
-    FeeEstimate(MicroMinotari),
+    FeeEstimate(MicroMinotari, usize, bool),
     RewoundOutputs(Vec<RecoveredOutput>),
     ScanOutputs(Vec<RecoveredOutput>),
     AddKnownOneSidedPaymentScript,
@@ -371,7 +395,6 @@ pub struct PublicRewindKeys {
 
 #[derive(Debug, Clone)]
 pub struct RecoveredOutput {
-    pub tx_id: TxId,
     pub output: WalletOutput,
     pub hash: FixedHash,
 }
@@ -383,7 +406,7 @@ pub struct OutputManagerHandle<KM> {
 }
 
 impl<KM> OutputManagerHandle<KM>
-where KM: TransactionKeyManagerInterface
+where KM: LegacyTransactionKeyManagerInterface
 {
     pub fn new(
         handle: SenderService<OutputManagerRequest, Result<OutputManagerResponse<KM>, OutputManagerError>>,
@@ -407,10 +430,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::AddOutput((Box::new(output), spend_priority)))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::AddOutput({e})"))??
         {
             OutputManagerResponse::OutputAdded => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::AddOutput".to_string(),
+            )),
         }
     }
 
@@ -427,10 +453,13 @@ where KM: TransactionKeyManagerInterface
                 Box::new(output),
                 spend_priority,
             )))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::AddOutputWithTxId({e})"))??
         {
             OutputManagerResponse::OutputAdded => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::AddOutputWithTxId".to_string(),
+            )),
         }
     }
 
@@ -447,10 +476,13 @@ where KM: TransactionKeyManagerInterface
                 Box::new(output),
                 spend_priority,
             )))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::AddUnvalidatedOutput({e})"))??
         {
             OutputManagerResponse::OutputAdded => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::AddUnvalidatedOutput".to_string(),
+            )),
         }
     }
 
@@ -465,10 +497,13 @@ where KM: TransactionKeyManagerInterface
                 value,
                 features: Box::new(features),
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateOutputWithFeatures({e})"))??
         {
             OutputManagerResponse::CreateOutputWithFeatures { output } => Ok(*output),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateOutputWithFeatures".to_string(),
+            )),
         }
     }
 
@@ -479,17 +514,44 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::UpdateOutputMetadataSignature(Box::new(output)))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::UpdateOutputMetadataSignature({e})"))??
         {
             OutputManagerResponse::OutputMetadataSignatureUpdated => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::UpdateOutputMetadataSignature".to_string(),
+            )),
         }
     }
 
     pub async fn get_balance(&mut self) -> Result<Balance, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::GetBalance).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetBalance)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetBalance({e})"))??
+        {
             OutputManagerResponse::Balance(b) => Ok(b),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetBalance".to_string(),
+            )),
+        }
+    }
+
+    pub async fn count_outputs_in_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<CoinBucket>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetCoinBuckets { ranges })
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetCoinBuckets({e})"))??
+        {
+            OutputManagerResponse::GetCoinBuckets(b) => Ok(b),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetCoinBuckets".to_string(),
+            )),
         }
     }
 
@@ -497,17 +559,27 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::GetBalancePaymentId(payment_id))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetBalancePaymentId({e})"))??
         {
             OutputManagerResponse::Balance(b) => Ok(b),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetBalancePaymentId".to_string(),
+            )),
         }
     }
 
     pub async fn revalidate_all_outputs(&mut self) -> Result<u64, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::RevalidateTxos).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::RevalidateTxos)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::RevalidateTxos({e})"))??
+        {
             OutputManagerResponse::TxoValidationStarted(request_key) => Ok(request_key),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::RevalidateTxos".to_string(),
+            )),
         }
     }
 
@@ -532,10 +604,42 @@ where KM: TransactionKeyManagerInterface
                 script,
                 covenant,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetTransactionBuilder({e})"))??
         {
             OutputManagerResponse::TransactionBuilderToSend(stp) => Ok(*stp),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetTransactionBuilder".to_string(),
+            )),
+        }
+    }
+
+    pub async fn prepare_range_limited_coin_join_transaction_to_send(
+        &mut self,
+        tx_id: TxId,
+        utxo_selection: UtxoSelectionCriteria,
+        output_features: OutputFeatures,
+        fee: FeeType,
+        script: TariScript,
+        covenant: Covenant,
+    ) -> Result<TransactionBuilder<KM>, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetTransactionBuilderRangeLimitedCoinJoin {
+                tx_id,
+                selection_criteria: utxo_selection,
+                output_features: Box::new(output_features),
+                fee,
+                script,
+                covenant,
+            })
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetTransactionBuilder({e})"))??
+        {
+            OutputManagerResponse::TransactionBuilderToSend(stp) => Ok(*stp),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetTransactionBuilder".to_string(),
+            )),
         }
     }
 
@@ -547,10 +651,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::ScrapeWallet { tx_id, fee_per_gram })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ScrapeWallet({e})"))??
         {
             OutputManagerResponse::TransactionBuilderToSend(tx_builder) => Ok(*tx_builder),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ScrapeWallet".to_string(),
+            )),
         }
     }
 
@@ -563,7 +670,7 @@ where KM: TransactionKeyManagerInterface
         fee_per_gram: MicroMinotari,
         num_kernels: usize,
         num_outputs: usize,
-    ) -> Result<MicroMinotari, OutputManagerError> {
+    ) -> Result<(MicroMinotari, usize, bool), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::FeeEstimate {
@@ -573,62 +680,110 @@ where KM: TransactionKeyManagerInterface
                 num_kernels,
                 num_outputs,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::FeeEstimate({e})"))??
         {
-            OutputManagerResponse::FeeEstimate(fee) => Ok(fee),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            OutputManagerResponse::FeeEstimate(fee, number_selected, change) => Ok((fee, number_selected, change)),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::FeeEstimate".to_string(),
+            )),
         }
     }
 
     pub async fn confirm_pending_transaction(
         &mut self,
         tx_id: TxId,
+        tx_id_update: Option<TxId>,
         change_outputs: Option<Vec<WalletOutput>>,
     ) -> Result<(), OutputManagerError> {
         match self
             .handle
-            .call(OutputManagerRequest::ConfirmPendingTransaction(tx_id, change_outputs))
-            .await??
+            .call(OutputManagerRequest::ConfirmPendingTransaction {
+                tx_id,
+                tx_id_update,
+                change_outputs,
+            })
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ConfirmPendingTransaction({e})"))??
         {
             OutputManagerResponse::PendingTransactionConfirmed => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ConfirmPendingTransaction".to_string(),
+            )),
         }
     }
 
-    pub async fn cancel_transaction(&mut self, tx_id: TxId) -> Result<(), OutputManagerError> {
+    pub async fn cancel_pending_transaction(&mut self, tx_id: TxId) -> Result<(), OutputManagerError> {
         match self
             .handle
-            .call(OutputManagerRequest::CancelTransaction(tx_id))
-            .await??
+            .call(OutputManagerRequest::CancelPendingTransaction(tx_id))
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CancelPendingTransaction({e})"))??
         {
             OutputManagerResponse::TransactionCancelled => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CancelPendingTransaction".to_string(),
+            )),
         }
     }
 
-    pub async fn get_many_outputs(&mut self, outputs: Vec<FixedHash>) -> Result<Vec<WalletOutput>, OutputManagerError> {
+    pub async fn cancel_completed_transaction(&mut self, tx_id: TxId) -> Result<(), OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::CancelCompletedTransaction(tx_id))
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CancelCompletedTransaction({e})"))??
+        {
+            OutputManagerResponse::TransactionCancelled => Ok(()),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CancelCompletedTransaction".to_string(),
+            )),
+        }
+    }
+
+    pub async fn get_many_outputs(
+        &mut self,
+        outputs: Vec<FixedHash>,
+    ) -> Result<Vec<(DbWalletOutput, WalletOutput)>, OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::GetManyOutputs { outputs })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetManyOutputs({e})"))??
         {
             OutputManagerResponse::Outputs(s) => Ok(s),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetManyOutputs".to_string(),
+            )),
         }
     }
 
     pub async fn get_spent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::GetSpentOutputs).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetSpentOutputs)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetSpentOutputs({e})"))??
+        {
             OutputManagerResponse::SpentOutputs(s) => Ok(s),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetSpentOutputs".to_string(),
+            )),
         }
     }
 
     /// Sorted from lowest value to highest
     pub async fn get_unspent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::GetUnspentOutputs).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetUnspentOutputs)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetUnspentOutputs({e})"))??
+        {
             OutputManagerResponse::UnspentOutputs(s) => Ok(s),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetUnspentOutputs".to_string(),
+            )),
         }
     }
 
@@ -640,24 +795,41 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::GetOutputsByQuery(query))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetOutputsByQuery({e})"))??
         {
             OutputManagerResponse::UnspentOutputs(s) => Ok(s),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetOutputsByQuery".to_string(),
+            )),
         }
     }
 
     pub async fn get_invalid_outputs(&mut self) -> Result<Vec<WalletOutput>, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::GetInvalidOutputs).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::GetInvalidOutputs)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetInvalidOutputs({e})"))??
+        {
             OutputManagerResponse::InvalidOutputs(s) => Ok(s),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetInvalidOutputs".to_string(),
+            )),
         }
     }
 
     pub async fn validate_txos(&mut self) -> Result<u64, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::ValidateTxos).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::ValidateTxos)
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ValidateTxos({e})"))??
+        {
             OutputManagerResponse::TxoValidationStarted(request_key) => Ok(request_key),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ValidateTxos".to_string(),
+            )),
         }
     }
 
@@ -669,10 +841,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::PreviewCoinJoin((commitments, fee_per_gram)))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::PreviewCoinJoin({e})"))??
         {
             OutputManagerResponse::CoinPreview((expected_outputs, fee)) => Ok((expected_outputs, fee)),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::PreviewCoinJoin".to_string(),
+            )),
         }
     }
 
@@ -689,10 +864,13 @@ where KM: TransactionKeyManagerInterface
                 split_count,
                 fee_per_gram,
             )))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::PreviewCoinSplitEven({e})"))??
         {
             OutputManagerResponse::CoinPreview((expected_outputs, fee)) => Ok((expected_outputs, fee)),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::PreviewCoinSplitEven".to_string(),
+            )),
         }
     }
 
@@ -713,10 +891,13 @@ where KM: TransactionKeyManagerInterface
                 split_count,
                 fee_per_gram,
             )))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateCoinSplit({e})"))??
         {
             OutputManagerResponse::Transaction(ct) => Ok(ct),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateCoinSplit".to_string(),
+            )),
         }
     }
 
@@ -733,10 +914,13 @@ where KM: TransactionKeyManagerInterface
                 split_count,
                 fee_per_gram,
             )))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateCoinSplitEven({e})"))??
         {
             OutputManagerResponse::Transaction(ct) => Ok(ct),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateCoinSplitEven".to_string(),
+            )),
         }
     }
 
@@ -753,10 +937,13 @@ where KM: TransactionKeyManagerInterface
                 fee_per_gram,
                 payment_id,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateCoinJoin({e})"))??
         {
             OutputManagerResponse::Transaction(result) => Ok(result),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateCoinJoin".to_string(),
+            )),
         }
     }
 
@@ -768,10 +955,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::CreateHtlcRefundTransaction(output, fee_per_gram))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateHtlcRefundTransaction({e})"))??
         {
             OutputManagerResponse::ClaimHtlcTransaction(ct) => Ok(ct),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateHtlcRefundTransaction".to_string(),
+            )),
         }
     }
 
@@ -788,48 +978,65 @@ where KM: TransactionKeyManagerInterface
                 pre_image,
                 fee_per_gram,
             ))
-            .await??
-        {
+            .await
+            .inspect_err(
+                |e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreateClaimShaAtomicSwapTransaction({e})"),
+            )?? {
             OutputManagerResponse::ClaimHtlcTransaction(ct) => Ok(ct),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreateClaimShaAtomicSwapTransaction".to_string(),
+            )),
         }
     }
 
     pub async fn scan_for_recoverable_outputs(
         &mut self,
-        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+        outputs: Vec<TransactionOutput>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::ScanForRecoverableOutputs(outputs))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ScanForRecoverableOutputs({e})"))??
         {
             OutputManagerResponse::RewoundOutputs(outputs) => Ok(outputs),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ScanForRecoverableOutputs".to_string(),
+            )),
         }
     }
 
     pub async fn scan_outputs_for_one_sided_payments(
         &mut self,
-        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+        outputs: Vec<TransactionOutput>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
-        match self.handle.call(OutputManagerRequest::ScanOutputs(outputs)).await?? {
+        match self
+            .handle
+            .call(OutputManagerRequest::ScanOutputs(outputs))
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ScanOutputs({e})"))??
+        {
             OutputManagerResponse::ScanOutputs(outputs) => Ok(outputs),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ScanOutputs".to_string(),
+            )),
         }
     }
 
     pub async fn scan_outputs_for_multisig(
         &mut self,
-        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+        outputs: Vec<TransactionOutput>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::ScanOutputsForMultisig(outputs))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ScanOutputsForMultisig({e})"))??
         {
             OutputManagerResponse::ScanOutputs(outputs) => Ok(outputs),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ScanOutputsForMultisig".to_string(),
+            )),
         }
     }
 
@@ -837,17 +1044,19 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::AddKnownOneSidedPaymentScript(script))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::AddKnownOneSidedPaymentScript({e})"))??
         {
             OutputManagerResponse::AddKnownOneSidedPaymentScript => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::AddKnownOneSidedPaymentScript".to_string(),
+            )),
         }
     }
 
     #[allow(clippy::mutable_key_type)]
     pub async fn encumber_aggregate_utxo(
         &mut self,
-        tx_id: TxId,
         fee_per_gram: MicroMinotari,
         expected_commitment: CompressedCommitment,
         script_input_shares: HashMap<CompressedPublicKey, CompressedCheckSigSchnorrSignature>,
@@ -861,6 +1070,7 @@ where KM: TransactionKeyManagerInterface
         payment_id: MemoField,
     ) -> Result<
         (
+            TxId,
             Transaction,
             MicroMinotari,
             MicroMinotari,
@@ -874,7 +1084,6 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::EncumberAggregateUtxo {
-                tx_id,
                 fee_per_gram,
                 expected_commitment,
                 script_input_shares,
@@ -887,60 +1096,64 @@ where KM: TransactionKeyManagerInterface
                 use_output,
                 payment_id,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::EncumberAggregateUtxo({e})"))??
         {
-            OutputManagerResponse::EncumberAggregateUtxo(values) => {
-                let (
-                    transaction,
-                    amount,
-                    fee,
-                    total_script_key,
-                    total_metadata_ephemeral_public_key,
-                    total_script_nonce,
-                    shared_secret,
-                ) = *values;
-                Ok((
-                    transaction,
-                    amount,
-                    fee,
-                    total_script_key,
-                    total_metadata_ephemeral_public_key,
-                    total_script_nonce,
-                    shared_secret,
-                ))
-            },
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            OutputManagerResponse::EncumberAggregateUtxo {
+                tx_id,
+                transaction,
+                amount,
+                fee,
+                total_script_public_key,
+                total_metadata_ephemeral_public_key,
+                total_script_nonce,
+                shared_secret_public_key,
+            } => Ok((
+                tx_id,
+                *transaction,
+                amount,
+                fee,
+                *total_script_public_key,
+                *total_metadata_ephemeral_public_key,
+                *total_script_nonce,
+                *shared_secret_public_key,
+            )),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::EncumberAggregateUtxo".to_string(),
+            )),
         }
     }
 
     pub async fn spend_backup_pre_mine_utxo(
         &mut self,
-        tx_id: TxId,
         fee_per_gram: MicroMinotari,
         output_hash: HashOutput,
         expected_commitment: CompressedCommitment,
         recipient_address: TariAddress,
-    ) -> Result<(Transaction, MicroMinotari, MicroMinotari), OutputManagerError> {
+    ) -> Result<(TxId, Transaction, MicroMinotari, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::SpendBackupPreMineUtxo {
-                tx_id,
                 fee_per_gram,
                 output_hash,
                 expected_commitment,
                 recipient_address,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::SpendBackupPreMineUtxo({e})"))??
         {
-            OutputManagerResponse::SpendBackupPreMineUtxo((transaction, amount, fee)) => Ok((transaction, amount, fee)),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            OutputManagerResponse::SpendBackupPreMineUtxo((tx_id, transaction, amount, fee)) => {
+                Ok((tx_id, transaction, amount, fee))
+            },
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::SpendBackupPreMineUtxo".to_string(),
+            )),
         }
     }
 
     #[allow(clippy::too_many_lines)]
     pub async fn create_pay_to_self_transaction(
         &mut self,
-        tx_id: TxId,
         amount: MicroMinotari,
         utxo_selection: UtxoSelectionCriteria,
         output_features: OutputFeatures,
@@ -948,11 +1161,10 @@ where KM: TransactionKeyManagerInterface
         lock_height: Option<u64>,
         payment_id: MemoField,
         minimum_value_promise: MicroMinotari,
-    ) -> Result<(MicroMinotari, Transaction), OutputManagerError> {
+    ) -> Result<(MicroMinotari, Transaction, TxId), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreatePayToSelfTransaction {
-                tx_id,
                 amount,
                 selection_criteria: utxo_selection,
                 output_features: Box::new(output_features),
@@ -961,10 +1173,13 @@ where KM: TransactionKeyManagerInterface
                 payment_id,
                 minimum_value_promise,
             })
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::CreatePayToSelfTransaction({e})"))??
         {
             OutputManagerResponse::PayToSelfTransaction(outputs) => Ok(outputs),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::CreatePayToSelfTransaction".to_string(),
+            )),
         }
     }
 
@@ -975,10 +1190,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::ReinstateCancelledInboundTx(tx_id))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ReinstateCancelledInboundTx({e})"))??
         {
             OutputManagerResponse::ReinstatedCancelledInboundTx => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ReinstateCancelledInboundTx".to_string(),
+            )),
         }
     }
 
@@ -986,10 +1204,13 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::GetOutputInfoByTxId(tx_id))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::GetOutputInfoByTxId({e})"))??
         {
             OutputManagerResponse::OutputInfoByTxId(output_info_by_tx_id) => Ok(output_info_by_tx_id),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::GetOutputInfoByTxId".to_string(),
+            )),
         }
     }
 
@@ -1000,33 +1221,27 @@ where KM: TransactionKeyManagerInterface
         match self
             .handle
             .call(OutputManagerRequest::FetchUnspentOutputs(hashes))
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::FetchUnspentOutputs({e})"))??
         {
             OutputManagerResponse::FetchUnspentOutputs(outputs) => Ok(outputs),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::FetchUnspentOutputs".to_string(),
+            )),
         }
-    }
-
-    pub async fn confirm_encumberance(
-        &mut self,
-        tx_id: TxId,
-        change_outputs: Vec<WalletOutput>,
-    ) -> Result<(), OutputManagerError> {
-        self.handle
-            .call(OutputManagerRequest::ConfirmEncumberance(tx_id, change_outputs))
-            .await??;
-
-        Ok(())
     }
 
     pub async fn clear_short_term_encumberances(&mut self) -> Result<(), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::ClearShortTermEncumberances)
-            .await??
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "OutputManagerRequest::ClearShortTermEncumberances({e})"))??
         {
             OutputManagerResponse::ClearShortTermEncumberances => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
+            _ => Err(OutputManagerError::UnexpectedApiResponse(
+                "OutputManagerRequest::ClearShortTermEncumberances".to_string(),
+            )),
         }
     }
 }

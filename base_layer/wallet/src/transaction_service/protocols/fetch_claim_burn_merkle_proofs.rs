@@ -4,7 +4,7 @@
 use log::*;
 use minotari_node_wallet_client::BaseNodeWalletClient;
 use tari_common_types::{burn_proof::EncodedMerkleProof, types::FixedHash};
-use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
+use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
 use tari_utilities::ByteArray;
 
 use crate::{
@@ -22,7 +22,7 @@ pub async fn execute<TBackend, KM, TConnectivity>(
     confirmed_burns: Vec<FixedHash>,
 ) where
     TBackend: TransactionBackend + 'static,
-    KM: TransactionKeyManagerInterface,
+    KM: LegacyTransactionKeyManagerInterface,
     TConnectivity: WalletConnectivityInterface,
 {
     debug!(
@@ -44,7 +44,7 @@ async fn execute_inner<TBackend, KM, TConnectivity>(
 ) -> anyhow::Result<()>
 where
     TBackend: TransactionBackend + 'static,
-    KM: TransactionKeyManagerInterface,
+    KM: LegacyTransactionKeyManagerInterface,
     TConnectivity: WalletConnectivityInterface,
 {
     let timer = std::time::Instant::now();
@@ -72,16 +72,16 @@ where
     }
 
     for output in outputs {
-        if !output.features().output_type.is_burn() {
+        if !output.1.features().output_type.is_burn() {
             warn!(
                 target: LOG_TARGET,
                 "NEVER HAPPEN: Output with key id {} is not a burn output, skipping",
-                output.commitment_mask_key_id()
+                output.1.commitment_mask_key_id()
             );
             continue;
         }
 
-        let output_hash = output.output_hash();
+        let output_hash = output.1.output_hash();
         let Some(burn) = db.fetch_burn_proof(&output_hash)? else {
             // OK - UTXO not burnt with claim key, so no burn proof
             debug!(

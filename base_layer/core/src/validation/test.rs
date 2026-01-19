@@ -32,7 +32,7 @@ use tari_test_utils::unpack_enum;
 use tari_transaction_components::{
     consensus::ConsensusConstantsBuilder,
     crypto_factories::CryptoFactories,
-    key_manager::TxoStage,
+    key_manager::{KeyManager, TxoStage},
     tari_amount::{uT, MicroMinotari},
     test_helpers::{create_random_signature_from_secret_key, create_utxo},
     transaction_components::{
@@ -45,7 +45,6 @@ use tari_transaction_components::{
     },
     tx,
 };
-use tari_transaction_key_manager::create_memory_db_key_manager;
 use tari_utilities::ByteArray;
 
 use crate::{
@@ -67,7 +66,6 @@ mod header_validators {
         test_helpers::blockchain::{create_main_chain, create_new_blockchain},
         validation::{header::HeaderFullValidator, HeaderChainLinkedValidator},
     };
-
     #[test]
     fn header_iter_empty_and_invalid_height() {
         let consensus_manager = BaseNodeConsensusManager::builder(Network::LocalNet).build().unwrap();
@@ -148,7 +146,7 @@ mod header_validators {
         let consensus_manager = BaseNodeConsensusManagerBuilder::new(Network::LocalNet).build().unwrap();
         let db = create_new_blockchain();
 
-        let (_, blocks) = create_main_chain(&db, block_specs!(["1->GB"], ["2->1"], ["3->2"])).await;
+        let (_, blocks) = create_main_chain(&db, block_specs!(["1->GB"], ["2->1"], ["3->2"]));
         let last_block = blocks.get("3").unwrap();
 
         let candidate_header = BlockHeader::from_previous(last_block.header());
@@ -196,7 +194,7 @@ async fn chain_balance_validation() {
         .unwrap();
     let genesis = consensus_manager.get_genesis_block();
     let pre_mine_value = 5000 * uT;
-    let key_manager = create_memory_db_key_manager().await.unwrap();
+    let key_manager = KeyManager::new_random().unwrap();
     let (pre_mine_utxo, pre_mine_key_id, _) = create_utxo(
         pre_mine_value,
         &key_manager,
@@ -204,8 +202,7 @@ async fn chain_balance_validation() {
         &TariScript::default(),
         &Covenant::default(),
         MicroMinotari::zero(),
-    )
-    .await;
+    );
     let (pk, sig) = create_random_signature_from_secret_key(
         &key_manager,
         pre_mine_key_id,
@@ -213,8 +210,7 @@ async fn chain_balance_validation() {
         0,
         KernelFeatures::empty(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess = CompressedCommitment::from_public_key(pk.to_public_key().unwrap());
     let kernel =
         TransactionKernel::new_current_version(KernelFeatures::empty(), MicroMinotari::from(0), 0, excess, sig, None);
@@ -293,8 +289,7 @@ async fn chain_balance_validation() {
         &TariScript::default(),
         &Covenant::default(),
         MicroMinotari::zero(),
-    )
-    .await;
+    );
 
     let (pk, sig) = create_random_signature_from_secret_key(
         &key_manager,
@@ -303,8 +298,7 @@ async fn chain_balance_validation() {
         0,
         KernelFeatures::create_coinbase(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess = CompressedCommitment::from_compressed_key(pk);
     let kernel = KernelBuilder::new()
         .with_signature(sig)
@@ -360,8 +354,7 @@ async fn chain_balance_validation() {
         &TariScript::default(),
         &Covenant::default(),
         MicroMinotari::zero(),
-    )
-    .await;
+    );
     let (pk, sig) = create_random_signature_from_secret_key(
         &key_manager,
         spending_key_id,
@@ -369,8 +362,7 @@ async fn chain_balance_validation() {
         0,
         KernelFeatures::create_coinbase(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess = CompressedCommitment::from_compressed_key(pk);
     let kernel = KernelBuilder::new()
         .with_signature(sig)
@@ -424,7 +416,7 @@ async fn chain_balance_validation_burned() {
         .unwrap();
     let genesis = consensus_manager.get_genesis_block();
     let pre_mine_value = 5000 * uT;
-    let key_manager = create_memory_db_key_manager().await.unwrap();
+    let key_manager = KeyManager::new_random().unwrap();
     let (pre_mine_utxo, pre_mine_key_id, _) = create_utxo(
         pre_mine_value,
         &key_manager,
@@ -432,8 +424,7 @@ async fn chain_balance_validation_burned() {
         &TariScript::default(),
         &Covenant::default(),
         MicroMinotari::zero(),
-    )
-    .await;
+    );
     let (pk, sig) = create_random_signature_from_secret_key(
         &key_manager,
         pre_mine_key_id,
@@ -441,8 +432,7 @@ async fn chain_balance_validation_burned() {
         0,
         KernelFeatures::empty(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess = CompressedCommitment::from_compressed_key(pk);
     let kernel =
         TransactionKernel::new_current_version(KernelFeatures::empty(), MicroMinotari::from(0), 0, excess, sig, None);
@@ -522,8 +512,7 @@ async fn chain_balance_validation_burned() {
         &TariScript::default(),
         &Covenant::default(),
         coinbase_value,
-    )
-    .await;
+    );
     let (pk, sig) = create_random_signature_from_secret_key(
         &key_manager,
         coinbase_key_id,
@@ -531,8 +520,7 @@ async fn chain_balance_validation_burned() {
         0,
         KernelFeatures::create_coinbase(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess = CompressedCommitment::from_compressed_key(pk);
     let kernel = KernelBuilder::new()
         .with_signature(sig)
@@ -548,8 +536,7 @@ async fn chain_balance_validation_burned() {
         &TariScript::default(),
         &Covenant::default(),
         MicroMinotari::zero(),
-    )
-    .await;
+    );
 
     let (pk2, sig2) = create_random_signature_from_secret_key(
         &key_manager,
@@ -558,8 +545,7 @@ async fn chain_balance_validation_burned() {
         0,
         KernelFeatures::create_burn(),
         TxoStage::Output,
-    )
-    .await;
+    );
     let excess2 = CompressedCommitment::from_compressed_key(pk2);
     let kernel2 = KernelBuilder::new()
         .with_signature(sig2)
@@ -624,7 +610,7 @@ mod transaction_validator {
 
     #[tokio::test]
     async fn it_rejects_coinbase_outputs() {
-        let key_manager = create_memory_db_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let consensus_manager = BaseNodeConsensusManagerBuilder::new(Network::LocalNet).build().unwrap();
         let db = create_store_with_consensus(consensus_manager.clone());
         let factories = CryptoFactories::default();
@@ -647,7 +633,7 @@ mod transaction_validator {
 
     #[tokio::test]
     async fn coinbase_extra_must_be_empty() {
-        let key_manager = create_memory_db_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let consensus_manager = BaseNodeConsensusManagerBuilder::new(Network::LocalNet).build().unwrap();
         let db = create_store_with_consensus(consensus_manager.clone());
         let factories = CryptoFactories::default();

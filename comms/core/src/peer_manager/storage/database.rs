@@ -26,6 +26,7 @@ use bytes::Bytes;
 use chrono::{NaiveDateTime, TimeDelta};
 use diesel::{
     self,
+    dsl::not,
     prelude::*,
     r2d2::{ConnectionManager, PooledConnection},
     ExpressionMethods,
@@ -542,7 +543,7 @@ impl PeerDatabaseSql {
             match self.get_peer_by_node_id_inner(node_id, conn)? {
                 Some(mut peer) => {
                     // Update existing
-                    peer.addresses.update_addresses(addresses, source);
+                    peer.addresses.add_or_update_addresses(addresses, source);
                     peer.features = *peer_features;
                     let update_peer_sql = PeerDatabaseSql::update_peer_sql(peer.clone())?;
                     self.update_peer_inner(update_peer_sql, conn)?;
@@ -733,6 +734,20 @@ impl PeerDatabaseSql {
             .first::<i64>(conn)?;
 
         // Update the associated multi-addresses
+        // - Remove all stale addresses that are not in the update list
+        let final_addr_list: Vec<String> = update_peer_sql
+            .addresses
+            .iter()
+            .filter_map(|a| a.address.clone())
+            .collect();
+
+        diesel::delete(
+            multi_addresses::table
+                .filter(multi_addresses::peer_id.eq(peer_id))
+                .filter(not(multi_addresses::address.eq_any(&final_addr_list))),
+        )
+        .execute(conn)?;
+        // - Update existing addresses and add new ones
         for address_update in update_peer_sql.addresses {
             let updated = diesel::update(
                 multi_addresses::table
@@ -1173,13 +1188,21 @@ impl PeerDatabaseSql {
     }
 
     /// Return available dial candidates that are communication nodes, not banned, not deleted,
-    /// and not in the excluded node IDs list
+    /// optionally not failed, optionally at random, and not in the excluded node IDs list.
     pub fn get_available_dial_candidates(
         &self,
         exclude_node_ids: &[NodeId],
-        limit: Option<usize>,
+        n: Option<usize>,
         transport_protocols: &[TransportProtocol],
+        exclude_failed: bool,
+        randomize: bool,
     ) -> Result<Vec<Peer>, StorageError> {
+        if let Some(n) = n {
+            if n == 0 {
+                warn!(target: LOG_TARGET, "'0' requested for 'get_available_dial_candidates'");
+                return Ok(Vec::new());
+            }
+        }
         let mut conn = self.connection.get_pooled_connection()?;
         let addr_filter_sql = Self::build_addr_filter_sql(transport_protocols);
 
@@ -1196,7 +1219,17 @@ impl PeerDatabaseSql {
                 "features & {} != 0",
                 PeerFeatures::COMMUNICATION_NODE.to_i32()
             )))
+            .select(peers::node_id)
+            .distinct()
             .into_boxed();
+
+        if exclude_failed {
+            query = query.filter(multi_addresses::last_failed_reason.is_null());
+        }
+
+        if randomize {
+            query = query.order_by(diesel::dsl::sql::<diesel::sql_types::Integer>("RANDOM()"));
+        }
 
         if let Some(filter_sql) = addr_filter_sql {
             query = query.filter(diesel::dsl::sql::<diesel::sql_types::Bool>(&filter_sql));
@@ -1209,14 +1242,22 @@ impl PeerDatabaseSql {
         }
 
         // Apply limit if specified
-        if let Some(limit) = limit {
+        if let Some(limit) = n {
             // Safely convert usize to i64, using try_into with fallback to i64::MAX
             let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
             query = query.limit(limit_i64);
         }
 
-        let results = query.load::<(NewPeerSql, NewMultiaddrWithStatsSql)>(&mut conn)?;
-        PeerDatabaseSql::peers_from_join_query(results)
+        let node_ids = query.load::<String>(&mut conn)?;
+
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A peer can have more than one valid address, so that if the join-limit-load query is not returning node IDs,
+        // it will give the requested number of unique peer-adress combinations, which will result in less peer records
+        // than what was required. For that reason, we need a 2nd query to fetch the peers by node IDs.
+        self.get_peers_by_node_ids_str(&node_ids, false, &mut conn)
     }
 
     /// Get a peer by its node ID
@@ -1416,6 +1457,7 @@ impl PeerDatabaseSql {
         features: PeerFeatures,
     ) -> Result<Vec<NodeId>, StorageError> {
         if n == 0 {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_good_standing_peer_node_ids'");
             return Ok(Vec::new());
         }
 
@@ -1432,6 +1474,10 @@ impl PeerDatabaseSql {
         n: usize,
         features: PeerFeatures,
     ) -> Result<Vec<Peer>, StorageError> {
+        if n == 0 {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_good_standing_peers'");
+            return Ok(Vec::new());
+        }
         let mut conn = self.connection.get_pooled_connection()?;
 
         conn.transaction::<_, StorageError, _>(|conn| {
@@ -1464,6 +1510,12 @@ impl PeerDatabaseSql {
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
         transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<String>, StorageError> {
+        if let Some(n) = n {
+            if n == 0 {
+                warn!(target: LOG_TARGET, "'0' requested for 'get_active_peer_node_ids'");
+                return Ok(Vec::new());
+            }
+        }
         let excluded_node_ids_hex = excluded_peers.iter().map(|id| id.to_hex()).collect::<Vec<_>>();
         let addr_filter_sql = Self::build_addr_filter_sql(transport_protocols);
 
@@ -1556,6 +1608,7 @@ impl PeerDatabaseSql {
         transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, StorageError> {
         if n == 0 {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_active_peers'");
             return Ok(Vec::new());
         }
 
@@ -1612,6 +1665,7 @@ impl PeerDatabaseSql {
         transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, StorageError> {
         if n == 0 {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_n_random_active_peers'");
             return Ok(Vec::new());
         }
 
@@ -1646,6 +1700,7 @@ impl PeerDatabaseSql {
         transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<Peer>, StorageError> {
         if n == 0 {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_n_random_peers'");
             return Ok(Vec::new());
         }
 
@@ -2095,10 +2150,10 @@ mod tests {
         new_peer.metadata.insert(1, vec![1, 2, 3]);
         new_peer.metadata.insert(2, vec![4, 5, 6]);
         // - add another multi-address
-        let new_addr_str = "/ip4/127.0.0.1/udt/sctp/5678";
+        let new_addr: Multiaddr = "/ip4/127.0.0.1/udt/sctp/5678".parse().unwrap();
         new_peer
             .addresses
-            .add_address(&new_addr_str.parse().unwrap(), &PeerAddressSource::Config);
+            .add_or_update_addresses(std::slice::from_ref(&new_addr), &PeerAddressSource::Config);
         // - new stats for the first multi-address
         let mut address_to_update = new_peer.addresses.addresses().first().unwrap().clone();
         address_to_update.update_latency(Duration::from_millis(123));
@@ -2866,7 +2921,8 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         for address in &duplicate_address {
-            peer.addresses.add_address(address, &PeerAddressSource::Config)
+            peer.addresses
+                .add_or_update_addresses(std::slice::from_ref(address), &PeerAddressSource::Config)
         }
         peers_db.add_or_update_peer(peer.clone()).unwrap();
 
@@ -3132,7 +3188,7 @@ mod tests {
         )
         .unwrap();
 
-        // Create a new peer and add a failure reason
+        // Create a new peer and remove all addresses
         let mut peer = create_test_peer(false, PeerFeatures::COMMUNICATION_NODE);
         peer.addresses = MultiaddressesWithStats::new(vec![]);
 
@@ -3194,5 +3250,120 @@ mod tests {
             .load::<NewMultiaddrWithStatsSql>(&mut conn)
             .unwrap();
         assert!(addresses_query.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_get_available_dial_candidates() {
+        let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
+        let peers_db = PeerDatabaseSql::new(
+            db_connection,
+            &create_test_peer(false, PeerFeatures::COMMUNICATION_NODE),
+        )
+        .unwrap();
+        let transport_protocols = TransportProtocol::get_all();
+
+        // Create new node peers each with one known good address
+        let mut node_peers = Vec::with_capacity(100);
+        for i in 0..100 {
+            let mut peer = create_test_peer(false, PeerFeatures::COMMUNICATION_NODE);
+            if i % 4 == 0 {
+                peer.flags = PeerFlags::SEED;
+            }
+            node_peers.push(peer.clone());
+            peers_db.add_or_update_peer(peer).unwrap();
+        }
+
+        // Set 'deleted_at' [1]
+        peers_db.soft_delete_peer(&node_peers[1].node_id).unwrap();
+
+        // Set 'banned_until' [5]
+        peers_db
+            .set_banned(
+                &node_peers[5].node_id,
+                Duration::from_secs(12345),
+                "Misbehaviour is punished".to_string(),
+            )
+            .unwrap();
+
+        // Set 'last_failed_reason' [7]
+        for address in node_peers[7].addresses.addresses() {
+            peers_db
+                .set_last_failed_reason(
+                    &node_peers[7].node_id,
+                    "not playing with".to_string(),
+                    address.address(),
+                )
+                .unwrap();
+        }
+
+        // Pre-amble
+        let all_peers = peers_db.get_all_peers(None).unwrap();
+        assert_eq!(all_peers.len(), 100);
+        let seed_peers = peers_db
+            .get_seed_peers()
+            .unwrap()
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(seed_peers.len(), 25);
+
+        // Test case 1: Only non-failed peers, no exclusions
+        let dial_candidates = peers_db
+            .get_available_dial_candidates(&[], None, &transport_protocols, true, false)
+            .unwrap();
+        assert_eq!(dial_candidates.len(), 97);
+        // Verify deleted, banned and failed are not returned
+        assert!(!dial_candidates.iter().any(|n| n.node_id == node_peers[1].node_id ||
+            n.node_id == node_peers[5].node_id ||
+            n.node_id == node_peers[7].node_id));
+
+        // Test case 2: Only non-failed peers, with exclusions
+        let dial_candidates = peers_db
+            .get_available_dial_candidates(&seed_peers, None, &transport_protocols, true, false)
+            .unwrap();
+        assert_eq!(dial_candidates.len(), 72);
+        // Verify deleted, banned and failed are not returned
+        assert!(!dial_candidates.iter().any(|n| n.node_id == node_peers[1].node_id ||
+            n.node_id == node_peers[5].node_id ||
+            n.node_id == node_peers[7].node_id));
+        // Verify excluded are not returned
+        for seed_node_id in &seed_peers {
+            assert!(!dial_candidates.iter().any(|n| n.node_id == *seed_node_id));
+        }
+
+        // Test case 3: Verify randomness
+        let limit = 17;
+        let mut dial_candidates_1 = peers_db
+            .get_available_dial_candidates(&[], Some(limit), &transport_protocols, true, false)
+            .unwrap()
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(dial_candidates_1.len(), limit);
+        dial_candidates_1.sort();
+
+        let mut dial_candidates_2 = peers_db
+            .get_available_dial_candidates(&[], Some(limit), &transport_protocols, true, false)
+            .unwrap()
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(dial_candidates_2.len(), limit);
+        dial_candidates_2.sort();
+
+        let mut dial_candidates_3 = peers_db
+            .get_available_dial_candidates(&[], Some(limit), &transport_protocols, true, true)
+            .unwrap()
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(dial_candidates_3.len(), limit);
+        dial_candidates_3.sort();
+
+        // - With no randomness, results should be the same
+        assert_eq!(dial_candidates_1, dial_candidates_2);
+        // - With randomness, results should differ
+        assert_ne!(dial_candidates_1, dial_candidates_3);
     }
 }

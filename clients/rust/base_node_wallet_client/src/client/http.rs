@@ -17,7 +17,8 @@ use tari_transaction_components::{
             GenerateKernelMerkleProofResponse,
             GetUtxosDeletedInfoResponse,
             GetUtxosMinedInfoResponse,
-            SyncUtxosByBlockResponse,
+            SyncUtxosByBlockResponseV0,
+            SyncUtxosByBlockResponseV1,
             TipInfoResponse,
             TxQueryResponse,
             TxSubmissionResponse,
@@ -45,10 +46,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(local_api_address: Url, default_seed_address: Url) -> Self {
+        let http_client_builder = reqwest::Client::builder();
+        let http_client = http_client_builder
+            .http2_initial_stream_window_size(4 * 1024 * 1024)
+            .build()
+            .expect("http2 init");
         Self {
             local_api_address,
             default_seed_address,
-            http_client: reqwest::Client::new(),
+            http_client,
             last_latency: RwLock::new(None),
             use_local_api_address: RwLock::new(None),
         }
@@ -284,7 +290,7 @@ impl BaseNodeWalletClient for Client {
         &self,
         start_header_hash: Vec<u8>,
         shutdown: ShutdownSignal,
-    ) -> Result<mpsc::Receiver<Result<SyncUtxosByBlockResponse, anyhow::Error>>, anyhow::Error> {
+    ) -> Result<mpsc::Receiver<Result<SyncUtxosByBlockResponseV0, anyhow::Error>>, anyhow::Error> {
         debug!(
             target: LOG_TARGET,
             "Starting UTXO sync from {}",
@@ -295,7 +301,7 @@ impl BaseNodeWalletClient for Client {
         let start_header_hash_hex = start_header_hash.to_hex();
         let client = self.http_client.clone();
 
-        let limit = 10;
+        let limit = 25;
         tokio::spawn(async move {
             let mut page = 0;
             let mut has_next_page = true;
@@ -305,15 +311,15 @@ impl BaseNodeWalletClient for Client {
                     break;
                 }
                 target_url.set_query(Some(
-                    format!("start_header_hash={start_header_hash_hex}&limit={limit}&page={page}").as_str(),
+                    format!("start_header_hash={start_header_hash_hex}&limit={limit}&page={page}&version=1").as_str(),
                 ));
                 debug!(target: LOG_TARGET, "Requesting UTXOs by block from Base Node wallet service at {target_url}");
                 match client.get(target_url.clone()).send().await {
-                    Ok(response) => match response.json::<SyncUtxosByBlockResponse>().await {
+                    Ok(response) => match response.json::<SyncUtxosByBlockResponseV1>().await {
                         Ok(response) => {
                             has_next_page = response.has_next_page;
                             debug!(target: LOG_TARGET, "Received UTXOs for page {page}");
-                            if let Err(send_error) = resp_tx.send(Ok(response)).await {
+                            if let Err(send_error) = resp_tx.send(Ok(response.into())).await {
                                 error!(target: LOG_TARGET, "Error sending utxo response: {send_error:?}");
                             }
                         },
@@ -375,9 +381,9 @@ impl BaseNodeWalletClient for Client {
         );
 
         let res_text = res.text().await?;
-        debug!(target: LOG_TARGET, "Response text: {res_text}");
         let json = serde_json::from_str::<GetUtxosMinedInfoResponse>(&res_text)
             .map_err(|e| anyhow!("Failed to parse response JSON: {e}"))?;
+        debug!(target: LOG_TARGET, "Response json: {json}");
         Ok(json)
     }
 
@@ -455,6 +461,14 @@ impl BaseNodeWalletClient for Client {
                 "transaction": transaction,
             }
         });
+
+        let body_bytes = serde_json::to_vec(&request_body)?;
+        let len = body_bytes.len();
+        debug!(
+            target: LOG_TARGET,
+            "submit_transaction JSON body size: {}, bytes: ~{:.2} MiB, inputs: {}, outputs: {}",
+            len, len as f64 / (1024.0 * 1024.0), transaction.body.inputs().len(), transaction.body.outputs().len()
+        );
 
         let res = self.http_client.post(target_url).json(&request_body).send().await?;
         if res.status().is_client_error() || res.status().is_server_error() {

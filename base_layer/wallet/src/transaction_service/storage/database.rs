@@ -119,6 +119,12 @@ pub trait TransactionBackend: Send + Sync + Clone {
         tx_id: TxId,
         cancelled: bool,
     ) -> Result<(), TransactionStorageError>;
+    /// Set cancellation on Completed transaction, this will update the transaction status
+    fn set_completed_transaction_cancellation_status(
+        &self,
+        tx_id: TxId,
+        cancelled: bool,
+    ) -> Result<(), TransactionStorageError>;
     /// Search all pending transaction for the provided tx_id and if it exists return the public key of the counterparty
     fn get_pending_transaction_counterparty_address_by_tx_id(
         &self,
@@ -199,6 +205,8 @@ pub trait TransactionBackend: Send + Sync + Clone {
     ) -> Result<(), TransactionStorageError>;
 
     fn fetch_burn_proof(&self, output_hash: &FixedHash) -> Result<Option<DbBurnProof>, TransactionStorageError>;
+
+    fn process_reorg(&self, reorg_height: u64) -> Result<(), TransactionStorageError>;
 }
 
 #[derive(Clone, PartialEq)]
@@ -565,7 +573,7 @@ where T: TransactionBackend + 'static
         let t = match self.db.fetch(&DbKey::CompletedTransaction(tx_id)) {
             Ok(None) => Err(TransactionStorageError::ValueNotFound(key)),
             Ok(Some(DbValue::CompletedTransaction(pt))) => {
-                if pt.status == LegacyTransactionStatus::Completed && pt.status == LegacyTransactionStatus::Broadcast {
+                if pt.status == LegacyTransactionStatus::Completed || pt.status == LegacyTransactionStatus::Broadcast {
                     Ok(pt)
                 } else {
                     Err(TransactionStorageError::ValueNotFound(key))
@@ -922,6 +930,10 @@ where T: TransactionBackend + 'static
 
     pub fn fetch_burn_proof(&self, output_hash: &FixedHash) -> Result<Option<DbBurnProof>, TransactionStorageError> {
         self.db.fetch_burn_proof(output_hash)
+    }
+
+    pub fn process_reorg(&self, reorg_height: u64) -> Result<(), TransactionStorageError> {
+        self.db.process_reorg(reorg_height)
     }
 }
 

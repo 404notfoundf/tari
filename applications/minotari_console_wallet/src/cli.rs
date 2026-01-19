@@ -198,6 +198,7 @@ pub enum CliCommands {
 
     SignMessage(SignMessageArgs),
     SignScriptMessage(SignScriptMessageArgs),
+    RescanWallet(RescanWalletArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -539,7 +540,7 @@ impl From<HexError> for CliParseError {
 pub struct FinaliseShaAtomicSwapArgs {
     #[clap(short, long, parse(try_from_str = parse_hex), required=true )]
     pub output_hash: Vec<Vec<u8>>,
-    #[clap(short, long)]
+    #[clap(long)]
     pub pre_image: UniPublicKey,
     #[clap(short, long, default_value = "Claimed HTLC atomic swap")]
     pub payment_id: String,
@@ -634,4 +635,10 @@ pub struct CreateMultisigUtxoArgs {
     #[clap(long)]
     // The recipient address of the multisig UTXO
     pub recipient_address: TariAddress,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct RescanWalletArgs {
+    #[clap(short, long, default_value = "0")]
+    pub from_height: u64,
 }

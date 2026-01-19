@@ -20,11 +20,13 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::fmt::Display;
+
 use chrono::NaiveDateTime;
 use log::*;
 use tari_common_types::{tari_address::TariAddress, types::HashOutput};
 use tari_shutdown::ShutdownSignal;
-use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
+use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
 use tokio::{sync::broadcast, task};
 
 use crate::{
@@ -63,7 +65,7 @@ impl<TBackend, TKeyManagerInterface: Clone, TWalletClientFactory>
     UtxoScannerService<TBackend, TKeyManagerInterface, TWalletClientFactory>
 where
     TBackend: WalletBackend + 'static,
-    TKeyManagerInterface: TransactionKeyManagerInterface + Clone + Send + Sync + 'static,
+    TKeyManagerInterface: LegacyTransactionKeyManagerInterface + Clone + Send + Sync + 'static,
     TWalletClientFactory: HttpClientFactory + Clone + Send + Sync + 'static,
 {
     pub fn new(
@@ -179,4 +181,14 @@ pub struct ScannedBlock {
     pub header_hash: HashOutput,
     pub height: u64,
     pub timestamp: NaiveDateTime,
+}
+
+impl Display for ScannedBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ScannedBlock {{ height: {}, header_hash: {}, timestamp: {} }}",
+            self.height, self.header_hash, self.timestamp
+        )
+    }
 }

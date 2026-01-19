@@ -23,30 +23,25 @@
 use std::{str::FromStr, time::Instant};
 
 use log::*;
-use tari_common_types::{
-    transaction::TxId,
-    types::{FixedHash, PrivateKey},
-};
+use tari_common_types::types::{FixedHash, PrivateKey};
 use tari_crypto::keys::SecretKey;
 use tari_script::{inputs, script, ExecutionStack, Opcode, TariScript};
 use tari_transaction_components::{
-    key_manager::{TariKeyId, TransactionKeyManagerInterface},
+    key_manager::TariKeyId,
     transaction_components::{MemoField, OutputType, TransactionOutput, WalletOutput},
     MicroMinotari,
 };
-use tari_utilities::hex::Hex;
+use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
+use tari_utilities::{hex::Hex, ByteArray};
 
-use crate::{
-    output_manager_service::{
-        error::{OutputManagerError, OutputManagerStorageError},
-        handle::RecoveredOutput,
-        storage::{
-            database::{OutputManagerBackend, OutputManagerDatabase},
-            models::{DbWalletOutput, KnownOneSidedPaymentScript},
-            OutputSource,
-        },
+use crate::output_manager_service::{
+    error::{OutputManagerError, OutputManagerStorageError},
+    handle::RecoveredOutput,
+    storage::{
+        database::{OutputManagerBackend, OutputManagerDatabase},
+        models::{DbWalletOutput, KnownOneSidedPaymentScript},
+        OutputSource,
     },
-    transaction_service::{handle::TransactionServiceHandle, storage::models::CompletedTransaction},
 };
 
 const LOG_TARGET: &str = "wallet::output_manager_service::recovery";
@@ -54,24 +49,15 @@ const LOG_TARGET: &str = "wallet::output_manager_service::recovery";
 pub(crate) struct StandardUtxoRecoverer<TBackend: OutputManagerBackend + 'static, TKeyManagerInterface> {
     master_key_manager: TKeyManagerInterface,
     db: OutputManagerDatabase<TBackend>,
-    transaction_service_handle: TransactionServiceHandle,
 }
 
 impl<TBackend, TKeyManagerInterface> StandardUtxoRecoverer<TBackend, TKeyManagerInterface>
 where
     TBackend: OutputManagerBackend + 'static,
-    TKeyManagerInterface: TransactionKeyManagerInterface,
+    TKeyManagerInterface: LegacyTransactionKeyManagerInterface,
 {
-    pub fn new(
-        master_key_manager: TKeyManagerInterface,
-        db: OutputManagerDatabase<TBackend>,
-        transaction_service_handle: TransactionServiceHandle,
-    ) -> Self {
-        Self {
-            master_key_manager,
-            db,
-            transaction_service_handle,
-        }
+    pub fn new(master_key_manager: TKeyManagerInterface, db: OutputManagerDatabase<TBackend>) -> Self {
+        Self { master_key_manager, db }
     }
 
     /// Attempt to rewind all of the given transaction outputs into key_manager outputs. If they can be rewound then add
@@ -79,16 +65,18 @@ where
     #[allow(clippy::too_many_lines)]
     pub async fn scan_and_recover_outputs(
         &mut self,
-        outputs: Vec<(TransactionOutput, Option<TxId>)>,
+        outputs: Vec<TransactionOutput>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
         let start = Instant::now();
         let outputs_length = outputs.len();
 
-        let known_scripts = self.db.get_all_known_one_sided_payment_scripts()?;
+        let known_scripts = self
+            .db
+            .get_all_known_one_sided_payment_scripts(&self.master_key_manager)?;
 
-        let mut rewound_outputs: Vec<(WalletOutput, bool, FixedHash, Option<TxId>)> = Vec::new();
+        let mut rewound_outputs: Vec<(WalletOutput, bool, FixedHash)> = Vec::new();
         let push_pub_key_script = script!(PushPubKey(Box::default()))?;
-        for (output, tx_id) in outputs {
+        for output in outputs {
             let known_script_index = known_scripts.iter().position(|s| s.script == output.script);
             if output.script != script!(Nop)? &&
                 known_script_index.is_none() &&
@@ -97,17 +85,15 @@ where
                 continue;
             }
 
-            let (commitment_mask, committed_value, payment_id) = match self.attempt_output_recovery(&output).await? {
+            let (commitment_mask, committed_value, payment_id) = match self.attempt_output_recovery(&output)? {
                 Some(recovered) => recovered,
                 None => continue,
             };
-            let (input_data, script_key) = match self
-                .find_script_key(&output.script, &commitment_mask, known_script_index, &known_scripts)
-                .await?
-            {
-                Some((input_data, script_key)) => (input_data, script_key),
-                None => continue,
-            };
+            let (input_data, script_key) =
+                match self.find_script_key(&output.script, &commitment_mask, known_script_index, &known_scripts)? {
+                    Some((input_data, script_key)) => (input_data, script_key),
+                    None => continue,
+                };
 
             let hash = output.hash();
             let uo = WalletOutput::new_from_transaction_output(
@@ -119,7 +105,7 @@ where
                 script_key,
             );
 
-            rewound_outputs.push((uo, known_script_index.is_some(), hash, tx_id));
+            rewound_outputs.push((uo, known_script_index.is_some(), hash));
         }
 
         let rewind_time = start.elapsed();
@@ -130,8 +116,8 @@ where
             rewind_time.as_millis(),
         );
 
-        let mut rewound_outputs_with_tx_id: Vec<RecoveredOutput> = Vec::new();
-        for (output, has_known_script, hash, tx_id) in &mut rewound_outputs {
+        let mut recovered_outputs: Vec<RecoveredOutput> = Vec::new();
+        for (output, has_known_script, hash) in &mut rewound_outputs {
             let db_output = DbWalletOutput::from_wallet_output(
                 output.clone(),
                 None,
@@ -139,39 +125,13 @@ where
                 None,
                 None,
             );
-            let tx_id = match tx_id {
-                Some(id) => *id,
-                None => {
-                    let mut related_txs: Vec<CompletedTransaction> = Vec::new();
-                    if outputs_length < 6 {
-                        // This is very much a hacky fix to a hacky fix, but this call takes 140ms at min. This piece of
-                        // code is here as a hacky fix to attempt to find the tx if TU already imported it. This will be
-                        // low-volume so we can afford to do this. Scanning during recovery for higher output wallets,
-                        // this becomes a massive bottleneck.
-                        let source_address = db_output.payment_id.get_sender_address();
-                        let recipient_address = db_output.payment_id.get_recipient_address();
-                        if source_address.is_some() || recipient_address.is_some() {
-                            related_txs = self
-                                .transaction_service_handle
-                                .get_completed_transactions_by_addresses(source_address, recipient_address)
-                                .await
-                                .unwrap_or_default();
-                        }
-                    }
-                    let tx_id = related_txs.iter().find_map(|tx| {
-                        tx.transaction
-                            .body
-                            .outputs()
-                            .iter()
-                            .find(|tx| tx.commitment == db_output.commitment)
-                            .map(|_| tx.tx_id)
-                    });
-
-                    tx_id.unwrap_or_else(TxId::new_random)
-                },
-            };
             let output_hex = db_output.commitment.to_hex();
-            if let Err(e) = self.db.add_unspent_output_with_tx_id(tx_id, db_output) {
+            let view_key = self.master_key_manager.get_view_key().pub_key;
+            if let Err(e) = self.db.add_unspent_output_with_tx_id(
+                output.calculate_tx_id(view_key.as_bytes()),
+                db_output,
+                &self.master_key_manager,
+            ) {
                 match e {
                     OutputManagerStorageError::DuplicateOutput => {
                         continue;
@@ -180,9 +140,8 @@ where
                 }
             }
 
-            rewound_outputs_with_tx_id.push(RecoveredOutput {
+            recovered_outputs.push(RecoveredOutput {
                 output: output.clone(),
-                tx_id,
                 hash: *hash,
             });
             trace!(
@@ -194,7 +153,7 @@ where
             );
         }
 
-        Ok(rewound_outputs_with_tx_id)
+        Ok(recovered_outputs)
     }
 
     // Helper function to get the output source for a given output
@@ -222,7 +181,7 @@ where
         }
     }
 
-    async fn find_script_key(
+    fn find_script_key(
         &self,
         script: &TariScript,
         spending_key: &TariKeyId,
@@ -235,9 +194,9 @@ where
                 TariKeyId::from_str(&key.to_string()).map_err(OutputManagerError::BuildError)?
             } else {
                 let private_key = PrivateKey::random(&mut rand::thread_rng());
-                self.master_key_manager.import_key(private_key, None).await?
+                self.master_key_manager.create_encrypted_key(private_key, None)?
             };
-            let public_key = self.master_key_manager.get_public_key_at_key_id(&key).await?;
+            let public_key = self.master_key_manager.get_public_key_at_key_id(&key)?;
             (inputs!(public_key), key)
         } else {
             // This is a known script so lets fill in the details
@@ -251,8 +210,7 @@ where
                 if let Some(Opcode::PushPubKey(public_key)) = script.opcode(0) {
                     let result = self
                         .master_key_manager
-                        .find_script_key_id_from_commitment_mask_key_id(spending_key, Some(public_key))
-                        .await?;
+                        .find_script_key_id_from_commitment_mask_key_id(spending_key, Some(public_key))?;
                     if let Some(script_key_id) = result {
                         (ExecutionStack::default(), script_key_id)
                     } else {
@@ -269,26 +227,25 @@ where
         Ok(Some((input_data, script_key)))
     }
 
-    async fn attempt_output_recovery(
+    fn attempt_output_recovery(
         &self,
         output: &TransactionOutput,
     ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField)>, OutputManagerError> {
         // lets first check if the output exists in the db, if it does we dont have to try recovery as we already know
         // about the output.
-        match self.db.fetch_by_commitment(output.commitment().clone()) {
+        match self
+            .db
+            .fetch_by_commitment(output.commitment().clone(), &self.master_key_manager)
+        {
             Ok(_) => return Ok(None),
             Err(OutputManagerStorageError::ValueNotFound) => {},
             Err(e) => return Err(e.into()),
         };
-        let (key, committed_value, payment_id) = match self
-            .master_key_manager
-            .try_output_key_recovery(
-                output.commitment(),
-                output.encrypted_data(),
-                &output.sender_offset_public_key,
-            )
-            .await?
-        {
+        let (key, committed_value, payment_id) = match self.master_key_manager.try_output_key_recovery(
+            output.commitment(),
+            output.encrypted_data(),
+            &output.sender_offset_public_key,
+        )? {
             Some(value) => value,
             _ => return Ok(None),
         };

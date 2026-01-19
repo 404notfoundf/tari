@@ -20,13 +20,13 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-pub const SAFETY_HEIGHT_MARGIN: u64 = 3000;
+pub const SAFETY_HEIGHT_MARGIN: u64 = 100;
 
 use std::sync::Arc;
 
 use log::*;
 use tari_common_types::types::FixedHash;
-use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
+use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
 
 use crate::{
     output_manager_service::handle::OutputManagerHandle,
@@ -43,7 +43,10 @@ use crate::{
 const LOG_TARGET: &str = "wallet::transaction_service::protocols::validation_protocol";
 
 #[allow(clippy::too_many_lines)]
-pub async fn check_detected_transactions<TBackend: 'static + TransactionBackend, KM: TransactionKeyManagerInterface>(
+pub async fn check_detected_transactions<
+    TBackend: 'static + TransactionBackend,
+    KM: LegacyTransactionKeyManagerInterface,
+>(
     mut output_manager: OutputManagerHandle<KM>,
     db: TransactionDatabase<TBackend>,
     event_publisher: TransactionEventSender,
@@ -134,6 +137,11 @@ pub async fn check_detected_transactions<TBackend: 'static + TransactionBackend,
                 return;
             },
         };
+        debug!(
+            target: LOG_TARGET,
+            "TxId: {}, {:?} ",
+            tx.tx_id, output_info_for_tx_id
+        );
         if tx.mined_height.unwrap_or_default() != output_info_for_tx_id.mined_height.unwrap_or_default() {
             // If the mined height has changed, we need to update the transaction
             state_changed = true;
@@ -159,7 +167,7 @@ pub async fn check_detected_transactions<TBackend: 'static + TransactionBackend,
         let mined_height = output_info_for_tx_id.mined_height.unwrap_or(0);
         let mined_in_block = output_info_for_tx_id.block_hash.unwrap_or(FixedHash::zero());
         let is_valid = tip_height >= mined_height;
-        let previously_confirmed = tx.status.is_confirmed();
+        let previously_confirmed = tx.status.is_confirmed() && tx.mined_height.is_some() && tx.mined_in_block.is_some();
         let must_be_confirmed = tip_height.saturating_sub(mined_height) >= config.num_confirmations_required;
 
         if !(previously_confirmed && must_be_confirmed) {

@@ -33,22 +33,24 @@ use minotari_node_wallet_client::BaseNodeWalletClient;
 use tari_common_types::{
     seeds::seed_words::get_birthday_from_unix_epoch_in_seconds,
     tari_address::TariAddress,
-    transaction::{LegacyImportStatus, TxId},
+    transaction::LegacyImportStatus,
     types::{BlockHash, FixedHash, HashOutput},
-    wallet_types::WalletType,
 };
 use tari_crypto::{compressed_commitment::CompressedCommitment, compressed_key::CompressedKey};
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::{
-    key_manager::TransactionKeyManagerInterface,
     rpc::models::MinimalUtxoSyncInfo,
     transaction_components::{
-        one_sided::shared_secret_to_output_encryption_key,
+        one_sided::public_key_to_output_encryption_key,
         EncryptedData,
         TransactionOutput,
         WalletOutput,
     },
     MicroMinotari,
+};
+use tari_transaction_key_manager::legacy_key_manager::{
+    wallet_types::LegacyWalletType,
+    LegacyTransactionKeyManagerInterface,
 };
 use tari_utilities::{hex::Hex, ByteArray};
 use tokio::{sync::broadcast, time::sleep};
@@ -98,7 +100,7 @@ pub struct UtxoScannerTask<
 impl<TBackend, TKeyManager, TWalletClientFactory> UtxoScannerTask<TBackend, TKeyManager, TWalletClientFactory>
 where
     TBackend: WalletBackend + 'static,
-    TKeyManager: TransactionKeyManagerInterface,
+    TKeyManager: LegacyTransactionKeyManagerInterface,
     TWalletClientFactory: HttpClientFactory + Clone + Send + Sync + 'static,
 {
     pub async fn run(mut self) -> Result<(), anyhow::Error> {
@@ -219,8 +221,8 @@ where
             // wallet birthday
             self.resources.db.clear_scanned_blocks()?;
             let wallet_birthday = match self.resources.db.get_wallet_type()? {
-                Some(WalletType::ProvidedKeys(wallet)) => Some(wallet.birthday.unwrap_or_default()),
-                Some(WalletType::Ledger(_)) => Some(0), // Ledger wallets have no birthday, so start from genesis
+                Some(LegacyWalletType::ProvidedKeys(wallet)) => Some(wallet.birthday.unwrap_or_default()),
+                Some(LegacyWalletType::Ledger(_)) => Some(0), // Ledger wallets have no birthday, so start from genesis
                 _ => None,
             };
             let scanning_start_height_hash = self
@@ -294,7 +296,12 @@ where
             );
 
             let scan_result = self
-                .scan_utxos_to_tip(&wallet_service_client, next_block_to_scan.header_hash, tip_height)
+                .scan_utxos_to_tip(
+                    &wallet_service_client,
+                    next_block_to_scan.header_hash,
+                    tip_height,
+                    tip_hash,
+                )
                 .await?;
             scanned_blocks += scan_result.blocks_scanned;
             total_num_recovered += scan_result.total_num_recovered;
@@ -326,7 +333,7 @@ where
     }
 
     async fn get_last_scanned_block(
-        &self,
+        &mut self,
         client: &TWalletClientFactory::Client,
         current_tip_height: u64,
     ) -> Result<Option<ScannedBlock>, anyhow::Error> {
@@ -380,6 +387,7 @@ where
                 "{:?}: Reorg detected on base node. Removing scanned blocks from height {}", self.mode, block.height
             );
             self.resources.db.clear_scanned_blocks_from_and_higher(block.height)?;
+            self.resources.transaction_service.process_reorg(block.height).await?;
         }
 
         if let Some(sb) = found_scanned_block {
@@ -411,6 +419,7 @@ where
         client: &TWalletClientFactory::Client,
         start_header_hash: HashOutput,
         tip_height: u64,
+        tip_hash: BlockHash,
     ) -> Result<ScanUtxosResult, anyhow::Error> {
         info!(
             target: LOG_TARGET,
@@ -427,6 +436,7 @@ where
         let mut blocks_scanned = 0;
         let mut starting_header_vec = start_header_hash.to_vec();
         let mut last_saved_hash = None;
+
         loop {
             let mut utxo_stream = client
                 .sync_utxos_by_block(starting_header_vec.clone(), self.shutdown_signal.clone())
@@ -444,9 +454,40 @@ where
                     return Ok(result);
                 }
 
-                let response = response?;
+                let mut response = response?;
+                response.blocks.sort_by(|a, b| a.height.cmp(&b.height));
                 #[allow(clippy::cast_possible_wrap)]
                 for response in response.blocks {
+                    if let Some(previous_block) = &prev_scanned_block {
+                        if response.height < previous_block.height {
+                            // We do not accept blocks that go backwards in height - fork block re-validation forced.
+                            return Err(anyhow!(
+                                "Non-monotonic block heights received during UTXO scan: {} followed by {}",
+                                previous_block.height,
+                                response.height
+                            ));
+                        }
+                        if response.height > previous_block.height + 1 {
+                            // Missing block(s) detected between previous_block and response height - fork block
+                            // re-validation forced.
+                            return Err(anyhow!(
+                                "Non-consecutive block heights received during UTXO scan: {} followed by {}",
+                                previous_block.height,
+                                response.height
+                            ));
+                        }
+                        if response.height == previous_block.height &&
+                            response.header_hash != previous_block.header_hash.to_vec()
+                        {
+                            // Conflicting block detected for the same height - fork block re-validation forced.
+                            return Err(anyhow!(
+                                "Conflicting blocks for same height {} during UTXO scan: response {} vs expected {}",
+                                response.height,
+                                BlockHash::try_from(response.header_hash).unwrap_or_default(),
+                                previous_block.header_hash,
+                            ));
+                        }
+                    }
                     blocks_scanned += 1;
                     let current_height = response.height;
                     let current_header_hash = response.header_hash;
@@ -455,7 +496,7 @@ where
                     let outputs = response.outputs;
                     total_scanned += outputs.len();
 
-                    let found_outputs = self.search_for_owned_outputs(outputs).await?;
+                    let found_outputs = self.search_for_owned_outputs(outputs)?;
 
                     if found_outputs.is_empty() {
                         trace!(
@@ -494,7 +535,7 @@ where
                     let block_hash: FixedHash = current_header_hash.try_into()?;
                     trace!(
                         target: LOG_TARGET,
-                        "Scanned block at height {} with header hash {}, :{:?}",
+                        "Scanned block at height {} with header hash {}, previous: {:?}",
                         current_height,
                         block_hash.to_hex(), prev_scanned_block
                     );
@@ -506,8 +547,8 @@ where
                                 current_height,
                                 block_hash.to_hex()
                             );
-                            self.resources.db.save_scanned_block(scanned_block)?;
-                            last_saved_hash = Some(block_hash);
+                            self.resources.db.save_scanned_block(scanned_block.clone())?;
+                            last_saved_hash = Some(scanned_block.header_hash);
                             if current_height % PROGRESS_REPORT_INTERVAL == 0 {
                                 debug!(
                                     target: LOG_TARGET,
@@ -534,7 +575,7 @@ where
                 starting_header_vec = response.next_header_to_scan;
             }
             // We need to update the last one
-            if let Some(scanned_block) = prev_scanned_block {
+            if let Some(scanned_block) = prev_scanned_block.clone() {
                 self.resources.db.clear_scanned_blocks_before_height(
                     scanned_block.height.saturating_sub(SCANNED_BLOCK_CACHE_SIZE),
                     true,
@@ -545,6 +586,18 @@ where
             }
 
             if starting_header_vec.is_empty() {
+                if let Some(previous_block) = prev_scanned_block {
+                    // The base node did not return all blocks up to the expected tip, but things may have changed since
+                    // the request was made
+                    if previous_block.height < tip_height || previous_block.header_hash != tip_hash {
+                        debug!(
+                            target: LOG_TARGET,
+                            "End state block mismatch - the base node state may have changed: expected height \
+                            {tip_height} vs. actual {}, expected hash {tip_hash} vs. actual {}.",
+                            previous_block.height, previous_block.header_hash,
+                        );
+                    }
+                }
                 // No more blocks to scan
                 break;
             }
@@ -558,13 +611,13 @@ where
         Ok(result)
     }
 
-    async fn search_for_owned_outputs(
+    fn search_for_owned_outputs(
         &mut self,
         outputs: Vec<MinimalUtxoSyncInfo>,
     ) -> Result<Vec<MinimalUtxoSyncInfo>, anyhow::Error> {
         let mut found_outputs: Vec<MinimalUtxoSyncInfo> = Vec::new();
         let start = Instant::now();
-        let view_key = self.key_manager.get_view_key().await?;
+        let view_key = self.key_manager.get_view_key();
         for output in outputs {
             let commitment = CompressedCommitment::from_canonical_bytes(&output.commitment)
                 .map_err(|e| anyhow!("Not a valid commitment: {}", e.to_string()))?;
@@ -576,9 +629,8 @@ where
                 .map_err(|e| anyhow!("Sender offset is not a valid public key:{}", e.to_string()))?;
             let shared_secret = self
                 .key_manager
-                .get_diffie_hellman_shared_secret(&view_key.key_id, &offset_pub_key)
-                .await?;
-            let recovery_key = shared_secret_to_output_encryption_key(&shared_secret)
+                .get_diffie_hellman_shared_secret(&view_key.key_id, &offset_pub_key)?;
+            let recovery_key = public_key_to_output_encryption_key(&shared_secret)
                 .map_err(|e| anyhow!("Could not hash key :{}", e.to_string()))?;
             if EncryptedData::decrypt_data(&recovery_key, &commitment, &encrypted)
                 .ok()
@@ -589,13 +641,7 @@ where
             }
 
             // Change outputs just use the view key.
-            if self
-                .key_manager
-                .is_this_output_ours(&commitment, &encrypted, None)
-                .await
-                .ok()
-                .is_some()
-            {
+            if let Ok(true) = self.key_manager.is_this_output_ours(&commitment, &encrypted, None) {
                 found_outputs.push(output.clone());
             }
         }
@@ -612,7 +658,7 @@ where
     async fn scan_for_outputs(
         &mut self,
         outputs: Vec<TransactionOutput>,
-    ) -> Result<Vec<(WalletOutput, LegacyImportStatus, TxId, TransactionOutput)>, anyhow::Error> {
+    ) -> Result<Vec<(WalletOutput, LegacyImportStatus, TransactionOutput)>, anyhow::Error> {
         let start = Instant::now();
         let outputs_by_hash: HashMap<_, _> = outputs.iter().cloned().map(|o| (o.hash(), o)).collect();
         let mut found_outputs = Vec::new();
@@ -621,7 +667,7 @@ where
             &mut self
                 .resources
                 .output_manager_service
-                .scan_outputs_for_one_sided_payments(outputs.clone().into_iter().map(|o| (o, None)).collect())
+                .scan_outputs_for_one_sided_payments(outputs.clone().into_iter().collect())
                 .await?
                 .into_iter()
                 .map(|ro| -> Result<_, anyhow::Error> {
@@ -633,15 +679,15 @@ where
                     let output = outputs_by_hash
                         .get(&ro.hash)
                         .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
-                    Ok((ro.output, status, ro.tx_id, output.clone()))
+                    Ok((ro.output, status, output.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
-        let output_without_one_sided: Vec<(TransactionOutput, Option<TxId>)> = outputs
+        let output_without_one_sided: Vec<TransactionOutput> = outputs
             .iter()
-            .filter(|o| !found_outputs.iter().any(|f| f.3.hash() == o.hash()))
-            .map(|o| (o.clone(), None))
+            .filter(|o| !found_outputs.iter().any(|f| f.2.hash() == o.hash()))
+            .cloned()
             .collect();
 
         let one_sided_time = start.elapsed();
@@ -658,15 +704,15 @@ where
                     let output = outputs_by_hash
                         .get(&ro.hash)
                         .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
-                    Ok((ro.output, status, ro.tx_id, output.clone()))
+                    Ok((ro.output, status, output.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
-        let other_outputs: Vec<(TransactionOutput, Option<TxId>)> = output_without_one_sided
+        let other_outputs: Vec<TransactionOutput> = output_without_one_sided
             .iter()
-            .filter(|o| !found_outputs.iter().any(|f| f.3.hash() == o.0.hash()))
-            .map(|o| (o.0.clone(), o.1))
+            .filter(|o| !found_outputs.iter().any(|f| f.2.hash() == o.hash()))
+            .cloned()
             .collect();
 
         found_outputs.append(
@@ -685,7 +731,7 @@ where
                     let output = outputs_by_hash
                         .get(&ro.hash)
                         .ok_or_else(|| anyhow!("Output '{}' not found", ro.hash.to_hex()))?;
-                    Ok((ro.output, status, ro.tx_id, output.clone()))
+                    Ok((ro.output, status, output.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
@@ -703,13 +749,14 @@ where
 
     async fn import_utxos_to_transaction_service(
         &mut self,
-        utxos: &[(WalletOutput, LegacyImportStatus, TxId, TransactionOutput)],
+        utxos: &[(WalletOutput, LegacyImportStatus, TransactionOutput)],
         current_height: u64,
         mined_timestamp: DateTime<Utc>,
     ) -> Result<(u64, MicroMinotari), anyhow::Error> {
         let mut num_recovered = 0u64;
         let mut total_amount = MicroMinotari::from(0);
-        for (wo, import_status, tx_id, to) in utxos {
+        let view_key = self.key_manager.get_view_key().pub_key;
+        for (wo, import_status, to) in utxos {
             let source_address = if wo.is_coinbase() {
                 // It's a coinbase, so we know we mined it (we do mining with cold wallets).
                 self.resources.one_sided_tari_address.clone()
@@ -725,7 +772,6 @@ where
                     wo.clone(),
                     source_address,
                     import_status.clone(),
-                    *tx_id,
                     current_height,
                     mined_timestamp,
                     to.clone(),
@@ -744,7 +790,7 @@ where
                         "{:?}: Recoverer attempted to add a duplicate output to the database for faux transaction ({}); \
                          ignoring it as this is not a real error",
                         self.mode,
-                        tx_id
+                        wo.calculate_tx_id(view_key.as_bytes())
                     );
                 },
                 Err(e) => return Err(e.into()),
@@ -776,23 +822,21 @@ where
         wallet_output: WalletOutput,
         source_address: TariAddress,
         import_status: LegacyImportStatus,
-        tx_id: TxId,
         current_height: u64,
         mined_timestamp: DateTime<Utc>,
         scanned_output: TransactionOutput,
-    ) -> Result<TxId, WalletError> {
-        let tx_id = self
-            .resources
+    ) -> Result<(), WalletError> {
+        self.resources
             .transaction_service
             .import_utxo_with_status(
                 wallet_output.value(),
                 source_address,
                 import_status.clone(),
-                Some(tx_id),
                 Some(current_height),
                 Some(mined_timestamp),
                 scanned_output,
                 wallet_output.payment_id().clone(),
+                None,
             )
             .await?;
 
@@ -802,7 +846,7 @@ where
             self.mode, wallet_output.value(), import_status
         );
 
-        Ok(tx_id)
+        Ok(())
     }
 
     async fn get_scanning_start_header_height_hash(

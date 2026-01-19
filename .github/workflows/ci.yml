@@ -40,7 +40,7 @@ jobs:
     runs-on: [ubuntu-latest]
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,7 +60,7 @@ jobs:
         # Without restore keys, we lose the ability to get partial matches on caches, and end
         # up with too many cache misses.
         # Use a "small" suffix to use the build caches where possible, but build caches won't use this
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -98,10 +98,10 @@ jobs:
     name: ledger build tests
     runs-on: [ubuntu-latest]
     env:
-      DOCKER_IMAGE: "ghcr.io/ledgerhq/ledger-app-builder/ledger-app-builder:4.15.0"
+      DOCKER_IMAGE: "ghcr.io/ledgerhq/ledger-app-builder/ledger-app-builder:4.23.0"
     steps:
       - name: checkout tari
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: ledger build tests
         shell: bash
@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: checkout tari
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -149,7 +149,7 @@ jobs:
         # Without restore keys, we lose the ability to get partial matches on caches, and end
         # up with too many cache misses.
         # Use a "small" suffix to use the build caches where possible, but build caches won't use this
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -191,7 +191,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
       - name: Cache cargo files and outputs
         if: startsWith(runner.environment,'github-hosted')
         uses: Swatinem/rust-cache@v2
@@ -272,7 +272,7 @@ jobs:
     runs-on: [ubuntu-latest]
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
       - name: install ripgrep
         run: |
           #wget https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_14.1.0-1_amd64.deb.sha256
@@ -304,7 +304,7 @@ jobs:
       RUST_LOG: debug
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -343,7 +343,7 @@ jobs:
       - name: cargo test
         run: cargo +${{ env.toolchain }} nextest run --all-features --release -E "not package(tari_integration_tests)" --profile ci --no-fail-fast
       - name: upload artifact
-        uses: actions/upload-artifact@v4 # upload test results as artifact
+        uses: actions/upload-artifact@v6 # upload test results as artifact
         if: always()
         with:
           name: test-results-${{ matrix.tari_target_network.target }}.${{ matrix.tari_target_network.network }}
@@ -361,7 +361,7 @@ jobs:
         run: echo $PR_NUM > pr_num.txt
 
       - name: Upload the PR number
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pr_num
           path: ./pr_num.txt
@@ -372,7 +372,7 @@ jobs:
     runs-on: [ubuntu-latest]
     steps:
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Event File
           path: ${{ github.event_path }}

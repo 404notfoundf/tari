@@ -332,17 +332,15 @@ impl ReorgPool {
 
 #[cfg(test)]
 mod test {
-
     #![allow(clippy::indexing_slicing)]
     use tari_common::configuration::Network;
-    use tari_transaction_components::{tx, MicroMinotari};
-    use tari_transaction_key_manager::create_memory_db_key_manager;
+    use tari_transaction_components::{key_manager::KeyManager, tx, MicroMinotari};
 
     use super::*;
     use crate::{consensus::BaseNodeConsensusManagerBuilder, test_helpers::create_orphan_block};
     #[tokio::test]
     async fn test_insert_expire_by_height() {
-        let key_manager = create_memory_db_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let tx1 = Arc::new(
             tx!(MicroMinotari(100_000), fee: MicroMinotari(100), lock: 4000, inputs: 2, outputs: 1, &key_manager)
                 .expect("Failed to get tx")
@@ -402,7 +400,7 @@ mod test {
 
     #[tokio::test]
     async fn test_remove_all() {
-        let key_manager = create_memory_db_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let tx1 = Arc::new(
             tx!(MicroMinotari(100_000), fee: MicroMinotari(100), lock: 4000, inputs: 2, outputs: 1, &key_manager)
                 .expect("Failed to get tx")
@@ -439,7 +437,7 @@ mod test {
 
     #[tokio::test]
     async fn remove_scan_for_and_remove_reorged_txs() {
-        let key_manager = create_memory_db_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let network = Network::LocalNet;
         let consensus = BaseNodeConsensusManagerBuilder::new(network).build().unwrap();
         let tx1 = Arc::new(

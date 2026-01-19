@@ -29,7 +29,6 @@ use std::{
 };
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use log::*;
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::{FixedHash, PrivateKey};
 use tari_transaction_components::{
@@ -251,6 +250,24 @@ pub struct NewBlock {
     pub coinbase_outputs: Vec<TransactionOutput>,
     /// The scalar `s` component of the kernel excess signatures of the transactions contained in the block.
     pub kernel_excess_sigs: Vec<PrivateKey>,
+}
+
+impl Display for NewBlock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        writeln!(f, "----------------- New Block -----------------")?;
+        writeln!(f, "--- Header ---")?;
+        writeln!(f, "Hash: {}", self.header.hash())?;
+        writeln!(f, "{}", self.header)?;
+        writeln!(f, "---  Coinbase Kernels  ---")?;
+        for kernel in &self.coinbase_kernels {
+            writeln!(f, "{}", kernel)?;
+        }
+        writeln!(f, "---  Coinbase Outputs  ---")?;
+        for output in &self.coinbase_outputs {
+            writeln!(f, "{}", output)?;
+        }
+        Ok(())
+    }
 }
 
 impl From<&Block> for NewBlock {

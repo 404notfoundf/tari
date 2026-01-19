@@ -135,6 +135,13 @@ pub struct WalletConfig {
     pub fallback_http_server_url: String,
     /// the scanning interval for the utxo scanner service
     pub scanning_interval: u64,
+    /// grpc database write timeout in ms. This is how long the grpc server will wait for a database write to complete
+    /// before returning an error to the client. This should be long enough to cover the majority of database writes
+    /// but short enough to avoid blocking the grpc server for too long. Default = 100ms
+    pub grpc_db_write_timeout: u64,
+    /// gRPC broadcast confirmation timeout in ms. This is how long the grpc server will wait for the mempool to
+    /// respond once the transaction has been submitted, either accepted or rejected. Default = 5000ms
+    pub grpc_broadcast_confirmation: u64,
 }
 
 impl Default for WalletConfig {
@@ -179,6 +186,8 @@ impl Default for WalletConfig {
             http_server_url,
             fallback_http_server_url,
             scanning_interval: 60,
+            grpc_db_write_timeout: 100,
+            grpc_broadcast_confirmation: 5000,
         }
     }
 }

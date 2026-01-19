@@ -32,10 +32,10 @@ use tari_common_types::{
     types::CompressedSignature,
 };
 use tari_transaction_components::{
-    key_manager::TransactionKeyManagerInterface,
     rpc::models::{TxLocation, TxSubmissionRejectionReason},
     transaction_components::Transaction,
 };
+use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
 use tari_utilities::{hex::Hex, ByteArray};
 use tokio::{sync::watch, time::sleep};
 
@@ -68,7 +68,7 @@ impl<TBackend, TWalletConnectivity, TKeyManagerInterface>
 where
     TBackend: TransactionBackend + 'static,
     TWalletConnectivity: WalletConnectivityInterface,
-    TKeyManagerInterface: TransactionKeyManagerInterface,
+    TKeyManagerInterface: LegacyTransactionKeyManagerInterface,
 {
     pub fn new(
         tx_id: TxId,
@@ -120,7 +120,7 @@ where
                 return Ok(self.tx_id);
             }
             if let Err(e) = check_transaction_size(&completed_tx.transaction, self.tx_id) {
-                self.cancel_transaction(TxCancellationReason::Oversized).await;
+                self.cancel_pending_transaction(TxCancellationReason::Oversized).await;
                 return Err(e);
             }
 
@@ -220,13 +220,17 @@ where
                     TransactionServiceError::MempoolRejectionTimeLocked,
                     TxCancellationReason::TimeLocked,
                 ),
-                _ => (
-                    TransactionServiceError::UnexpectedBaseNodeResponse,
-                    TxCancellationReason::Unknown,
+                TxSubmissionRejectionReason::FeeTooLow => (
+                    TransactionServiceError::MempoolRejectionFeeTooLow,
+                    TxCancellationReason::FeeTooLow,
+                ),
+                TxSubmissionRejectionReason::AlreadyMined => (
+                    TransactionServiceError::MempoolRejectionAlreadyMined,
+                    TxCancellationReason::AlreadyMined,
                 ),
             };
 
-            self.cancel_transaction(reason).await;
+            self.cancel_pending_transaction(reason).await;
 
             let _size = self
                 .resources
@@ -317,13 +321,13 @@ where
                 self.last_rejection = Some(Instant::now());
                 Ok(false)
             } else {
-                error!(
-                    target: LOG_TARGET,
-                    "Transaction (TxId: {}) has been rejected by the mempool after second submission attempt, \
-                     cancelling transaction",
-                    self.tx_id
+                let reason = "rejected by the mempool after second submission attempt".to_string();
+                error!(target: LOG_TARGET,
+                    "Transaction (TxId: {}) has been {}, cancelling transaction",
+                    self.tx_id, reason,
                 );
-                self.cancel_transaction(TxCancellationReason::InvalidTransaction).await;
+                self.cancel_pending_transaction(TxCancellationReason::InvalidTransaction)
+                    .await;
 
                 let _size = self
                     .resources
@@ -340,7 +344,7 @@ where
                     });
                 Err(TransactionServiceProtocolError::new(
                     self.tx_id,
-                    TransactionServiceError::MempoolRejection,
+                    TransactionServiceError::MempoolRejection { reason },
                 ))
             }
         } else {
@@ -380,22 +384,23 @@ where
         }
     }
 
-    async fn cancel_transaction(&mut self, reason: TxCancellationReason) {
+    async fn cancel_pending_transaction(&mut self, reason: TxCancellationReason) {
         if let Err(e) = self
             .resources
             .output_manager_service
-            .cancel_transaction(self.tx_id)
+            .cancel_pending_transaction(self.tx_id)
             .await
         {
             warn!(
                 target: LOG_TARGET,
-                "Failed to Cancel outputs for TxId: {} after failed sending attempt with error {:?}", self.tx_id, e
+                "Failed to Cancel pending outputs for TxId: {} after failed sending attempt with error {:?}",
+                self.tx_id, e
             );
         }
         if let Err(e) = self.resources.db.reject_completed_transaction(self.tx_id, reason) {
             warn!(
                 target: LOG_TARGET,
-                "Failed to Cancel TxId: {} after failed sending attempt with error {:?}", self.tx_id, e
+                "Failed to Cancel pending TxId: {} after failed sending attempt with error {:?}", self.tx_id, e
             );
         }
     }

@@ -1,6 +1,7 @@
 // Copyright 2025 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
-use std::sync::Arc;
+
+use std::{fmt::Display, sync::Arc};
 
 use axum::{
     extract::Query,
@@ -11,11 +12,13 @@ use axum::{
 };
 use log::debug;
 use serde::Deserialize;
+use tari_common_types::types::HashOutput;
 use tari_core::{
     base_node::rpc::{query_service, BaseNodeWalletQueryService},
     chain_storage::BlockchainBackend,
 };
 use tari_transaction_components::rpc::models::{GetUtxosByBlockRequest, GetUtxosByBlockResponse};
+use tari_utilities::hex::Hex;
 use tonic::service::AxumBody;
 
 use crate::{
@@ -59,16 +62,38 @@ pub async fn handle<B: BlockchainBackend + 'static>(
     Query(params): Query<GetUtxosByBlockQueryParams>,
     Extension(cache_cfg): Extension<Arc<HttpCacheConfig>>,
 ) -> Result<Response<AxumBody>, (StatusCode, Json<ErrorResponse>)> {
-    debug!(target: LOG_TARGET, "Received get_utxos_by_block request: {params:?}");
+    debug!(target: LOG_TARGET, "Received get_utxos_by_block request: {params}");
+
+    let tip_info = query_service.get_tip_info().await.map_err(error_handler_with_message)?;
+    let tip_height = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+
     let request = params.into();
 
     let response = query_service
         .get_utxos_by_block(request)
         .await
         .map_err(error_handler_with_message)?;
-
+    let height = response.height;
     let body = Json(response);
     let mut response = body.into_response();
-    apply_cache_control(response.headers_mut(), &cache_cfg, RouteKey::GetUtxosByBlock);
+    apply_cache_control(
+        response.headers_mut(),
+        &cache_cfg,
+        RouteKey::GetUtxosByBlock,
+        tip_height,
+        height,
+    );
     Ok(response)
+}
+
+impl Display for GetUtxosByBlockQueryParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GetUtxosByBlockQueryParams {{ header_hash: {} }}",
+            HashOutput::try_from(self.header_hash.as_slice())
+                .unwrap_or_default()
+                .to_hex()
+        )
+    }
 }

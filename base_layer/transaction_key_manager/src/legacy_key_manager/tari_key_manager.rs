@@ -37,7 +37,7 @@ use tari_crypto::{
 use tari_hashing::KeyManagerDomain;
 use zeroize::Zeroize;
 
-use crate::key_manager::HASHER_LABEL_DERIVE_KEY;
+use crate::legacy_key_manager::HASHER_LABEL_DERIVE_KEY;
 
 #[derive(Clone, Derivative, Serialize, Deserialize, Zeroize)]
 #[derivative(Debug)]
@@ -74,9 +74,9 @@ where
     D::OutputSize: IsEqual<U64>,
 {
     /// Creates a new KeyManager with a new randomly selected entropy
-    pub fn new() -> TariKeyManager<D> {
+    pub fn random() -> TariKeyManager<D> {
         TariKeyManager {
-            seed: CipherSeed::new(),
+            seed: CipherSeed::random(),
             branch_seed: "".to_string(),
             primary_key_index: 0,
             digest_type: PhantomData,
@@ -153,32 +153,31 @@ where
     }
 }
 
-impl<D> Default for TariKeyManager<D>
-where
-    D: Digest + LengthExtensionAttackResistant,
-    D::OutputSize: IsEqual<U64>,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
+
     use blake2::Blake2b;
+    use tari_transaction_components::key_manager::{SecretTransactionKeyManagerInterface, TariKeyId};
 
     use super::*;
+    use crate::legacy_key_manager::{
+        create_new_random_key_manager,
+        LegacySerializedKeyString,
+        LegacyTariKeyId,
+        LegacyTransactionKeyManagerInterface,
+    };
 
     #[test]
     fn test_new_keymanager() {
-        let km1 = TariKeyManager::<Blake2b<U64>>::new();
-        let km2 = TariKeyManager::<Blake2b<U64>>::new();
+        let km1 = TariKeyManager::<Blake2b<U64>>::random();
+        let km2 = TariKeyManager::<Blake2b<U64>>::random();
         assert_ne!(km1.seed, km2.seed);
     }
 
     #[test]
     fn test_derive_and_next_key() {
-        let mut km = TariKeyManager::<Blake2b<U64>>::new();
+        let mut km = TariKeyManager::<Blake2b<U64>>::random();
         let next_key1_result = km.next_key();
         let next_key2_result = km.next_key();
         let desired_key_index1 = 1;
@@ -198,7 +197,7 @@ mod test {
 
     #[test]
     fn test_derive_and_next_key_with_branch_seed() {
-        let mut km = TariKeyManager::<Blake2b<U64>>::from(CipherSeed::new(), "Test".to_string(), 0);
+        let mut km = TariKeyManager::<Blake2b<U64>>::from(CipherSeed::random(), "Test".to_string(), 0);
         let next_key1_result = km.next_key();
         let next_key2_result = km.next_key();
         let desired_key_index1 = 1;
@@ -218,11 +217,58 @@ mod test {
 
     #[test]
     fn test_use_of_branch_seed() {
-        let x = CipherSeed::new();
+        let x = CipherSeed::random();
         let mut km1 = TariKeyManager::<Blake2b<U64>>::from(x.clone(), "some".to_string(), 0);
         let mut km2 = TariKeyManager::<Blake2b<U64>>::from(x, "other".to_string(), 0);
         let next_key1 = km1.next_key().unwrap();
         let next_key2 = km2.next_key().unwrap();
         assert_ne!(next_key1.key, next_key2.key);
+    }
+
+    #[tokio::test]
+    async fn test_convert_legacy_managed_and_derived_key() {
+        let legacy_key_manager = create_new_random_key_manager().await.unwrap();
+
+        // Managed key
+        let legacy_managed = LegacyTariKeyId::Managed {
+            branch: "commitment mask".to_string(),
+            index: 18309514604232961632,
+        };
+        // Derived key wrapping managed
+        let legacy_derived = LegacyTariKeyId::Derived {
+            key: LegacySerializedKeyString::from(legacy_managed.to_string()),
+        };
+
+        let legacy_managed_converted = legacy_key_manager
+            .convert_legacy_tari_key_id_to_current(&legacy_managed)
+            .unwrap();
+        let legacy_derived_converted = legacy_key_manager
+            .convert_legacy_tari_key_id_to_current(&legacy_derived)
+            .unwrap();
+
+        let legacy_managed_private_key = legacy_key_manager.get_private_key(&legacy_managed_converted).unwrap();
+        let legacy_derived_private_key = legacy_key_manager.get_private_key(&legacy_derived_converted).unwrap();
+        //  Legacy managed and derived private keys should be different
+        assert_ne!(legacy_managed_private_key, legacy_derived_private_key);
+
+        let key_manager = legacy_key_manager.key_manager();
+
+        let managed_private_key = key_manager.get_private_key(&legacy_managed_converted).unwrap();
+        let derived_private_key = key_manager.get_private_key(&legacy_derived_converted).unwrap();
+        // New managed and derived private keys should be different
+        assert_ne!(managed_private_key, derived_private_key);
+
+        // Legacy and new managed_private_key should be the same
+        assert_eq!(legacy_managed_private_key, managed_private_key);
+        // Legacy and new derived_private_key should be the same
+        assert_eq!(legacy_derived_private_key, derived_private_key);
+
+        // These must fail because the legacy format is not compatible with the current TariKeyId parser
+        assert!(TariKeyId::from_str(&legacy_managed.to_string()).is_err());
+        assert!(TariKeyId::from_str(&legacy_derived.to_string()).is_err());
+
+        // These must pass because they have been converted to the current format
+        assert!(TariKeyId::from_str(&legacy_managed_converted.to_string()).is_ok());
+        assert!(TariKeyId::from_str(&legacy_derived_converted.to_string()).is_ok());
     }
 }

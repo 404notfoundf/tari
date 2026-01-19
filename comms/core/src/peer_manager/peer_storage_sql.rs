@@ -224,16 +224,22 @@ impl PeerStorageSql {
     }
 
     /// Get available dial candidates that are communication nodes, not banned, not deleted, reachable,
-    /// and not in the excluded node IDs list
+    /// optionally not failed, optionally at random, and not in the excluded node IDs list
     pub fn get_available_dial_candidates(
         &self,
         exclude_node_ids: &[NodeId],
         limit: Option<usize>,
         transport_protocols: &[TransportProtocol],
+        exclude_failed: bool,
+        randomize: bool,
     ) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self
-            .peer_db
-            .get_available_dial_candidates(exclude_node_ids, limit, transport_protocols)?)
+        Ok(self.peer_db.get_available_dial_candidates(
+            exclude_node_ids,
+            limit,
+            transport_protocols,
+            exclude_failed,
+            randomize,
+        )?)
     }
 
     /// Compile a list of closest `n` active peers
@@ -444,8 +450,8 @@ mod test {
         let net_address3 = "/ip4/5.6.7.8/tcp/7000".parse::<Multiaddr>().unwrap();
         let mut net_addresses =
             MultiaddressesWithStats::from_addresses_with_source(vec![net_address1], &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address2, &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address3, &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address2], &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address3], &PeerAddressSource::Config);
         let peer1 = Peer::new(
             pk,
             node_id,
@@ -477,7 +483,7 @@ mod test {
         let net_address6 = "/ip4/17.18.19.20/tcp/8000".parse::<Multiaddr>().unwrap();
         let mut net_addresses =
             MultiaddressesWithStats::from_addresses_with_source(vec![net_address5], &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address6, &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address6], &PeerAddressSource::Config);
         let peer3 = Peer::new(
             pk,
             node_id,
@@ -527,8 +533,8 @@ mod test {
         let net_address3 = "/ip4/5.6.7.8/tcp/7000".parse::<Multiaddr>().unwrap();
         let mut net_addresses =
             MultiaddressesWithStats::from_addresses_with_source(vec![net_address1], &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address2, &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address3, &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address2], &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address3], &PeerAddressSource::Config);
         let peer1 = Peer::new(
             pk,
             node_id,
@@ -560,7 +566,7 @@ mod test {
         let net_address6 = "/ip4/17.18.19.20/tcp/8000".parse::<Multiaddr>().unwrap();
         let mut net_addresses =
             MultiaddressesWithStats::from_addresses_with_source(vec![net_address5], &PeerAddressSource::Config);
-        net_addresses.add_address(&net_address6, &PeerAddressSource::Config);
+        net_addresses.add_or_update_addresses(&[net_address6], &PeerAddressSource::Config);
         let peer3 = Peer::new(
             pk,
             node_id,
@@ -704,7 +710,7 @@ mod test {
             let net_address = format!("/ip4/{}.{}.{}.{}/tcp/{}", n[0], n[1], n[2], n[3], n[4])
                 .parse::<Multiaddr>()
                 .unwrap();
-            net_addresses.add_address(&net_address, &PeerAddressSource::Config);
+            net_addresses.add_or_update_addresses(&[net_address], &PeerAddressSource::Config);
         }
 
         let mut peer = Peer::new(

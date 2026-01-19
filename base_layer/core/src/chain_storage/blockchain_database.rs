@@ -85,6 +85,8 @@ use tari_utilities::{epoch_time::EpochTime, hex::Hex, ByteArray};
 use super::{
     smt_hasher::SmtHasher,
     AccumulatedDataRebuildStatus,
+    BlockchainCheckRequest,
+    CheckFailure,
     MinedInfo,
     PayrefRebuildStatus,
     TemplateRegistrationEntry,
@@ -107,6 +109,7 @@ use crate::{
         db_transaction::{DbKey, DbTransaction, DbValue},
         error::ChainStorageError,
         kernel_merkle_proof::KernelMerkleProof,
+        lmdb_db::{BlockchainCheckStatus, BREATHING_TIME_MS_MAX, BREATHING_TIME_MS_MIN},
         smt_hasher::ValidatorNodeJmtHasher,
         utxo_mined_info::OutputMinedInfo,
         BlockAddResult,
@@ -385,6 +388,7 @@ where B: BlockchainBackend
 
         self.rebuild_payref_indexes_background_task()?;
         self.rebuild_accumulated_data_background_task()?;
+        self.initialize_blockchain_check_tasks()?;
 
         Ok(())
     }
@@ -464,6 +468,508 @@ where B: BlockchainBackend
         });
 
         Ok(())
+    }
+
+    /// This function will check the accumulated data in the background, up to the last stored chain header, and correct
+    /// any corrupt accumulated data it finds.
+    #[allow(clippy::too_many_lines)]
+    pub fn check_accumulated_data_background_task(&self) -> Result<(), ChainStorageError> {
+        // We cannot check the accumulated data if the migration background task has not completed
+        let accumulated_data_rebuild_status = {
+            let db = self.db_read_access()?;
+            db.fetch_accumulated_data_rebuild_status()?
+        };
+        if !accumulated_data_rebuild_status.is_rebuilt {
+            warn!(target: LOG_TARGET, "[AccData check] Accumulated data migration task in progress, cannot continue.");
+            return Err(ChainStorageError::AccDataMigrationStillInProgress);
+        }
+
+        // Now we can continue with the accumulated data check
+        let check_status = self.fetch_accumulated_data_check_status()?;
+
+        let initial_status = if let Some(status) = check_status {
+            if status.checked_status().0 {
+                debug!(target: LOG_TARGET, "[AccData check] Accumulated data check has concluded.");
+                return Ok(());
+            }
+            if status.is_running() {
+                debug!(target: LOG_TARGET, "[AccData check] Accumulated data check is already busy.");
+                return Ok(());
+            }
+            debug!(target: LOG_TARGET, "[AccData check] Accumulated data check in progress: {status:?}.");
+            status
+        } else {
+            return Ok(());
+        };
+
+        {
+            let db = self.db_write_access()?;
+            db.update_accumulated_data_check_status(BlockchainCheckRequest::SetRunState(true))?;
+        }
+        let db_rw_lock = self.db.clone();
+        let rules = self.consensus_manager.clone();
+
+        tokio::task::spawn(async move {
+            let clear_flags = |db: Arc<RwLock<B>>, has_concluded: bool, last_failure: Option<CheckFailure>| match db
+                .write()
+            {
+                Ok(db) => {
+                    if let Err(e) = db.update_accumulated_data_check_status(BlockchainCheckRequest::ClearRunningFlags {
+                        has_concluded,
+                        last_failure,
+                    }) {
+                        error!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Failed to clear the db consistency check status run flags: {e:?}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    error!(target: LOG_TARGET, "[Blockchain check] Write lock on blockchain db failed: {e:?}");
+                },
+            };
+
+            let difficulty_calculator = DifficultyCalculator::new(rules.clone(), RandomXFactory::new(1));
+            // The genesis block will not be at fault - start at height 1 if no data exists.
+            let start_height = initial_status.last_check_height.unwrap_or(1);
+            let mut last_status = initial_status.clone();
+            debug!(
+                target: LOG_TARGET,
+                "[AccData check] Start checking accumulated data from height {start_height}"
+
+            );
+
+            let mut height = start_height;
+            let sleep_ms = last_status
+                .breathing_time_ms
+                .clamp(BREATHING_TIME_MS_MIN, BREATHING_TIME_MS_MAX);
+            let autocorrect_enabled = initial_status.autocorrect_enabled();
+            loop {
+                // Add a small tokio sleep to allow other tasks to run more freely - this will push out the check a bit.
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                let db = db_rw_lock.clone();
+                let difficulty_calculator = difficulty_calculator.clone();
+                // We use `spawn_blocking` with `.await` here to ensure that the async spawned task will be able to
+                // shut down when base node shutdown is triggered
+                let cc = rules.consensus_constants(height).clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    verify_accumulated_data_for_height(db, difficulty_calculator, height, &cc, autocorrect_enabled)
+                })
+                .await;
+                match res {
+                    Ok(Ok(current_status)) => {
+                        last_status = current_status;
+                    },
+                    Ok(ref _err @ Err(ChainStorageError::CorruptedDatabase(ref e))) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[AccData check] Accumulated data check found corruption. Initial \
+                            status: {initial_status:?}. Last updated status: {last_status:?}. ({e})"
+                        );
+                        info!(
+                            target: LOG_TARGET,
+                            "[AccData check] Autocorrect flag is disabled - re-run with autocorrect flag enabled",
+                        );
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            true,
+                            Some(CheckFailure {
+                                corrupt_db: true,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                    Ok(Err(e)) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[AccData check] Checking accumulated data failed. Initial status: {initial_status:?}. \
+                            Last updated status: {last_status:?} ({e})"
+                        );
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            false,
+                            Some(CheckFailure {
+                                corrupt_db: false,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[AccData check] Checking accumulated data failed. Initial status: {initial_status:?}. \
+                            Last updated status: {last_status:?} ({e})",
+                        );
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            false,
+                            Some(CheckFailure {
+                                corrupt_db: false,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                }
+
+                if last_status.checked_status().0 || last_status.stop_if_running {
+                    clear_flags(db_rw_lock.clone(), true, None);
+                    if last_status.checked_status().0 {
+                        debug!(
+                            target: LOG_TARGET,
+                            "[AccData check] Accumulated data check from height {start_height} completed, Final status: \
+                            {last_status:?}"
+                        );
+                    } else {
+                        debug!(
+                            target: LOG_TARGET,
+                            "[AccData check] Accumulated data check stopped as requested, Final status: {last_status:?}"
+                        );
+                    }
+                    break;
+                }
+                height = height.saturating_add(1);
+            }
+        });
+
+        Ok(())
+    }
+
+    /// This function will check the blockchain consistency in the background, up to the last stored chain header, and
+    /// correct any corrupt accumulated data it finds.
+    #[allow(clippy::too_many_lines)]
+    pub fn check_blockchain_consistency_background_task(&self) -> Result<(), ChainStorageError> {
+        // We cannot check the accumulated data if the migration background task has not completed
+        let accumulated_data_rebuild_status = {
+            let db = self.db_read_access()?;
+            db.fetch_accumulated_data_rebuild_status()?
+        };
+        if !accumulated_data_rebuild_status.is_rebuilt {
+            warn!(target: LOG_TARGET, "[Blockchain check] Accumulated data migration task in progress, cannot continue.");
+            return Err(ChainStorageError::AccDataMigrationStillInProgress);
+        }
+
+        // Now we can continue with the accumulated data check
+        let check_status = self.fetch_blockchain_consistency_check_status()?;
+
+        let initial_status = if let Some(status) = check_status {
+            if status.checked_status().0 {
+                debug!(target: LOG_TARGET, "[Blockchain check] Blockchain consistency check has concluded.");
+                return Ok(());
+            }
+            if status.is_running() {
+                debug!(target: LOG_TARGET, "[Blockchain check] Blockchain consistency check is already busy.");
+                return Ok(());
+            }
+            debug!(target: LOG_TARGET, "[Blockchain check] Blockchain consistency check in progress: {status:?}.");
+            status
+        } else {
+            return Ok(());
+        };
+
+        {
+            let db = self.db_write_access()?;
+            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetRunState(true))?;
+        }
+        let db_rw_lock = self.db.clone();
+        let validators = self.validators.clone();
+
+        tokio::task::spawn(async move {
+            let clear_flags =
+                |db: Arc<RwLock<B>>, has_concluded: bool, last_failure: Option<CheckFailure>| match db.write() {
+                    Ok(db) => {
+                        if let Err(e) =
+                            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::ClearRunningFlags {
+                                has_concluded,
+                                last_failure,
+                            })
+                        {
+                            error!(
+                                target: LOG_TARGET,
+                                "[Blockchain check] Failed to clear the db consistency check status run flags: {e:?}"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        error!(target: LOG_TARGET, "[Blockchain check] Write lock on blockchain db failed: {e:?}");
+                    },
+                };
+
+            // The genesis block will not be at fault - start at height 1 if no data exists.
+            let start_height = initial_status.last_check_height.unwrap_or(1);
+            let mut last_status = initial_status.clone();
+            debug!(
+                target: LOG_TARGET,
+                "[Blockchain check] Start checking blockchain consistency from height {start_height}"
+            );
+
+            let mut height = start_height;
+            let sleep_ms = last_status
+                .breathing_time_ms
+                .clamp(BREATHING_TIME_MS_MIN, BREATHING_TIME_MS_MAX);
+            loop {
+                // Add a small tokio sleep to allow other tasks to run more freely - this will push out the check a bit.
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                let db = db_rw_lock.clone();
+                let validators = validators.clone();
+                let full_validation = initial_status.full_validation_enabled();
+                // We use `spawn_blocking` with `.await` here to ensure that the async spawned task will be able to
+                // shut down when base node shutdown is triggered
+                let res = tokio::task::spawn_blocking(move || {
+                    verify_blockchain_consistency_for_height(db, &validators, height, full_validation)
+                })
+                .await;
+                match res {
+                    Ok(Ok(current_status)) => {
+                        last_status = current_status;
+                    },
+                    Ok(ref _err @ Err(ChainStorageError::CorruptedDatabase(ref e))) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Blockchain consistency check found unrecoverable corruption. Initial \
+                            status: {initial_status:?}. Last updated status: {last_status:?}. ({e})"
+                        );
+                        if initial_status.autocorrect_enabled() {
+                            let db_rw_lock = db_rw_lock.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                if let Ok(mut db) = db_rw_lock.write() {
+                                    rewind_to_height(&mut *db, height - 1)
+                                } else {
+                                    Err(ChainStorageError::AccessError(
+                                        "Write lock on blockchain backend failed".into(),
+                                    ))
+                                }
+                            })
+                            .await;
+                            match res {
+                                Ok(Ok(_)) => {
+                                    info!(target: LOG_TARGET,
+                                        "[Blockchain check] Rewound the blockchain to height {} after unrecoverable \
+                                        corruption at height {}.",
+                                        height - 1, height
+                                    );
+                                },
+                                Ok(Err(e)) => {
+                                    error!(target: LOG_TARGET,
+                                        "[Blockchain check] Rewind after unrecoverable corruption at height {height} \
+                                        failed: {e}",
+                                    );
+                                },
+                                Err(e) => {
+                                    error!(target: LOG_TARGET,
+                                        "[Blockchain check] Rewind task join error after unrecoverable corruption at \
+                                        height {height}: {e}",
+                                    );
+                                },
+                            }
+                        } else {
+                            info!(
+                                target: LOG_TARGET,
+                                "[Blockchain check] Autocorrect flag is disabled - manually rewind to height {}",
+                                height - 1,
+                            );
+                        }
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            true,
+                            Some(CheckFailure {
+                                corrupt_db: true,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                    Ok(Err(e)) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Checking blockchain consistency failed. Initial status: \
+                            {initial_status:?}. Last updated status: {last_status:?} ({e})"
+                        );
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            false,
+                            Some(CheckFailure {
+                                corrupt_db: false,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Checking blockchain consistency failed. Initial status: \
+                            {initial_status:?}. Last updated status: {last_status:?} ({e})",
+                        );
+                        clear_flags(
+                            db_rw_lock.clone(),
+                            false,
+                            Some(CheckFailure {
+                                corrupt_db: false,
+                                error: e.to_string(),
+                            }),
+                        );
+                        break;
+                    },
+                }
+
+                if last_status.checked_status().0 || last_status.stop_if_running {
+                    clear_flags(db_rw_lock.clone(), true, None);
+                    if last_status.checked_status().0 {
+                        debug!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Blockchain consistency check from height {start_height} completed, \
+                            Final status: {last_status:?}"
+                        );
+                    } else {
+                        debug!(
+                            target: LOG_TARGET,
+                            "[Blockchain check] Blockchain consistency check stopped as requested, Final status: \
+                            {last_status:?}"
+                        );
+                    }
+                    break;
+                }
+                height = height.saturating_add(1);
+            }
+        });
+
+        Ok(())
+    }
+
+    fn initialize_blockchain_check_tasks(&self) -> Result<(), ChainStorageError> {
+        let db = self.db_write_access()?;
+        db.update_accumulated_data_check_status(BlockchainCheckRequest::SetRunState(false))?;
+        db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetRunState(false))?;
+
+        Ok(())
+    }
+
+    /// Initialize and start the accumulated-data check (difficulty only).
+    pub fn request_accumulated_data_check(
+        &self,
+        auto_correct: bool,
+        breathing_time_ms: u64,
+    ) -> Result<(), ChainStorageError> {
+        {
+            if self
+                .fetch_accumulated_data_check_status()?
+                .unwrap_or_default()
+                .is_running()
+            {
+                return Err(ChainStorageError::InvalidOperation(
+                    "[Blockchain check] Cannot start a new accumulated data check while one is already running."
+                        .to_string(),
+                ));
+            }
+
+            let db = self.db_write_access()?;
+            db.update_accumulated_data_check_status(BlockchainCheckRequest::ResumeCheck)?;
+            db.update_accumulated_data_check_status(BlockchainCheckRequest::SetAutoCorrect(auto_correct))?;
+            db.update_accumulated_data_check_status(BlockchainCheckRequest::SetBreathingTime(breathing_time_ms))?;
+            trace!(
+                target: LOG_TARGET,
+                "[AccData check] Requested accumulated data check: auto_correct({auto_correct})"
+            );
+        }
+        self.check_accumulated_data_background_task()
+    }
+
+    /// Initialize and start the chain consistency check (blocks+headers; full or light).
+    pub fn request_blockchain_consistency_check(
+        &self,
+        full_validation: bool,
+        auto_correct: bool,
+        breathing_time_ms: u64,
+    ) -> Result<(), ChainStorageError> {
+        {
+            if self
+                .fetch_blockchain_consistency_check_status()?
+                .unwrap_or_default()
+                .is_running()
+            {
+                return Err(ChainStorageError::InvalidOperation(
+                    "[Blockchain check] Cannot start a new blockchain consistency check while one is already running."
+                        .to_string(),
+                ));
+            }
+
+            let db = self.db_write_access()?;
+            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::ResumeCheck)?;
+            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetFullValidation(full_validation))?;
+            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetAutoCorrect(auto_correct))?;
+            db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetBreathingTime(breathing_time_ms))?;
+            trace!(
+                target: LOG_TARGET,
+                "[Blockchain check] Requested blockchain consistency check: auto_correct({auto_correct}), \
+                full_validation({full_validation})"
+            );
+        }
+        self.check_blockchain_consistency_background_task()
+    }
+
+    /// Stop the accumulated data check task.
+    pub fn stop_running_accumulated_data_check_task(&self) -> Result<(), ChainStorageError> {
+        let db = self.db_write_access()?;
+        db.update_accumulated_data_check_status(BlockchainCheckRequest::SetStopIfRunning(true))?;
+        trace!(target: LOG_TARGET, "[AccData check] Requested stop");
+        Ok(())
+    }
+
+    /// Stop the blockchain consistency task.
+    pub fn stop_running_blockchain_consistency_check_task(&self) -> Result<(), ChainStorageError> {
+        let db = self.db_write_access()?;
+        db.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetStopIfRunning(true))?;
+        trace!(target: LOG_TARGET, "[Blockchain check] Requested stop");
+        Ok(())
+    }
+
+    /// Reset the accumulated data check counters.
+    pub fn reset_accumulated_data_check_db_counters(&self) -> Result<(), ChainStorageError> {
+        let acc_diff_status = self.fetch_accumulated_data_check_status()?;
+        if let Some(acc_diff) = acc_diff_status {
+            if acc_diff.is_running() {
+                return Err(ChainStorageError::InvalidOperation(
+                    "[AccData check] Cannot reset counters while a check is running.".to_string(),
+                ));
+            }
+        }
+        let db = self.db_write_access()?;
+        db.update_accumulated_data_check_status(BlockchainCheckRequest::ResetAllCounters)?;
+        trace!(target: LOG_TARGET, "[AccData check] Requested reset counters");
+        Ok(())
+    }
+
+    /// Reset the blockchain consistency check counters.
+    pub fn reset_blockchain_consistency_check_db_counters(&self) -> Result<(), ChainStorageError> {
+        let consistency_status = self.fetch_blockchain_consistency_check_status()?;
+        if let Some(consistency) = consistency_status {
+            if consistency.is_running() {
+                return Err(ChainStorageError::InvalidOperation(
+                    "[Blockchain check] Cannot reset counters while a check is running.".to_string(),
+                ));
+            }
+        }
+        let db = self.db_write_access()?;
+        db.update_blockchain_consistency_check_status(BlockchainCheckRequest::ResetAllCounters)?;
+        trace!(target: LOG_TARGET, "[Blockchain check] Requested reset counters");
+        Ok(())
+    }
+
+    /// Fetch the current status of the accumulated data check task.
+    pub fn fetch_accumulated_data_check_status(&self) -> Result<Option<BlockchainCheckStatus>, ChainStorageError> {
+        let db = self.db_read_access()?;
+        db.fetch_accumulated_data_check_status()
+    }
+
+    /// Fetch the current status of the blockchain consistency check task.
+    pub fn fetch_blockchain_consistency_check_status(
+        &self,
+    ) -> Result<Option<BlockchainCheckStatus>, ChainStorageError> {
+        let db = self.db_read_access()?;
+        db.fetch_blockchain_consistency_check_status()
     }
 
     /// This function will rebuild the payref indexes in the background if they are not already rebuilt.
@@ -1434,6 +1940,12 @@ where B: BlockchainBackend
         fetch_block_by_hash(&*db, hash, compact)
     }
 
+    /// Attempt to fetch the block corresponding to the provided hash from the main chain
+    pub fn fetch_orphan_blocks(&self) -> Result<Vec<ChainHeader>, ChainStorageError> {
+        let db = self.db_read_access()?;
+        fetch_orphan_blocks(&*db)
+    }
+
     /// Attempt to fetch the block corresponding to the provided kernel hash from the main chain, if the block is past
     /// pruning horizon, it will return Ok<None>
     pub fn fetch_block_with_kernel(
@@ -1550,6 +2062,11 @@ where B: BlockchainBackend
     ) -> Result<Vec<ValidatorNodeRegistrationInfo>, ChainStorageError> {
         let db = self.db_read_access()?;
         db.fetch_all_active_validator_nodes(height)
+    }
+
+    pub fn fetch_all_orphans(&self) -> Result<Vec<ChainHeader>, ChainStorageError> {
+        let db = self.db_read_access()?;
+        db.fetch_all_orphans()
     }
 
     pub fn fetch_active_validator_nodes(
@@ -2140,6 +2657,10 @@ fn fetch_block_by_hash<T: BlockchainBackend>(
         return Ok(Some(fetch_block(db, header.height, compact)?));
     }
     Ok(None)
+}
+
+fn fetch_orphan_blocks<T: BlockchainBackend>(db: &T) -> Result<Vec<ChainHeader>, ChainStorageError> {
+    db.fetch_all_orphans()
 }
 
 fn check_for_valid_height<T: BlockchainBackend>(db: &T, height: u64) -> Result<(u64, bool), ChainStorageError> {
@@ -3100,7 +3621,172 @@ fn process_accumulated_data_for_height<B: BlockchainBackend>(
         .with_total_kernel_offset(header.total_kernel_offset.clone())
         .build(consensus_constants)?;
 
-    let status = write_lock.update_accumulated_difficulty(height, accumulated_data, last_chain_header)?;
+    let status = write_lock.update_accumulated_difficulty(height, accumulated_data, last_chain_header, true)?;
+
+    Ok(status)
+}
+
+// Verify accumulated data for the given height, fixing it if needed
+fn verify_accumulated_data_for_height<B: BlockchainBackend>(
+    db: Arc<RwLock<B>>,
+    difficulty_calculator: DifficultyCalculator,
+    height: u64,
+    consensus_constants: &ConsensusConstants,
+    autocorrect: bool,
+) -> Result<BlockchainCheckStatus, ChainStorageError> {
+    debug!(target: LOG_TARGET, "[AccData check] Checking accumulated data for height {height}");
+
+    let read_lock = db
+        .read()
+        .map_err(|_e| ChainStorageError::AccessError("Read lock on blockchain backend failed".into()))?;
+    let last_chain_header = read_lock.fetch_last_chain_header()?;
+    // Safety check to ensure we do not check accumulated data for a height that has been reorged out.
+    let height = min(height, last_chain_header.height());
+
+    // Check the accumulated data for the given height
+    let chain_header = read_lock.fetch_chain_header_by_height(height)?;
+    let header = chain_header.header().clone();
+    let prev_chain_header = read_lock.fetch_chain_header_by_height(height.saturating_sub(1))?;
+
+    let achieved_difficulty = difficulty_calculator.check_achieved_and_target_difficulty(&*read_lock, &header)?;
+    drop(read_lock);
+
+    let calculated_accumulated_data =
+        BlockHeaderAccumulatedDataBuilder::from_previous(prev_chain_header.accumulated_data())
+            .with_hash(header.hash())
+            .with_achieved_target_difficulty(achieved_difficulty)
+            .with_total_kernel_offset(header.total_kernel_offset.clone())
+            .build(consensus_constants)?;
+
+    let current_accumulated_data = chain_header.accumulated_data();
+
+    if &calculated_accumulated_data == current_accumulated_data {
+        trace!(
+            target: LOG_TARGET,
+            "[AccData check] Accumulated data for height {height} is correct. No update needed."
+        );
+    } else if autocorrect {
+        let write_lock = db
+            .write()
+            .map_err(|_e| ChainStorageError::AccessError("Write lock on blockchain backend failed".into()))?;
+        write_lock.update_accumulated_difficulty(height, calculated_accumulated_data, last_chain_header, false)?;
+        info!(
+            target: LOG_TARGET,
+            "[AccData check] Accumulated data for height {height} was corrupted, but rebuilt."
+        );
+    } else {
+        return Err(ChainStorageError::CorruptedDatabase(format!(
+            "Accumulated data for height {height} is corrupted."
+        )));
+    }
+
+    let write_lock = db
+        .write()
+        .map_err(|_e| ChainStorageError::AccessError("Write lock on blockchain backend failed".into()))?;
+    let last_chain_header = write_lock.fetch_last_chain_header()?;
+    let status = write_lock.update_accumulated_data_check_status(BlockchainCheckRequest::SetCheckResult {
+        has_concluded: height == last_chain_header.height(),
+        last_check_height: height,
+        current_height: last_chain_header.height(),
+    })?;
+
+    Ok(status)
+}
+
+// Verify blockchain consistency for the given height
+fn verify_blockchain_consistency_for_height<B: BlockchainBackend>(
+    db: Arc<RwLock<B>>,
+    validators: &Validators<B>,
+    height: u64,
+    full_validation: bool,
+) -> Result<BlockchainCheckStatus, ChainStorageError> {
+    debug!(target: LOG_TARGET, "[Blockchain check] Checking blockchain data for height {height} with full_validation({full_validation})");
+
+    let read_lock = db
+        .read()
+        .map_err(|_e| ChainStorageError::AccessError("Read lock on blockchain backend failed".into()))?;
+    let last_chain_header = read_lock.fetch_last_chain_header()?;
+    // Safety check to ensure we do not check accumulated data for a height that has been reorged out.
+    let height = min(height, last_chain_header.height());
+
+    let block_data = {
+        let metadata = read_lock.fetch_chain_metadata()?;
+        let horizon_height = metadata.pruned_height_at_given_chain_tip(height);
+        if height > horizon_height {
+            let historical_block = fetch_block(&*read_lock, height, false).map_err(|e| {
+                ChainStorageError::CorruptedDatabase(format!("Could not fetch block for height {height}: {e}"))
+            })?;
+            Some((
+                historical_block.block().clone(),
+                historical_block.accumulated_data().clone(),
+            ))
+        } else {
+            None
+        }
+    };
+    let prev_chain_header = read_lock.fetch_chain_header_by_height(height.saturating_sub(1))?;
+    let this_block_header = if let Some((ref block, ref _accumulated_data)) = block_data {
+        block.header.clone()
+    } else {
+        read_lock.fetch_chain_header_by_height(height)?.header().clone()
+    };
+    drop(read_lock);
+
+    // Simple consistency checks
+    if &this_block_header.prev_hash != prev_chain_header.hash() {
+        return Err(ChainStorageError::CorruptedDatabase(format!(
+            "Block at height {height} has invalid previous hash"
+        )));
+    }
+    if this_block_header.height != prev_chain_header.height() + 1 {
+        return Err(ChainStorageError::CorruptedDatabase(format!(
+            "Block at height {height} does not follow previous header height"
+        )));
+    }
+
+    // Full validation of block body and internal consistency if requested
+    if full_validation {
+        if let Some((block, accumulated_data)) = block_data {
+            let read_lock = db
+                .read()
+                .map_err(|_e| ChainStorageError::AccessError("Read lock on blockchain backend failed".into()))?;
+            let block_hash = block.hash();
+            let accumulated_data_hash = accumulated_data.hash;
+            let chain_block = ChainBlock::try_construct(Arc::new(block), accumulated_data).ok_or_else(|| {
+                ChainStorageError::CorruptedDatabase(format!(
+                    "Inconsistent hash in historical block: block hash {} vs. acc_data hash {}",
+                    block_hash, accumulated_data_hash
+                ))
+            })?;
+            let block_validator = validators.block.clone();
+            block_validator
+                .validate_body_at_height(&read_lock, &chain_block)
+                .map_err(|e| {
+                    ChainStorageError::CorruptedDatabase(format!(
+                        "Block body validation failed for height {height}: {e}"
+                    ))
+                })?;
+
+            let orphan_validator = validators.orphan.clone();
+            orphan_validator
+                .validate_internal_consistency(chain_block.block())
+                .map_err(|e| {
+                    ChainStorageError::CorruptedDatabase(format!(
+                        "Block internal consistency validation failed for height {height}: {e}"
+                    ))
+                })?;
+        }
+    }
+
+    let write_lock = db
+        .write()
+        .map_err(|_e| ChainStorageError::AccessError("Write lock on blockchain backend failed".into()))?;
+    let last_chain_header = write_lock.fetch_last_chain_header()?;
+    let status = write_lock.update_blockchain_consistency_check_status(BlockchainCheckRequest::SetCheckResult {
+        has_concluded: height == last_chain_header.height(),
+        last_check_height: height,
+        current_height: last_chain_header.height(),
+    })?;
 
     Ok(status)
 }
@@ -3180,7 +3866,7 @@ mod test {
                 .map(Arc::new)
                 .unwrap();
             let (_, chain) =
-                create_orphan_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120), ("C->B", 1, 120)], genesis).await;
+                create_orphan_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120), ("C->B", 1, 120)], genesis);
             let access = db.db_read_access().unwrap();
             let orphan_chain = get_orphan_link_main_chain(&*access, chain.get("C").unwrap().hash()).unwrap();
             assert_eq!(orphan_chain[2].hash(), chain.get("C").unwrap().hash());
@@ -3198,8 +3884,7 @@ mod test {
                 ("B->A", 1, 120),
                 ("C->B", 1, 120),
                 ("D->C", 1, 120),
-            ])
-            .await;
+            ]);
             // Create reorg chain
             let fork_root = mainchain.get("B").unwrap().clone();
             let (_, reorg_chain) = create_orphan_chain(
@@ -3211,8 +3896,7 @@ mod test {
                     ("F2->E2", 1, 120),
                 ],
                 fork_root,
-            )
-            .await;
+            );
             let access = db.db_read_access().unwrap();
             let orphan_chain = get_orphan_link_main_chain(&*access, reorg_chain.get("F2").unwrap().hash()).unwrap();
 
@@ -3245,7 +3929,7 @@ mod test {
                 .try_into_chain_block()
                 .map(Arc::new)
                 .unwrap();
-            let (_, chain) = create_chained_blocks(&db, &[("A->GB", 1u64, 120u64)], genesis_block).await;
+            let (_, chain) = create_chained_blocks(&db, &[("A->GB", 1u64, 120u64)], genesis_block);
             let block = chain.get("A").unwrap().clone();
             let mut access = db.db_write_access().unwrap();
             insert_orphan_and_find_new_tips(&mut *access, block.to_arc_block(), &validator, &db.consensus_manager)
@@ -3259,15 +3943,14 @@ mod test {
         async fn it_inserts_true_orphan_chain() {
             let db = create_new_blockchain();
             let validator = MockValidator::new(true);
-            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120)]).await;
+            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120)]);
 
             let block_b = main_chain.get("B").unwrap().clone();
             let (_, orphan_chain) = create_chained_blocks(
                 &db,
                 &[("C2->GB", 1, 120), ("D2->C2", 1, 120), ("E2->D2", 1, 120)],
                 block_b,
-            )
-            .await;
+            );
             let mut access = db.db_write_access().unwrap();
 
             let block_d2 = orphan_chain.get("D2").unwrap().clone();
@@ -3286,10 +3969,10 @@ mod test {
         async fn it_correctly_handles_duplicate_blocks() {
             let db = create_new_blockchain();
             let validator = MockValidator::new(true);
-            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120)]).await;
+            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120)]);
 
             let fork_root = main_chain.get("A").unwrap().clone();
-            let (_, orphan_chain) = create_chained_blocks(&db, &[("B2->GB", 1, 120)], fork_root).await;
+            let (_, orphan_chain) = create_chained_blocks(&db, &[("B2->GB", 1, 120)], fork_root);
             let mut access = db.db_write_access().unwrap();
 
             let block = orphan_chain.get("B2").unwrap().clone();
@@ -3321,8 +4004,7 @@ mod test {
                 ("E->D", 1, 120),
                 ("F->E", 1, 120),
                 ("G->F", 1, 120),
-            ])
-            .await;
+            ]);
 
             // Fork 1 (with 3 blocks)
             let fork_root_1 = main_chain.get("A").unwrap().clone();
@@ -3331,16 +4013,15 @@ mod test {
                 &db,
                 &[("B2->GB", 1, 120), ("C2->B2", 1, 120), ("D2->C2", 1, 120)],
                 fork_root_1,
-            )
-            .await;
+            );
 
             // Fork 2 (with 1 block)
             let fork_root_2 = main_chain.get("GB").unwrap().clone();
-            let (_, orphan_chain_2) = create_chained_blocks(&db, &[("B3->GB", 1, 120)], fork_root_2).await;
+            let (_, orphan_chain_2) = create_chained_blocks(&db, &[("B3->GB", 1, 120)], fork_root_2);
 
             // Fork 3 (with 1 block)
             let fork_root_3 = main_chain.get("B").unwrap().clone();
-            let (_, orphan_chain_3) = create_chained_blocks(&db, &[("B4->GB", 1, 120)], fork_root_3).await;
+            let (_, orphan_chain_3) = create_chained_blocks(&db, &[("B4->GB", 1, 120)], fork_root_3);
 
             // Add blocks to db
             let mut access = db.db_write_access().unwrap();
@@ -3412,7 +4093,7 @@ mod test {
         async fn it_links_many_orphan_branches_to_main_chain() {
             let test = TestHarness::setup();
             let (_, main_chain) =
-                create_main_chain(&test.db, block_specs!(["1a->GB"], ["2a->1a"], ["3a->2a"], ["4a->3a"])).await;
+                create_main_chain(&test.db, block_specs!(["1a->GB"], ["2a->1a"], ["3a->2a"], ["4a->3a"]));
             let genesis = main_chain.get("GB").unwrap().clone();
 
             let fork_root = main_chain.get("1a").unwrap().clone();
@@ -3420,8 +4101,7 @@ mod test {
                 &test.db,
                 block_specs!(["2b->GB"], ["3b->2b"], ["4b->3b"], ["5b->4b"], ["6b->5b"]),
                 fork_root,
-            )
-            .await;
+            );
 
             // Add orphans out of height order
             for name in ["5b", "3b", "4b", "6b"] {
@@ -3436,8 +4116,7 @@ mod test {
                 &test.db,
                 block_specs!(["4c->GB"], ["5c->4c"], ["6c->5c"], ["7c->6c"]),
                 fork_root,
-            )
-            .await;
+            );
 
             for name in ["7c", "5c", "6c", "4c"] {
                 let block = orphan_chain_c.get(name).unwrap();
@@ -3450,8 +4129,7 @@ mod test {
                 &test.db,
                 block_specs!(["7d->GB", difficulty: Difficulty::from_u64(10).unwrap()]),
                 fork_root,
-            )
-            .await;
+            );
 
             let block = orphan_chain_d.get("7d").unwrap();
             let result = test.handle_possible_reorg(block.to_arc_block()).unwrap();
@@ -3521,8 +4199,7 @@ mod test {
                     ["12a->11a"],
                     ["13a->12a"],
                 ),
-            )
-            .await;
+            );
             let genesis = main_chain.get("GB").unwrap().clone();
             let fork_root = main_chain.get("1a").unwrap().clone();
             let (_, orphan_chain_b) = create_chained_blocks(
@@ -3541,8 +4218,7 @@ mod test {
                     ["12b->11b", difficulty: Difficulty::from_u64(5).unwrap()]
                 ),
                 fork_root,
-            )
-            .await;
+            );
 
             // Add orphans out of height order
             let mut unordered = vec!["3b", "4b", "5b", "6b", "7b", "8b", "9b", "10b", "11b", "12b"];
@@ -3594,15 +4270,14 @@ mod test {
         async fn it_errors_if_reorging_to_an_invalid_height() {
             let test = TestHarness::setup();
             let (_, main_chain) =
-                create_main_chain(&test.db, block_specs!(["1a->GB"], ["2a->1a"], ["3a->2a"], ["4a->3a"])).await;
+                create_main_chain(&test.db, block_specs!(["1a->GB"], ["2a->1a"], ["3a->2a"], ["4a->3a"]));
 
             let fork_root = main_chain.get("1a").unwrap().clone();
             let (_, orphan_chain_b) = create_chained_blocks(
                 &test.db,
                 block_specs!(["2b->GB", height: 10, difficulty: Difficulty::from_u64(10).unwrap()]),
                 fork_root,
-            )
-            .await;
+            );
 
             let block = orphan_chain_b.get("2b").unwrap().clone();
             let err = test.handle_possible_reorg(block.to_arc_block()).unwrap_err();
@@ -3615,12 +4290,10 @@ mod test {
             let (_, main_chain) = create_main_chain(
                 &test.db,
                 block_specs!(["1a->GB", difficulty: Difficulty::from_u64(2).unwrap()]),
-            )
-            .await;
+            );
 
             let fork_root = main_chain.get("GB").unwrap().clone();
-            let (_, orphan_chain_b) =
-                create_orphan_chain(&test.db, block_specs!(["1b->GB", height: 10]), fork_root).await;
+            let (_, orphan_chain_b) = create_orphan_chain(&test.db, block_specs!(["1b->GB", height: 10]), fork_root);
 
             let block = orphan_chain_b.get("1b").unwrap().clone();
             test.handle_possible_reorg(block.to_arc_block())
@@ -3632,9 +4305,7 @@ mod test {
     #[tokio::test]
     async fn test_handle_possible_reorg_case1() {
         // Normal chain
-        let (result, _blocks) = test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("B->A", 1, 120)])
-            .await
-            .unwrap();
+        let (result, _blocks) = test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("B->A", 1, 120)]).unwrap();
         result[0].assert_added();
         result[1].assert_added();
     }
@@ -3643,9 +4314,7 @@ mod test {
     #[tokio::test]
     async fn test_handle_possible_reorg_case2() {
         let (result, blocks) =
-            test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("B->A", 1, 120), ("A2->GB", 3, 120)])
-                .await
-                .unwrap();
+            test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("B->A", 1, 120), ("A2->GB", 3, 120)]).unwrap();
         result[0].assert_added();
         result[1].assert_added();
         result[2].assert_reorg(1, 2);
@@ -3657,9 +4326,7 @@ mod test {
     async fn test_handle_possible_reorg_case3() {
         // Switch to new chain and then reorg back
         let (result, blocks) =
-            test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("A2->GB", 2, 120), ("B->A", 2, 120)])
-                .await
-                .unwrap();
+            test_case_handle_possible_reorg(&[("A->GB", 1, 120), ("A2->GB", 2, 120), ("B->A", 2, 120)]).unwrap();
         result[0].assert_added();
         result[1].assert_reorg(1, 1);
         result[2].assert_reorg(2, 1);
@@ -3676,7 +4343,6 @@ mod test {
             ("A3->GB", 4, 120),
             ("C->B", 2, 120),
         ])
-        .await
         .unwrap();
         result[0].assert_added();
         result[1].assert_reorg(1, 1);
@@ -3701,7 +4367,6 @@ mod test {
             ("D3->C", 7, 120),
             ("D4->C", 8, 120),
         ])
-        .await
         .unwrap();
         result[0].assert_added();
         result[1].assert_added();
@@ -3736,8 +4401,7 @@ mod test {
             ("B->A", 1, 120),
             ("C->B", 1, 120),
             ("D->C", 1, 120),
-        ])
-        .await;
+        ]);
 
         let mock_validator = MockValidator::new(true);
         let chain_strength_comparer = strongest_chain().by_sha3x_difficulty().build();
@@ -3747,8 +4411,7 @@ mod test {
             &db,
             &[("C2->GB", 1, 120), ("D2->C2", 1, 120), ("E2->D2", 1, 120)],
             fork_block,
-        )
-        .await;
+        );
 
         // Add true orphans
         let mut access = db.db_write_access().unwrap();
@@ -3817,15 +4480,14 @@ mod test {
             ("B->A", 1, 120),
             ("C->B", 1, 120),
             ("D->C", 1, 120),
-        ])
-        .await;
+        ]);
 
         let mock_validator = MockValidator::new(true);
         let chain_strength_comparer = strongest_chain().by_sha3x_difficulty().build();
         // we only need a smt, this one will not be technically correct, but due to the use of mockvalidators(true),
         // they will pass all mr tests
         let fork_block = mainchain.get("C").unwrap().clone();
-        let (_, reorg_chain) = create_chained_blocks(&db, &[("D2->GB", 1, 120), ("E2->D2", 2, 120)], fork_block).await;
+        let (_, reorg_chain) = create_chained_blocks(&db, &[("D2->GB", 1, 120), ("E2->D2", 2, 120)], fork_block);
 
         // Add true orphans
         let mut access = db.db_write_access().unwrap();
@@ -3867,7 +4529,6 @@ mod test {
             ("C2->B", 20, 69),
             ("D2->C2", 40, 40),
         ])
-        .await
         .unwrap();
         let mut expected_target_difficulties = vec![];
         expected_target_difficulties.extend(result[0].added_blocks());
@@ -3888,7 +4549,6 @@ mod test {
             ("C2->B", 20, 69),
             ("D2->C2", 40, 40),
         ])
-        .await
         .unwrap();
 
         result[0].assert_added();
@@ -3919,8 +4579,7 @@ mod test {
                 ["H6->H5"],
                 ["H7->H6"]
             ),
-        )
-        .await;
+        );
 
         // 3. Collect headers to "bank" (H4, H5, H6, H7)
         let banked_headers: Vec<_> = ["H4".to_string(), "H5".to_string(), "H6".to_string(), "H7".to_string()]
@@ -3946,7 +4605,7 @@ mod test {
             .all(|h| test.db.fetch_header_by_block_hash(*h.hash()).unwrap().is_some()));
 
         // 6. Create a new block that builds on the fork root (propagated block)
-        let (_, reorg_chain) = create_chained_blocks(&test.db, block_specs!(["newB->GB"]), fork_root).await;
+        let (_, reorg_chain) = create_chained_blocks(&test.db, block_specs!(["newB->GB"]), fork_root);
         let new_block = reorg_chain.get("newB").unwrap().clone().to_arc_block();
 
         // 7/ Reorg the blockchain to add the new block back in
@@ -3972,7 +4631,6 @@ mod test {
             ("D2->C2", 25, 70),
             ("E2->D2", 30, 70),
         ])
-        .await
         .unwrap();
         let mut expected_target_difficulties = vec![];
         expected_target_difficulties.extend(result[0].added_blocks());
@@ -3996,7 +4654,6 @@ mod test {
             ("D2->C2", 25, 70),
             ("E2->D2", 30, 70),
         ])
-        .await
         .unwrap();
         result[0].assert_added();
         result[1].assert_added();
@@ -4028,7 +4685,6 @@ mod test {
             ("E1->D1", 1, 120), // Chain 1 at 12
             ("E2->D2", 1, 120), // Chain 2 at 12
         ])
-        .await
         .unwrap();
 
         result[0].assert_added();
@@ -4154,7 +4810,7 @@ mod test {
     }
 
     #[allow(clippy::type_complexity)]
-    async fn test_case_handle_possible_reorg<T: Into<BlockSpecs>>(
+    fn test_case_handle_possible_reorg<T: Into<BlockSpecs>>(
         blocks: T,
     ) -> Result<(Vec<BlockAddResult>, HashMap<String, Arc<ChainBlock>>), ChainStorageError> {
         let test = TestHarness::setup();
@@ -4165,7 +4821,7 @@ mod test {
             .try_into_chain_block()
             .map(Arc::new)
             .unwrap();
-        let (block_names, chain) = { create_chained_blocks(&test.db, blocks, genesis_block).await };
+        let (block_names, chain) = { create_chained_blocks(&test.db, blocks, genesis_block) };
 
         let mut results = vec![];
         for name in block_names {

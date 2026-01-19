@@ -1,7 +1,10 @@
 // Copyright 2025 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -50,6 +53,7 @@ pub struct ApiDoc;
 pub struct Server<S> {
     port: u16,
     query_service: Arc<S>,
+    listen_ip: IpAddr,
     mempool_handle: MempoolHandle,
     shutdown_signal: ShutdownSignal,
     cache_cfg: HttpCacheConfig,
@@ -58,6 +62,7 @@ pub struct Server<S> {
 impl<S: BaseNodeWalletQueryService> Server<S> {
     pub fn new(
         port: u16,
+        listen_ip: IpAddr,
         query_service: S,
         mempool: MempoolHandle,
         shutdown_signal: ShutdownSignal,
@@ -65,6 +70,7 @@ impl<S: BaseNodeWalletQueryService> Server<S> {
     ) -> Self {
         Self {
             port,
+            listen_ip,
             query_service: Arc::new(query_service),
             mempool_handle: mempool,
             shutdown_signal,
@@ -80,6 +86,7 @@ impl<S: BaseNodeWalletQueryService> Server<S> {
             .route("/get_header_by_height", get(handler::get_header_by_height::handle::<B>))
             .route("/get_height_at_time", get(handler::get_height_at_time::handle::<B>))
             .route("/get_utxos_mined_info", get(handler::get_utxos_mined_info::handle::<B>))
+            .route("/fetch_utxo", get(handler::get_utxo::handle::<B>))
             .route(
                 "/get_utxos_deleted_info",
                 get(handler::get_utxos_deleted_info::handle::<B>).layer(DefaultBodyLimit::disable()),
@@ -104,17 +111,21 @@ impl<S: BaseNodeWalletQueryService> Server<S> {
                 "/generate_kernel_merkle_proof",
                 get(handler::generate_kernel_merkle_proof::handle::<B>),
             )
-            .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
+            // A large transaction with 2_316 inputs, 154 outputs and byte size 2_109_809 translated to 4_853_330 JSON
+            // object bytes, ~ 2.3 times larger. So we set the limit here to 2.5 times 4 MB.
+            .layer(RequestBodyLimitLayer::new(25 * 4 * 1024 * 1024 / 10))
             .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", ApiDoc::openapi()))
             .layer(Extension(self.query_service.clone()))
             .layer(Extension(self.mempool_handle.clone()))
             .layer(Extension(Arc::new(self.cache_cfg.clone())));
+        let listen_ip = self.listen_ip;
+        let address = SocketAddr::new(listen_ip, port);
 
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+        let listener = TcpListener::bind(address).await?;
 
         // spawn server
         tokio::spawn(async move {
-            info!(target: LOG_TARGET, "Wallet query HTTP server listening at 0.0.0.0:{port}");
+            info!(target: LOG_TARGET, "Wallet query HTTP server listening at {listen_ip}:{port}");
             if let Err(error) = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown_signal)
                 .await

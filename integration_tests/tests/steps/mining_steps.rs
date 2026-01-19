@@ -409,7 +409,7 @@ async fn spend_outputs_via(world: &mut TariWorld, inputs: String, node: String) 
     let tx_name = format!("TX-{num}");
     let utxo_name = format!("UTXO-{num}");
 
-    create_tx_spending_coinbase(world, tx_name.clone(), inputs, utxo_name.clone()).await;
+    create_tx_spending_coinbase(world, tx_name.clone(), inputs, utxo_name.clone());
     submit_transaction_to(world, tx_name, node).await.unwrap();
 }
 

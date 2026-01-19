@@ -19,10 +19,11 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use rand::{rngs::OsRng, RngCore};
 use tari_common_types::{
-    key_branches::TransactionKeyManagerBranch,
     tari_address::TariAddress,
+    transaction::TxId,
     types::{CompressedPublicKey, FixedHash},
 };
 use tari_script::{
@@ -70,7 +71,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
 
     #[allow(clippy::too_many_lines)]
     pub async fn create_deposit_multisig_transaction(
-        &self,
+        &mut self,
         amount: MicroMinotari,
         party_number: u8,
         public_keys: Vec<CompressedPublicKey>,
@@ -84,6 +85,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
             Vec<FixedHash>,
             Vec<FixedHash>,
             Option<Vec<WalletOutput>>,
+            TxId,
         ),
         TransactionBuilderError,
     > {
@@ -107,8 +109,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
 
         let sender_offset_key = self
             .key_manager
-            .get_next_key(TransactionKeyManagerBranch::OneSidedSenderOffset.get_branch_key())
-            .await?;
+            .get_random_key(None, Some(LedgerKeyBranch::OneSidedSenderOffset))?;
 
         let recipient_spend_key = recipient.public_spend_key();
 
@@ -131,7 +132,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
         };
 
         let ephemeral_pubkeys =
-            derive_multisig_ephemeral_pubkeys(&self.key_manager, &public_keys, &sender_offset_key.key_id).await?;
+            derive_multisig_ephemeral_pubkeys(&self.key_manager, &public_keys, &sender_offset_key.key_id)?;
 
         let mut script_opcodes = vec![Opcode::CheckMultiSigVerify(
             party_number,
@@ -142,8 +143,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
 
         let script_pubkey = self
             .key_manager
-            .stealth_address_script_spending_key(&commitment_mask_key_id, recipient_spend_key)
-            .await?;
+            .stealth_address_script_spending_key(&commitment_mask_key_id, recipient_spend_key)?;
 
         script_opcodes.push(Opcode::PushPubKey(script_pubkey.clone().into()));
 
@@ -153,25 +153,20 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
             .with_script(final_script.clone())
             .with_features(OutputFeatures::default())
             .with_input_data(ExecutionStack::default())
-            .encrypt_data_for_recovery(&self.key_manager, Some(&encryption_key_id), payment_id.clone())
-            .await?
+            .encrypt_data_for_recovery(&self.key_manager, Some(&encryption_key_id), payment_id.clone())?
             .with_script_key(TariKeyId::Zero)
             .with_sender_offset_public_key(sender_offset_public_key.clone())
-            .sign_as_sender_and_receiver_verified(&self.key_manager, &sender_offset_key.key_id, &recipient)
-            .await?
-            .try_build(&self.key_manager)
-            .await?;
+            .sign_metadata_signature_user_verified(&self.key_manager, &sender_offset_key.key_id, &recipient)?
+            .try_build(&self.key_manager)?;
 
-        tx_builder
-            .add_recipient(
-                recipient,
-                output.clone(),
-                Some(sender_offset_key.key_id),
-                Some(encryption_key_id),
-            )
-            .await?;
+        tx_builder.add_recipient(
+            recipient,
+            output.clone(),
+            Some(sender_offset_key.key_id),
+            Some(encryption_key_id),
+        )?;
 
-        let finalized_builder = tx_builder.build().await?;
+        let finalized_builder = tx_builder.build()?;
 
         let (change_hashes, change) = match finalized_builder.change {
             Some(change_output) => {
@@ -189,11 +184,12 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
             sent_hashes,
             change_hashes,
             change,
+            finalized_builder.tx_id,
         ))
     }
 
     #[allow(clippy::too_many_lines)]
-    pub async fn spend_multisig_utxo(
+    pub fn spend_multisig_utxo(
         &self,
         signatures: Vec<CompressedCheckSigSchnorrSignature>,
         recipient: TariAddress,
@@ -226,7 +222,7 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
         let amount = output.value();
 
         let mut tx_builder =
-            TransactionBuilder::new(consensus_constants.clone(), key_manager.clone(), recipient.network()).await?;
+            TransactionBuilder::new(consensus_constants.clone(), key_manager.clone(), recipient.network())?;
         let fee_calculator = Fee::new(*consensus_constants.transaction_weight_params());
         let fee_per_gram = MicroMinotari::from(1);
         let script = push_pubkey_script(&Default::default());
@@ -262,15 +258,13 @@ where TKeyManagerInterface: TransactionKeyManagerInterface
             .checked_sub(fee)
             .ok_or(TransactionError::BuilderError("Amount too small to cover fee".into()))?;
 
-        tx_builder.with_input(input_wallet_output).await?;
+        tx_builder.with_input(input_wallet_output)?;
         tx_builder.with_fee_per_gram(fee_per_gram);
         tx_builder.with_lock_height(0);
 
-        tx_builder
-            .add_stealth_recipient(recipient, total_amount, OutputFeatures::default(), payment_id.clone())
-            .await?;
+        tx_builder.add_stealth_recipient(recipient, total_amount, OutputFeatures::default(), payment_id.clone())?;
 
-        let tx = match tx_builder.build().await {
+        let tx = match tx_builder.build() {
             Ok(tx) => tx,
             Err(e) => {
                 return Err(TransactionError::BuilderError(format!("Failed to build transaction: {:?}", e)).into());

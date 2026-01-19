@@ -1,6 +1,7 @@
 // Copyright 2025 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
-use std::sync::Arc;
+
+use std::{fmt::Display, sync::Arc};
 
 use axum::{
     extract::Query,
@@ -11,11 +12,17 @@ use axum::{
 };
 use log::debug;
 use serde::Deserialize;
+use tari_common_types::types::HashOutput;
 use tari_core::{
     base_node::rpc::{query_service, BaseNodeWalletQueryService},
     chain_storage::BlockchainBackend,
 };
-use tari_transaction_components::rpc::models::{SyncUtxosByBlockRequest, SyncUtxosByBlockResponse};
+use tari_transaction_components::rpc::models::{
+    SyncUtxosByBlockRequest,
+    SyncUtxosByBlockResponseV0,
+    SyncUtxosByBlockResponseV1,
+};
+use tari_utilities::hex::Hex;
 use tonic::service::AxumBody;
 
 use crate::{
@@ -39,6 +46,11 @@ pub struct SyncUtxosByBlockQueryParams {
     pub limit: u64,
     #[param(value_type = u64, example = 0)]
     pub page: u64,
+    #[serde(default)]
+    #[param(value_type = bool, example = false)]
+    pub exclude_spent: bool,
+    #[serde(default)]
+    pub version: u8,
 }
 
 impl From<SyncUtxosByBlockQueryParams> for SyncUtxosByBlockRequest {
@@ -47,6 +59,8 @@ impl From<SyncUtxosByBlockQueryParams> for SyncUtxosByBlockRequest {
             start_header_hash: params.start_header_hash,
             limit: params.limit,
             page: params.page,
+            exclude_spent: params.exclude_spent,
+            version: params.version,
         }
     }
 }
@@ -57,7 +71,8 @@ impl From<SyncUtxosByBlockQueryParams> for SyncUtxosByBlockRequest {
     params(SyncUtxosByBlockQueryParams),
     path = "/sync_utxos_by_block",
     responses(
-        (status = 200, description = "UTXOs returned successfully in the given headers' hash range", body = SyncUtxosByBlockResponse),
+        (status = 200, description = "UTXOs returned successfully in the given headers' hash range", body = SyncUtxosByBlockResponseV0),
+        (status = 200, description = "UTXOs returned successfully in the given headers' hash range", body = SyncUtxosByBlockResponseV1),
         (status = NOT_FOUND, description = "Header not found", body = ErrorResponse, example = json!({"error": "Header not found at height: 10"})),
         (status = INTERNAL_SERVER_ERROR, description = "Start/end header hash not found or header height mismatch", body = ErrorResponse),
     ),
@@ -67,16 +82,54 @@ pub async fn handle<B: BlockchainBackend + 'static>(
     Query(params): Query<SyncUtxosByBlockQueryParams>,
     Extension(cache_cfg): Extension<Arc<HttpCacheConfig>>,
 ) -> Result<Response<AxumBody>, (StatusCode, Json<ErrorResponse>)> {
-    debug!(target: LOG_TARGET, "Received sync_utxos_by_block request: {params:?}");
-    let request = params.into();
+    debug!(target: LOG_TARGET, "Received sync_utxos_by_block request: {params}");
+    let request: SyncUtxosByBlockRequest = params.into();
+    let tip_info = query_service.get_tip_info().await.map_err(error_handler_with_message)?;
+    let tip_height = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+    let height;
+    let mut response = match request.version {
+        0 => {
+            let response = query_service
+                .sync_utxos_by_block_v0(request)
+                .await
+                .map_err(error_handler_with_message)?;
+            height = response.blocks.last().map(|b| b.height);
+            let body = Json(response);
+            body.into_response()
+        },
+        _ => {
+            let response = query_service
+                .sync_utxos_by_block_v1(request)
+                .await
+                .map_err(error_handler_with_message)?;
+            height = response.blocks.last().map(|b| b.height);
+            let body = Json(response);
+            body.into_response()
+        },
+    };
+    let last_height = height.unwrap_or(0);
 
-    let response = query_service
-        .sync_utxos_by_block(request)
-        .await
-        .map_err(error_handler_with_message)?;
-
-    let body = Json(response);
-    let mut response = body.into_response();
-    apply_cache_control(response.headers_mut(), &cache_cfg, RouteKey::SyncUtxosByBlock);
+    apply_cache_control(
+        response.headers_mut(),
+        &cache_cfg,
+        RouteKey::SyncUtxosByBlock,
+        tip_height,
+        last_height,
+    );
     Ok(response)
+}
+
+impl Display for SyncUtxosByBlockQueryParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SyncUtxosByBlockQueryParams {{ start_header_hash: {}, limit: {}, page: {}, exclude_spent: {} }}",
+            HashOutput::try_from(self.start_header_hash.as_slice())
+                .unwrap_or_default()
+                .to_hex(),
+            self.limit,
+            self.page,
+            self.exclude_spent
+        )
+    }
 }

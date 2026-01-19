@@ -21,6 +21,7 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -132,6 +133,8 @@ pub struct BaseNodeConfig {
     pub p2p: P2pConfig,
     /// If set this node will only sync to the nodes in this set
     pub force_sync_peers: StringList,
+    /// If set this node will always try to keep connections open to these nodes
+    pub monitored_peers: StringList,
     /// The maximum amount of time to wait for remote base node responses for messaging-based requests.
     #[serde(with = "serializers::seconds")]
     pub messaging_request_timeout: Duration,
@@ -166,6 +169,8 @@ pub struct BaseNodeConfig {
 pub struct WalletHttpServiceConfig {
     /// Port that the local wallet query service will listen on.
     pub port: u16,
+    #[serde(default)]
+    pub listen_ip: Option<IpAddr>,
     /// The external address of the wallet query service.
     /// This must be accessible (if set) from the internet to let other peers connect to that.
     /// Also this address will be sent to peers when requesting for the query service URL (via RPC call).
@@ -180,6 +185,7 @@ impl Default for WalletHttpServiceConfig {
         let port = wallet_http_service_default_port(Network::get_current());
         Self {
             port,
+            listen_ip: None,
             external_address: Some(
                 Url::parse(format!("http://127.0.0.1:{port}").as_str()).expect("This should be a valid URL"),
             ),
@@ -216,6 +222,7 @@ impl Default for BaseNodeConfig {
             max_randomx_vms: 5,
             bypass_range_proof_verification: false,
             force_sync_peers: StringList::default(),
+            monitored_peers: StringList::default(),
             messaging_request_timeout: Duration::from_secs(60),
             storage: Default::default(),
             mempool: Default::default(),

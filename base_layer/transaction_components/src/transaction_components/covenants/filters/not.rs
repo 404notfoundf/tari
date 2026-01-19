@@ -50,16 +50,16 @@ mod test {
     use super::*;
     use crate::{
         covenant,
-        key_manager::create_memory_key_manager,
+        key_manager::KeyManager,
         transaction_components::covenants::{filters::test::setup_filter_test, test::create_input},
     };
 
     #[tokio::test]
     async fn it_filters_compliment_of_filter() {
-        let key_manager = create_memory_key_manager().await.unwrap();
+        let key_manager = KeyManager::new_random().unwrap();
         let script = script!(CheckHeight(100)).unwrap();
         let covenant = covenant!(not(or(field_eq(@field::features_maturity, @uint(42),), field_eq(@field::script, @script(script.clone()))))).unwrap();
-        let input = create_input(&key_manager).await;
+        let input = create_input(&key_manager);
         let (mut context, outputs) = setup_filter_test(
             &covenant,
             &input,
@@ -71,8 +71,7 @@ mod test {
                 outputs[8].script = script;
             },
             &key_manager,
-        )
-        .await;
+        );
         let mut output_set = OutputSet::new(&outputs);
         NotFilter.filter(&mut context, &mut output_set).unwrap();
 

@@ -16,7 +16,10 @@ use tari_comms::{
     types::CompressedSignature,
 };
 use tari_comms_rpc_macros::tari_rpc;
-use tari_transaction_components::rpc::{models, models::GenerateKernelMerkleProofResponse};
+use tari_transaction_components::{
+    rpc::{models, models::GenerateKernelMerkleProofResponse},
+    transaction_components::TransactionOutput,
+};
 use url::Url;
 
 use crate::{
@@ -71,10 +74,15 @@ pub trait BaseNodeWalletQueryService: Send + Sync + 'static {
 
     async fn transaction_query(&self, signature: models::Signature) -> Result<models::TxQueryResponse, Self::Error>;
 
-    async fn sync_utxos_by_block(
+    async fn sync_utxos_by_block_v0(
         &self,
         request: models::SyncUtxosByBlockRequest,
-    ) -> Result<models::SyncUtxosByBlockResponse, Self::Error>;
+    ) -> Result<models::SyncUtxosByBlockResponseV0, Self::Error>;
+
+    async fn sync_utxos_by_block_v1(
+        &self,
+        request: models::SyncUtxosByBlockRequest,
+    ) -> Result<models::SyncUtxosByBlockResponseV1, Self::Error>;
 
     async fn get_utxos_deleted_info(
         &self,
@@ -85,6 +93,8 @@ pub trait BaseNodeWalletQueryService: Send + Sync + 'static {
         &self,
         excess_sig: CompressedSignature,
     ) -> Result<GenerateKernelMerkleProofResponse, Self::Error>;
+
+    async fn get_utxo(&self, request: models::GetUtxoRequest) -> Result<Option<TransactionOutput>, Self::Error>;
 }
 
 #[tari_rpc(protocol_name = b"t/bnwallet/1", server_struct = BaseNodeWalletRpcServer, client_struct = BaseNodeWalletRpcClient)]
