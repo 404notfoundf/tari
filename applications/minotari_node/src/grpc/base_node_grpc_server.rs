@@ -3691,7 +3691,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             self.consensus_rules.consensus_constants(height),
             RangeProofType::RevealedValue,
             MemoField::new_open(vec![], TxType::Coinbase).expect("empty user-data should always be valid"),
-        )s.map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+        ).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
 
         // coninbase_kernel 和 coinbase_output 添加到 template
         new_template.body.add_output(coinbase_output);
