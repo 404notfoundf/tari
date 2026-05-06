@@ -92,7 +92,7 @@ use tari_shutdown::Shutdown;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 // 配置 Jemalloc 内存分析参数
-#[export_name ="malloc_conf"]
+#[unsafe(export_name ="malloc_conf")]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 #[cfg(not(target_env="msvc"))]
