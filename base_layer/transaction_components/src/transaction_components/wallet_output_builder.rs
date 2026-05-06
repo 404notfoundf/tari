@@ -28,9 +28,9 @@ use tari_common_types::{
 use tari_script::{ExecutionStack, TariScript};
 
 use crate::{
+    MicroMinotari,
     key_manager::{TariKeyId, TransactionKeyManagerInterface},
     transaction_components::{
-        covenants::Covenant,
         EncryptedData,
         MemoField,
         OutputFeatures,
@@ -38,8 +38,8 @@ use crate::{
         TransactionOutput,
         TransactionOutputVersion,
         WalletOutput,
+        covenants::Covenant,
     },
-    MicroMinotari,
 };
 
 #[derive(Derivative, Clone)]
@@ -163,6 +163,10 @@ impl WalletOutputBuilder {
 
     pub fn covenant(&self) -> &Covenant {
         &self.covenant
+    }
+
+    pub fn encrypted_data(&self) -> &EncryptedData {
+        &self.encrypted_data
     }
 
     pub fn sign_metadata_signature<KM: TransactionKeyManagerInterface>(
@@ -360,8 +364,8 @@ mod test {
     use super::*;
     use crate::key_manager::KeyManager;
 
-    #[tokio::test]
-    async fn test_try_build() {
+    #[test]
+    fn test_try_build() {
         let key_manager = KeyManager::new_random().unwrap();
         let (commitment_mask_key, script_key_id) = key_manager.get_next_commitment_mask_and_script_key().unwrap();
         let value = MicroMinotari(100);
@@ -383,9 +387,11 @@ mod test {
             Ok(val) => {
                 let output = val.to_transaction_output().unwrap();
                 assert!(output.verify_metadata_signature().is_ok());
-                assert!(key_manager
-                    .verify_mask(output.commitment(), &commitment_mask_key.key_id, value.into())
-                    .unwrap());
+                assert!(
+                    key_manager
+                        .verify_mask(output.commitment(), &commitment_mask_key.key_id, value.into())
+                        .unwrap()
+                );
 
                 let (recovered_key_id, recovered_value, _) = key_manager
                     .try_output_key_recovery(
@@ -406,8 +412,8 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_partial_metadata_signatures() {
+    #[test]
+    fn test_partial_metadata_signatures() {
         let key_manager = KeyManager::new_random().unwrap();
         let (commitment_mask_key, script_key) = key_manager.get_next_commitment_mask_and_script_key().unwrap();
         let value = MicroMinotari(100);

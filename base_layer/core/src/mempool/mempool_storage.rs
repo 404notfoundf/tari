@@ -23,7 +23,7 @@
 use std::{sync::Arc, time::Instant};
 
 use log::*;
-use tari_common_types::types::{CompressedSignature, FixedHash, PrivateKey};
+use tari_common_types::types::{CompressedSignature, FixedHash, HashOutput, PrivateKey};
 use tari_node_components::blocks::Block;
 use tari_transaction_components::{
     rpc::models::FeePerGramStat,
@@ -32,16 +32,18 @@ use tari_transaction_components::{
 };
 use tari_utilities::hex::Hex;
 
+#[cfg(feature = "metrics")]
+use crate::mempool::metrics;
 use crate::{
     consensus::BaseNodeConsensusManager,
     mempool::{
-        error::MempoolError,
-        reorg_pool::ReorgPool,
-        unconfirmed_pool::{RetrieveResults, TransactionKey, UnconfirmedPool, UnconfirmedPoolError},
         MempoolConfig,
         StateResponse,
         StatsResponse,
         TxStorageResponse,
+        error::MempoolError,
+        reorg_pool::ReorgPool,
+        unconfirmed_pool::{RetrieveResults, TransactionKey, UnconfirmedPool, UnconfirmedPoolError},
     },
     validation::{TransactionValidator, ValidationError},
 };
@@ -128,8 +130,6 @@ impl MempoolStorage {
                 }
             },
             Err(ValidationError::ContainsSTxO) => {
-                // This can happen if we get a transaction after it has been mined, but before the block has been
-                // published. In this case, we do not want to store the transaction in the mempool.
                 info!(target: LOG_TARGET, "Validation failed due to already spent input");
                 Ok(TxStorageResponse::NotStoredAlreadySpent)
             },
@@ -229,6 +229,10 @@ impl MempoolStorage {
             Ok(stats) => debug!(target: LOG_TARGET, "{stats}"),
             Err(e) => warn!(target: LOG_TARGET, "error to obtain stats: {e}"),
         }
+
+        // we set this to 0, as we have not removed any invalid double spent txs due to a reorg
+        #[cfg(feature = "metrics")]
+        metrics::reorg_invalid_transactions().set(0);
         Ok(())
     }
 
@@ -260,19 +264,47 @@ impl MempoolStorage {
     ) -> Result<(), MempoolError> {
         debug!(target: LOG_TARGET, "Mempool processing reorg");
 
+        let mut num_invalid_txs: i64 = 0;
+
         // Clear out all transactions from the unconfirmed pool and re-submit them to the unconfirmed mempool for
         // validation. This is important as invalid transactions that have not been mined yet may remain in the mempool
         // after a reorg.
         let removed_txs = self.unconfirmed_pool.drain_all_mempool_transactions();
+        let num_removed_txs = removed_txs.len();
         // Try to add in all the transactions again.
-        self.insert_txs(removed_txs)
-            .map_err(|e| MempoolError::InternalError(e.to_string()))?;
-        // Remove re-orged transactions from reorg  pool and re-submit them to the unconfirmed mempool
-        let removed_txs = self
+        for tx in removed_txs {
+            let resp = self
+                .insert(tx)
+                .map_err(|e| MempoolError::InternalError(e.to_string()))?;
+            if resp == TxStorageResponse::NotStoredAlreadySpent {
+                num_invalid_txs += 1;
+            }
+        }
+
+        // Remove re-orged transactions from reorg pool and re-submit them to the unconfirmed mempool
+        let reorg_txs = self
             .reorg_pool
             .remove_reorged_txs_and_discard_double_spends(removed_blocks, new_blocks);
-        self.insert_txs(removed_txs)
-            .map_err(|e| MempoolError::InternalError(e.to_string()))?;
+        let num_reorg_txs = reorg_txs.len();
+        for tx in reorg_txs {
+            let resp = self
+                .insert(tx)
+                .map_err(|e| MempoolError::InternalError(e.to_string()))?;
+            if resp == TxStorageResponse::NotStoredAlreadySpent {
+                num_invalid_txs += 1;
+            }
+        }
+
+        if num_invalid_txs > 0 {
+            warn!(
+                target: LOG_TARGET,
+                "Mempool reorg: {num_invalid_txs} transaction(s) invalidated \
+                 (from {num_removed_txs} unconfirmed and {num_reorg_txs} reorg pool transactions)"
+            );
+        }
+        #[cfg(feature = "metrics")]
+        metrics::reorg_invalid_transactions().set(num_invalid_txs);
+
         if let Some((height, hash)) = new_blocks
             .last()
             .or_else(|| removed_blocks.first())
@@ -326,6 +358,11 @@ impl MempoolStorage {
             )),
             Err(e) => Err(e),
         }
+    }
+
+    /// Returns the subset of provided output hashes that exist in the mempool's unconfirmed pool.
+    pub fn filter_outputs_in_mempool(&self, output_hashes: &[HashOutput]) -> Vec<HashOutput> {
+        self.unconfirmed_pool.filter_outputs(output_hashes)
     }
 
     /// Check if the specified excess signature is found in the Mempool.

@@ -28,16 +28,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tari_common::{
+    SubConfigPath,
     configuration::{
-        deserialize_dns_name_server_list,
-        serializers,
-        utils::serialize_string,
         DnsNameServerList,
         MultiaddrList,
         Network,
         StringList,
+        deserialize_dns_name_server_list,
+        serializers,
+        utils::serialize_string,
     },
-    SubConfigPath,
 };
 use tari_common_sqlite::connection::DbConnectionUrl;
 use tari_comms::multiaddr::Multiaddr;
@@ -158,6 +158,10 @@ pub struct P2pConfig {
     /// it with a new session. If false, the RPC server will reject the new session and preserve the older session.
     /// (default value = true).
     pub cull_oldest_peer_rpc_connection_on_full: bool,
+    /// The maximum time a seed peer connection is allowed to stay open before being forcibly closed.
+    /// Default: 15 minutes
+    #[serde(with = "serializers::seconds")]
+    pub max_seed_peer_age: Duration,
 }
 
 impl Default for P2pConfig {
@@ -183,6 +187,7 @@ impl Default for P2pConfig {
             rpc_max_simultaneous_sessions: 100,
             rpc_max_sessions_per_peer: 10,
             cull_oldest_peer_rpc_connection_on_full: true,
+            max_seed_peer_age: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -295,9 +300,8 @@ mod test {
             #dns_seeds_use_dnssec = false
          "#;
         let config = toml::from_str::<PeerSeedsConfig>(config_str).unwrap();
-        assert_eq!(config.dns_seed_name_servers.into_vec(), vec![DnsNameServer::from_str(
-            "system"
-        )
-        .unwrap(),]);
+        assert_eq!(config.dns_seed_name_servers.into_vec(), vec![
+            DnsNameServer::from_str("system").unwrap(),
+        ]);
     }
 }

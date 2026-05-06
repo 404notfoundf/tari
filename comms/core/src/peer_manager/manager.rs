@@ -29,15 +29,14 @@ use crate::peer_manager::metrics;
 use crate::{
     net_address::{MultiaddressesWithStats, PeerAddressSource},
     peer_manager::{
-        peer::Peer,
-        peer_id::PeerId,
-        peer_storage_sql::PeerStorageSql,
-        NodeDistance,
         NodeId,
         PeerFeatures,
         PeerFlags,
         PeerManagerError,
         ThisPeerIdentity,
+        peer::Peer,
+        peer_id::PeerId,
+        peer_storage_sql::PeerStorageSql,
     },
     types::{CommsDatabase, CommsPublicKey, TransportProtocol},
 };
@@ -228,61 +227,28 @@ impl PeerManager {
         self.peer_storage_sql.get_not_banned_or_deleted_peers()
     }
 
-    /// Fetch n nearest active neighbours. If features are supplied, the function will return the closest peers matching
-    /// that feature
-    pub async fn closest_n_active_peers(
-        &self,
-        region_node_id: &NodeId,
-        n: usize,
-        excluded_peers: &[NodeId],
-        features: Option<PeerFeatures>,
-        peer_flags: Option<PeerFlags>,
-        stale_peer_threshold: Option<Duration>,
-        exclude_if_all_address_failed: bool,
-        exclusion_distance: Option<NodeDistance>,
-        external_addresses_only: bool,
-    ) -> Result<Vec<Peer>, PeerManagerError> {
-        self.peer_storage_sql.closest_n_active_peers(
-            region_node_id,
-            n,
-            excluded_peers,
-            features,
-            peer_flags,
-            stale_peer_threshold,
-            exclude_if_all_address_failed,
-            exclusion_distance,
-            external_addresses_only,
-            &self.transport_protocols,
-        )
-    }
-
-    /// Get the closest `n` not failed, banned or deleted peers, ordered by their distance to the given node ID.
-    pub async fn closest_n_good_standing_peers(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-    ) -> Result<Vec<Peer>, PeerManagerError> {
-        self.peer_storage_sql.get_closest_n_good_standing_peers(n, features)
-    }
-
     /// Fetch n random peers that are Communication Nodes and have at least one external address
     pub async fn random_peers(
         &self,
         n: usize,
         excluded: &[NodeId],
         flags: Option<PeerFlags>,
+        known_good: bool,
     ) -> Result<Vec<Peer>, PeerManagerError> {
-        self.peer_storage_sql
-            .random_peers(n, excluded, flags, &self.transport_protocols)
-    }
-
-    /// Calculate the region threshold for a given number of peers and features
-    pub async fn calc_region_threshold(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-    ) -> Result<NodeDistance, PeerManagerError> {
-        self.peer_storage_sql.calc_region_threshold(n, features)
+        let mut peers =
+            self.peer_storage_sql
+                .random_peers(n, excluded, flags, &self.transport_protocols, known_good)?;
+        if known_good && peers.len() < n {
+            let mut additional = self.peer_storage_sql.random_peers(
+                n.checked_sub(peers.len()).unwrap_or(1),
+                excluded,
+                flags,
+                &self.transport_protocols,
+                false,
+            )?;
+            peers.append(&mut additional);
+        }
+        Ok(peers)
     }
 
     /// Unbans the peer if it is banned. This function is idempotent.
@@ -385,7 +351,7 @@ impl fmt::Debug for PeerManager {
 pub fn create_test_peer(ban_flag: bool, features: PeerFeatures) -> Peer {
     use std::borrow::BorrowMut;
 
-    use rand::{rngs::OsRng, Rng};
+    use rand::{Rng, rngs::OsRng};
 
     use crate::peer_manager::PeerFlags;
     let (_sk, pk) = CommsPublicKey::random_keypair(&mut OsRng);
@@ -462,7 +428,7 @@ fn random_onion3_host() -> String {
 pub fn create_test_peer_with_onion_address(ban_flag: bool, features: PeerFeatures) -> Peer {
     use std::borrow::BorrowMut;
 
-    use rand::{rngs::OsRng, Rng};
+    use rand::{Rng, rngs::OsRng};
 
     use crate::peer_manager::PeerFlags;
     let (_sk, pk) = CommsPublicKey::random_keypair(&mut OsRng);
@@ -539,7 +505,7 @@ pub fn create_test_peer_internal_addresses_only(ban_flag: bool, features: PeerFe
 
 #[cfg(test)]
 fn add_internal_addresses(peer: &mut Peer) {
-    use rand::{prelude::SliceRandom, Rng};
+    use rand::{Rng, prelude::SliceRandom};
 
     let mut addresses = Vec::new();
     // IPv4 Loopback
@@ -650,10 +616,7 @@ mod test {
     use tari_common_sqlite::connection::DbConnection;
 
     use super::*;
-    use crate::peer_manager::{
-        database::{PeerDatabaseSql, MIGRATIONS},
-        STALE_PEER_THRESHOLD_DURATION,
-    };
+    use crate::peer_manager::database::{MIGRATIONS, PeerDatabaseSql};
 
     fn create_peer_manager() -> PeerManager {
         let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
@@ -672,22 +635,28 @@ mod test {
         let peer_manager = create_peer_manager();
         let mut test_peers = vec![create_test_peer(true, PeerFeatures::COMMUNICATION_NODE)];
         // Create 20 peers were the 1st and last one is bad
-        assert!(peer_manager
-            .add_or_update_peer(test_peers[test_peers.len() - 1].clone())
-            .await
-            .is_ok());
-        for _i in 0..18 {
-            test_peers.push(create_test_peer(false, PeerFeatures::COMMUNICATION_NODE));
-            assert!(peer_manager
+        assert!(
+            peer_manager
                 .add_or_update_peer(test_peers[test_peers.len() - 1].clone())
                 .await
-                .is_ok());
+                .is_ok()
+        );
+        for _i in 0..18 {
+            test_peers.push(create_test_peer(false, PeerFeatures::COMMUNICATION_NODE));
+            assert!(
+                peer_manager
+                    .add_or_update_peer(test_peers[test_peers.len() - 1].clone())
+                    .await
+                    .is_ok()
+            );
         }
         test_peers.push(create_test_peer(true, PeerFeatures::COMMUNICATION_NODE));
-        assert!(peer_manager
-            .add_or_update_peer(test_peers[test_peers.len() - 1].clone())
-            .await
-            .is_ok());
+        assert!(
+            peer_manager
+                .add_or_update_peer(test_peers[test_peers.len() - 1].clone())
+                .await
+                .is_ok()
+        );
 
         // Test Valid Direct
         let selected_peers = peer_manager
@@ -699,195 +668,32 @@ mod test {
         assert_eq!(selected_peers.public_key, test_peers[2].public_key);
         // Test Invalid Direct
         let unmanaged_peer = create_test_peer(false, PeerFeatures::COMMUNICATION_NODE);
-        assert!(peer_manager
-            .direct_identity_node_id(&unmanaged_peer.node_id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            peer_manager
+                .direct_identity_node_id(&unmanaged_peer.node_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Test Flood
         let selected_peers = peer_manager.get_not_banned_or_deleted_peers().await.unwrap();
         assert_eq!(selected_peers.len(), 18);
         for peer_identity in &selected_peers {
-            assert!(!peer_manager
-                .find_by_node_id(&peer_identity.node_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_banned(),);
-        }
-
-        // Test Closest - No exclusions
-        let selected_peers = peer_manager
-            .closest_n_active_peers(
-                &unmanaged_peer.node_id,
-                3,
-                &[],
-                None,
-                None,
-                Some(STALE_PEER_THRESHOLD_DURATION),
-                true,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(selected_peers.len(), 3);
-        // Remove current identity nodes from test peers
-        let mut unused_peers: Vec<Peer> = Vec::new();
-        for peer in &test_peers {
-            if !selected_peers
-                .iter()
-                .any(|peer_identity| peer.node_id == peer_identity.node_id || peer.is_banned())
-            {
-                unused_peers.push(peer.clone());
-            }
-        }
-        // Check that none of the remaining unused peers have smaller distances compared to the selected peers
-        for peer_identity in &selected_peers {
-            let selected_dist = unmanaged_peer.node_id.distance(&peer_identity.node_id);
-            for unused_peer in &unused_peers {
-                let unused_dist = unmanaged_peer.node_id.distance(&unused_peer.node_id);
-                assert!(unused_dist >= selected_dist);
-            }
-        }
-
-        // Test Closest - With an exclusion
-        let excluded_peers = vec![selected_peers[0].node_id.clone()];
-        let selected_peers = peer_manager
-            .closest_n_active_peers(
-                &unmanaged_peer.node_id,
-                3,
-                &excluded_peers,
-                None,
-                None,
-                Some(STALE_PEER_THRESHOLD_DURATION),
-                true,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(selected_peers.len(), 3);
-        // Remove current identity nodes from test peers
-        let mut unused_peers: Vec<Peer> = Vec::new();
-        for peer in &test_peers {
-            let unused = !selected_peers.iter().any(|peer_identity| {
-                peer.node_id == peer_identity.node_id || peer.is_banned() || excluded_peers.contains(&peer.node_id)
-            });
-            if unused {
-                unused_peers.push(peer.clone());
-            }
-        }
-
-        // Check that none of the remaining unused peers have smaller distances compared to the selected peers
-        for peer_identity in &selected_peers {
-            let selected_dist = unmanaged_peer.node_id.distance(&peer_identity.node_id);
-            for unused_peer in &unused_peers {
-                let unused_dist = unmanaged_peer.node_id.distance(&unused_peer.node_id);
-                assert!(unused_dist >= selected_dist);
-            }
-            assert!(!excluded_peers.contains(&peer_identity.node_id));
+            assert!(
+                !peer_manager
+                    .find_by_node_id(&peer_identity.node_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_banned(),
+            );
         }
 
         // Test Random
-        let identities1 = peer_manager.random_peers(10, &[], None).await.unwrap();
-        let identities2 = peer_manager.random_peers(10, &[], None).await.unwrap();
+        let identities1 = peer_manager.random_peers(10, &[], None, false).await.unwrap();
+        let identities2 = peer_manager.random_peers(10, &[], None, false).await.unwrap();
         assert_ne!(identities1, identities2);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_calc_region_threshold() {
-        let n = 5;
-        // Create peer manager with random peers
-        let peer_manager = create_peer_manager();
-        let network_region_node_id = peer_manager.peer_storage_sql.this_peer_identity().node_id;
-        let mut test_peers = (0..10)
-            .map(|_| create_test_peer(false, PeerFeatures::COMMUNICATION_NODE))
-            .chain((0..10).map(|_| create_test_peer(false, PeerFeatures::COMMUNICATION_CLIENT)))
-            .collect::<Vec<_>>();
-
-        for p in &test_peers {
-            peer_manager.add_or_update_peer(p.clone()).await.unwrap();
-        }
-
-        test_peers.sort_by(|a, b| {
-            let a_dist = network_region_node_id.distance(&a.node_id);
-            let b_dist = network_region_node_id.distance(&b.node_id);
-            a_dist.partial_cmp(&b_dist).unwrap()
-        });
-
-        let node_region_threshold = peer_manager
-            .calc_region_threshold(n, PeerFeatures::COMMUNICATION_NODE)
-            .await
-            .unwrap();
-
-        // First 5 base nodes should be within the region
-        for peer in test_peers
-            .iter()
-            .filter(|p| p.features == PeerFeatures::COMMUNICATION_NODE)
-            .take(n)
-        {
-            assert!(peer.node_id.distance(&network_region_node_id) <= node_region_threshold);
-        }
-
-        // Next 5 should not be in the region
-        for peer in test_peers
-            .iter()
-            .filter(|p| p.features == PeerFeatures::COMMUNICATION_NODE)
-            .skip(n)
-        {
-            assert!(peer.node_id.distance(&network_region_node_id) >= node_region_threshold);
-        }
-
-        let node_region_threshold = peer_manager
-            .calc_region_threshold(n, PeerFeatures::COMMUNICATION_CLIENT)
-            .await
-            .unwrap();
-
-        // First 5 clients should be in region
-        for peer in test_peers
-            .iter()
-            .filter(|p| p.features == PeerFeatures::COMMUNICATION_CLIENT)
-            .take(5)
-        {
-            assert!(peer.node_id.distance(&network_region_node_id) <= node_region_threshold);
-        }
-
-        // Next 5 should not be in the region
-        for peer in test_peers
-            .iter()
-            .filter(|p| p.features == PeerFeatures::COMMUNICATION_CLIENT)
-            .skip(5)
-        {
-            assert!(peer.node_id.distance(&network_region_node_id) >= node_region_threshold);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_closest_peers() {
-        let n = 5;
-        // Create peer manager with random peers
-        let peer_manager = create_peer_manager();
-        let network_region_node_id = peer_manager.this_peer_identity().node_id;
-        let test_peers = (0..10)
-            .map(|_| create_test_peer(false, PeerFeatures::COMMUNICATION_NODE))
-            .chain((0..10).map(|_| create_test_peer(false, PeerFeatures::COMMUNICATION_CLIENT)))
-            .collect::<Vec<_>>();
-
-        for p in &test_peers {
-            peer_manager.add_or_update_peer(p.clone()).await.unwrap();
-        }
-
-        for features in &[PeerFeatures::COMMUNICATION_NODE, PeerFeatures::COMMUNICATION_CLIENT] {
-            let node_threshold = peer_manager.calc_region_threshold(n, *features).await.unwrap();
-
-            let closest = peer_manager.closest_n_good_standing_peers(n, *features).await.unwrap();
-
-            assert!(closest
-                .iter()
-                .all(|p| network_region_node_id.distance(&p.node_id) <= node_threshold));
-        }
     }
 
     #[tokio::test]
@@ -1018,7 +824,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn test_concurrent_add_or_update_and_get_closest_peers() {
+    async fn test_concurrent_add_or_update_and_get_random_peers() {
         let peer_manager = create_peer_manager();
         let num_peers = 75;
         let num_write_tasks = 20;
@@ -1062,35 +868,19 @@ mod test {
                         tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 100)).await;
                     }
                     Ok::<_, PeerManagerError>(())
-                    // println!("Added {} peers", num_peers);
                 })
             })
             .collect();
 
-        // Spawn tasks to concurrently fetch closest peers
+        // Spawn tasks to concurrently fetch random peers
         let get_tasks: Vec<_> = (0..num_read_tasks)
             .map(|_| {
                 let peer_manager = peer_manager.clone();
                 tokio::spawn(async move {
-                    let region_node_id = peer_manager.this_peer_identity().node_id;
                     tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 100)).await;
-                    let _closest_peers = peer_manager
-                        .closest_n_active_peers(
-                            &region_node_id,
-                            n,
-                            &[],
-                            Some(PeerFeatures::COMMUNICATION_NODE),
-                            None,
-                            None,
-                            false,
-                            None,
-                            false,
-                        )
-                        .await
-                        .unwrap();
+                    let _random_peers = peer_manager.random_peers(n, &[], None, false).await.unwrap();
                     tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 100)).await;
                     let _total_peers = peer_manager.count().await;
-                    // println!("Total peers: {}, Closest peers: {}", _total_peers, _closest_peers.len());
                     Ok::<_, PeerManagerError>(())
                 })
             })
@@ -1109,24 +899,9 @@ mod test {
 
         // Do one final read
         tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 100)).await;
-        let region_node_id = peer_manager.this_peer_identity().node_id;
-        let closest_peers = peer_manager
-            .closest_n_active_peers(
-                &region_node_id,
-                n,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                None,
-                None,
-                false,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
+        let random_peers = peer_manager.random_peers(n, &[], None, false).await.unwrap();
         let total_peers = peer_manager.count().await;
-        // println!("Total peers: {}, Closest peers: {}", total_peers, closest_peers.len());
         assert_eq!(total_peers, num_peers * num_write_tasks);
-        assert_eq!(closest_peers.len(), n);
+        assert!(random_peers.len() <= n);
     }
 }

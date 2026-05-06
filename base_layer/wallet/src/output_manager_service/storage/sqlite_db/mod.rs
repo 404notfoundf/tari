@@ -28,31 +28,34 @@ use diesel::{connection::SimpleConnection, prelude::*, result::Error as DieselEr
 use log::*;
 pub use new_output_sql::NewOutputSql;
 pub use output_sql::OutputSql;
-use tari_common_sqlite::{sqlite_connection_pool::PooledDbConnection, util::diesel_ext::ExpectedRowsExtension};
+use tari_common_sqlite::{
+    sqlite_connection_pool::PooledDbConnection,
+    util::{diesel_ext::ExpectedRowsExtension, retry::retry_db},
+};
 use tari_common_types::{
     transaction::TxId,
-    types::{CompressedCommitment, FixedHash},
+    types::{CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, PrivateKey},
 };
-use tari_crypto::tari_utilities::{hex::Hex, ByteArray};
+use tari_crypto::tari_utilities::{ByteArray, hex::Hex};
 use tari_script::{ExecutionStack, TariScript};
 use tari_transaction_components::{
+    MicroMinotari,
     key_manager::TariKeyId,
     transaction_components::{OutputType, TransactionOutput},
-    MicroMinotari,
 };
 use tari_transaction_key_manager::legacy_key_manager::{LegacyTariKeyId, LegacyTransactionKeyManagerInterface};
 use tokio::time::Instant;
 
 use crate::{
     output_manager_service::{
+        UtxoSelectionCriteria,
         error::OutputManagerStorageError,
         service::Balance,
         storage::{
+            OutputStatus,
             database::{DbKey, DbKeyValuePair, DbValue, OutputBackendQuery, OutputManagerBackend, WriteOperation},
             models::{DbWalletOutput, KnownOneSidedPaymentScript},
-            OutputStatus,
         },
-        UtxoSelectionCriteria,
     },
     schema::{known_one_sided_payment_scripts, outputs, scanned_blocks},
     storage::sqlite_utilities::wallet_db_connection::WalletDbConnection,
@@ -588,6 +591,51 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
         Ok(())
     }
 
+    fn fetch_kernel_signature_for_tx(
+        &self,
+        tx_id: TxId,
+    ) -> Result<Option<CompressedSignature>, OutputManagerStorageError> {
+        use crate::schema::completed_transactions;
+
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        let result: Option<(Vec<u8>, Vec<u8>)> = completed_transactions::table
+            .filter(completed_transactions::tx_id.eq(tx_id.as_i64_wrapped()))
+            .select((
+                completed_transactions::transaction_signature_nonce,
+                completed_transactions::transaction_signature_key,
+            ))
+            .first(&mut conn)
+            .optional()?;
+        let signature = result.and_then(
+            |(completed_transaction_signature_nonce, completed_transaction_signature_key)| {
+                match CompressedPublicKey::from_vec(&completed_transaction_signature_nonce) {
+                    Ok(public_nonce) => match PrivateKey::from_vec(&completed_transaction_signature_key) {
+                        Ok(signature) => Some(CompressedSignature::new(public_nonce, signature)),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            },
+        );
+        Ok(signature)
+    }
+
+    fn set_outputs_to_encumbered_to_be_received(
+        &self,
+        commitments: Vec<CompressedCommitment>,
+    ) -> Result<(), OutputManagerStorageError> {
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        let commitment_bytes: Vec<Vec<u8>> = commitments.iter().map(|c| c.to_vec()).collect();
+        diesel::update(
+            outputs::table
+                .filter(outputs::commitment.eq_any(&commitment_bytes))
+                .filter(outputs::status.eq(OutputStatus::Invalid as i32)),
+        )
+        .set(outputs::status.eq(OutputStatus::EncumberedToBeReceived as i32))
+        .execute(&mut conn)?;
+        Ok(())
+    }
+
     fn get_last_scanned_height(&self) -> Result<Option<u64>, OutputManagerStorageError> {
         let start = Instant::now();
         let mut conn = self.database_connection.get_pooled_connection()?;
@@ -857,64 +905,75 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
         outputs_to_send: &[DbWalletOutput],
         outputs_to_receive: &[DbWalletOutput],
     ) -> Result<(), OutputManagerStorageError> {
-        let start = Instant::now();
-        let mut conn = self.database_connection.get_pooled_connection()?;
-        let acquire_lock = start.elapsed();
+        retry_db("short_term_encumber_outputs", || {
+            let start = Instant::now();
+            let mut conn = self.database_connection.get_pooled_connection()?;
+            let acquire_lock = start.elapsed();
 
-        let mut commitments = Vec::with_capacity(outputs_to_send.len());
-        for output in outputs_to_send {
-            commitments.push(output.commitment.as_bytes());
-        }
-        conn.transaction::<_, _, _>(|conn| {
-            // Any output in the list without the `Unspent` status will invalidate the encumberance
-            if !OutputSql::find_by_commitments_excluding_status(commitments.clone(), OutputStatus::Unspent, conn)?
+            let mut commitments = Vec::with_capacity(outputs_to_send.len());
+            for output in outputs_to_send {
+                commitments.push(output.commitment.as_bytes());
+            }
+            conn.transaction::<_, _, _>(|conn| {
+                // Any output in the list without the `Unspent` or `EncumberedToBeReceived` status will invalidate the
+                // encumberance. `EncumberedToBeReceived` outputs are allowed because they represent pending
+                // transaction outputs that can be spent in chained transactions (e.g. user_pay_for_fee).
+                // Any output in the list without the `Unspent` or `EncumberedToBeReceived` status will invalidate the
+                // encumberance. `EncumberedToBeReceived` outputs are allowed because they represent pending
+                // transaction outputs that can be spent in chained transactions (e.g. user_pay_for_fee).
+                if !OutputSql::find_by_commitments_excluding_statuses(
+                    commitments.clone(),
+                    &[OutputStatus::Unspent, OutputStatus::EncumberedToBeReceived],
+                    conn,
+                )?
                 .is_empty()
-            {
-                return Err(OutputManagerStorageError::OutputAlreadySpent);
-            };
+                {
+                    return Err(OutputManagerStorageError::OutputAlreadySpent);
+                };
 
-            let count = OutputSql::update_by_commitments(
-                commitments,
-                UpdateOutput {
-                    status: Some(OutputStatus::ShortTermEncumberedToBeSpent),
-                    spent_in_tx_id: Some(Some(tx_id)),
-                    ..Default::default()
-                },
-                conn,
-            )?;
-            if count != outputs_to_send.len() {
-                let msg = format!(
-                    "Inconsistent short term encumbering! Lengths do not match - {} vs {}",
-                    count,
-                    outputs_to_send.len()
+                let count = OutputSql::update_by_commitments(
+                    commitments,
+                    UpdateOutput {
+                        status: Some(OutputStatus::ShortTermEncumberedToBeSpent),
+                        spent_in_tx_id: Some(Some(tx_id)),
+                        ..Default::default()
+                    },
+                    conn,
+                )?;
+                if count != outputs_to_send.len() {
+                    let msg = format!(
+                        "Inconsistent short term encumbering! Lengths do not match - {} vs {}",
+                        count,
+                        outputs_to_send.len()
+                    );
+                    error!(target: LOG_TARGET, "{msg}");
+                    return Err(OutputManagerStorageError::UnexpectedResult(msg));
+                }
+
+                Ok(())
+            })?;
+
+            for co in outputs_to_receive {
+                let new_output = NewOutputSql::new(
+                    co.clone(),
+                    Some(OutputStatus::ShortTermEncumberedToBeReceived),
+                    Some(tx_id),
+                )?;
+                new_output.commit(&mut conn)?;
+            }
+            if start.elapsed().as_millis() > 0 {
+                trace!(
+                    target: LOG_TARGET,
+                    "sqlite profile - short_term_encumber_outputs (TxId: {}): lock {} + db_op {} = {} ms",
+                    tx_id,
+                    acquire_lock.as_millis(),
+                    (start.elapsed() - acquire_lock).as_millis(),
+                    start.elapsed().as_millis()
                 );
-                error!(target: LOG_TARGET, "{msg}");
-                return Err(OutputManagerStorageError::UnexpectedResult(msg));
             }
 
-            Ok(())
-        })?;
-
-        for co in outputs_to_receive {
-            let new_output = NewOutputSql::new(
-                co.clone(),
-                Some(OutputStatus::ShortTermEncumberedToBeReceived),
-                Some(tx_id),
-            )?;
-            new_output.commit(&mut conn)?;
-        }
-        if start.elapsed().as_millis() > 0 {
-            trace!(
-                target: LOG_TARGET,
-                "sqlite profile - short_term_encumber_outputs (TxId: {}): lock {} + db_op {} = {} ms",
-                tx_id,
-                acquire_lock.as_millis(),
-                (start.elapsed() - acquire_lock).as_millis(),
-                start.elapsed().as_millis()
-            );
-        }
-
-        Ok(())
+            Ok::<_, OutputManagerStorageError>(())
+        }) // retry_db
     }
 
     fn confirm_encumbered_outputs(
@@ -1346,19 +1405,23 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
         tip_height: Option<u64>,
         key_manager: &KM,
     ) -> Result<Vec<DbWalletOutput>, OutputManagerStorageError> {
-        let start = Instant::now();
-        let mut conn = self.database_connection.get_pooled_connection()?;
-        let acquire_lock = start.elapsed();
+        let outputs: Vec<OutputSql> = retry_db("fetch_unspent_outputs_for_spending", || {
+            let start = Instant::now();
+            let mut conn = self.database_connection.get_pooled_connection()?;
+            let acquire_lock = start.elapsed();
 
-        let outputs = OutputSql::fetch_unspent_outputs_for_spending(selection_criteria, amount, tip_height, &mut conn)?;
+            let outputs =
+                OutputSql::fetch_unspent_outputs_for_spending(selection_criteria, amount, tip_height, &mut conn)?;
 
-        trace!(
-            target: LOG_TARGET,
-            "sqlite profile - fetch_unspent_outputs_for_spending: lock {} + db_op {} = {} ms",
-            acquire_lock.as_millis(),
-            (start.elapsed() - acquire_lock).as_millis(),
-            start.elapsed().as_millis()
-        );
+            trace!(
+                target: LOG_TARGET,
+                "sqlite profile - fetch_unspent_outputs_for_spending: lock {} + db_op {} = {} ms",
+                acquire_lock.as_millis(),
+                (start.elapsed() - acquire_lock).as_millis(),
+                start.elapsed().as_millis()
+            );
+            Ok::<_, OutputManagerStorageError>(outputs)
+        })?;
         outputs
             .iter()
             .map(|o| o.clone().to_db_wallet_output(key_manager))
@@ -1687,23 +1750,23 @@ pub struct CoinBucket {
 mod test {
     #![allow(clippy::indexing_slicing)]
 
-    use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
+    use diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
-    use rand::{rngs::OsRng, RngCore};
+    use rand::{RngCore, rngs::OsRng};
     use tari_script::script;
     use tari_test_utils::random;
     use tari_transaction_components::{
-        key_manager::KeyManager,
-        test_helpers::{create_wallet_output_with_data, TestParams},
-        transaction_components::{OutputFeatures, TransactionInput, WalletOutput},
         MicroMinotari,
+        key_manager::KeyManager,
+        test_helpers::{TestParams, create_wallet_output_with_data},
+        transaction_components::{OutputFeatures, TransactionInput, WalletOutput},
     };
     use tempfile::tempdir;
 
     use crate::output_manager_service::storage::{
-        models::DbWalletOutput,
-        sqlite_db::{new_output_sql::NewOutputSql, output_sql::OutputSql, OutputStatus, UpdateOutput},
         OutputSource,
+        models::DbWalletOutput,
+        sqlite_db::{OutputStatus, UpdateOutput, new_output_sql::NewOutputSql, output_sql::OutputSql},
     };
 
     pub fn make_input(val: MicroMinotari, key_manager: &KeyManager) -> (TransactionInput, WalletOutput) {

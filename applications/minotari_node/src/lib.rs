@@ -42,6 +42,7 @@ mod utils;
 mod http;
 mod profile;
 
+mod xmrig_proxy;
 use std::{process, sync::Arc};
 
 use commands::{cli_loop::CliLoop, command::CommandContext};
@@ -56,12 +57,12 @@ use minotari_app_grpc::{
 };
 use minotari_app_utilities::common_cli_args::CommonCliArgs;
 use tari_common::{
-    configuration::bootstrap::{grpc_default_port, ApplicationType},
-    exit_codes::{ExitCode, ExitError},
     MAX_GRPC_MESSAGE_SIZE,
+    configuration::bootstrap::{ApplicationType, grpc_default_port},
+    exit_codes::{ExitCode, ExitError},
 };
 use tari_common_types::grpc_authentication::GrpcAuthentication;
-use tari_comms::{multiaddr::Multiaddr, utils::multiaddr::multiaddr_to_socketaddr, NodeIdentity};
+use tari_comms::{NodeIdentity, multiaddr::Multiaddr, utils::multiaddr::multiaddr_to_socketaddr};
 use tari_shutdown::{Shutdown, ShutdownSignal};
 use tokio::{
     task::{self, JoinHandle},
@@ -105,8 +106,11 @@ pub async fn run_base_node(
         watch: None,
         profile_with_tokio_console: false,
         mining_enabled: false,
+        grpc_enabled: false,
+        grpc_address: None,
         second_layer_grpc_enabled: false,
         disable_splash_screen: true,
+        print_env: false,
         libtor_data_dir: None,
     };
 
@@ -114,6 +118,7 @@ pub async fn run_base_node(
 }
 
 /// Sets up the base node and runs the cli_loop
+#[allow(clippy::too_many_lines)]
 pub async fn run_base_node_with_cli(
     node_identity: Arc<NodeIdentity>,
     config: Arc<ApplicationConfig>,
@@ -135,7 +140,7 @@ pub async fn run_base_node_with_cli(
     let (readiness_grpc_server, readiness_handler) = ReadinessGrpcServer::new();
     let mut readiness_grpc_shutdown = Shutdown::new();
     let mut readiness_task: Option<JoinHandle<Result<(), anyhow::Error>>> = None;
-    if config.base_node.grpc_enabled {
+    if config.base_node.grpc_enabled && config.base_node.grpc_readiness_enabled {
         readiness_task = Some(task::spawn(run_grpc(
             readiness_grpc_server,
             grpc_address.clone(),
@@ -144,7 +149,7 @@ pub async fn run_base_node_with_cli(
             readiness_grpc_shutdown.to_signal(),
         )));
     } else {
-        info!(target: LOG_TARGET, "base_node.grpc_enabled is set to false. gRPC server is disabled.");
+        info!(target: LOG_TARGET, "Readiness gRPC server will not be started.");
     }
     readiness_handler.send_readiness_status(ReadinessState::StartingUp);
 
@@ -168,21 +173,94 @@ pub async fn run_base_node_with_cli(
         .map_err(|e| ExitError::new(ExitCode::DatabaseError, format!("Could not start database.{e:?}")))?;
 
     // Run, node, run!
-    let context = CommandContext::new(&ctx, shutdown.clone());
+    let context = CommandContext::new(&ctx, shutdown.clone(), cli.common.config_property_overrides.clone());
     readiness_handler.send_readiness_status(ReadinessState::Ready);
+
+    readiness_grpc_shutdown.trigger();
+    if let Some(task) = readiness_task {
+        match timeout(std::time::Duration::from_secs(1), task).await {
+            Ok(Ok(Ok(()))) => {
+                info!(target: LOG_TARGET, "Readiness gRPC server shutdown successfully");
+            },
+            Ok(Ok(Err(e))) => {
+                error!(target: LOG_TARGET, "Readiness gRPC server returned an error: {e}");
+            },
+            Ok(Err(e)) => {
+                error!(target: LOG_TARGET, "Readiness gRPC server task failed: {e}");
+            },
+            Err(_) => {
+                error!(target: LOG_TARGET, "Readiness gRPC server shutdown timed out after 1 second");
+            },
+        }
+    }
 
     // Go, GRPC, go go
     let grpc = grpc::base_node_grpc_server::BaseNodeGrpcServer::from_base_node_context(&ctx, config.base_node.clone());
 
-    readiness_grpc_shutdown.trigger();
-    if let Some(task) = readiness_task {
-        if let Err(e) = timeout(std::time::Duration::from_millis(500), task).await {
-            error!("Readiness task failed to shutdown: {e}");
-        }
+    if config.base_node.grpc_enabled {
+        task::spawn(run_grpc(
+            grpc,
+            grpc_address.clone(),
+            auth.clone(),
+            tls_identity,
+            shutdown.to_signal(),
+        ));
     }
 
-    if config.base_node.grpc_enabled {
-        task::spawn(run_grpc(grpc, grpc_address, auth, tls_identity, shutdown.to_signal()));
+    // Start the built-in XMRig proxy if enabled
+    if config.base_node.xmrig_proxy_enabled {
+        if config.base_node.xmrig_proxy_wallet_payment_address.is_empty() {
+            warn!(
+                target: LOG_TARGET,
+                "xmrig_proxy_enabled is true but xmrig_proxy_wallet_payment_address is not set. XMRig proxy will not \
+                 start."
+            );
+        } else {
+            let proxy_wallet_address = config.base_node.xmrig_proxy_wallet_payment_address.clone();
+            let proxy_listener = config.base_node.xmrig_proxy_address.clone();
+            let proxy_extra = config.base_node.xmrig_proxy_coinbase_extra.as_bytes().to_vec();
+            let proxy_range_proof = config.base_node.xmrig_proxy_range_proof_type;
+            let signal = shutdown.to_signal();
+            let network = config.base_node.network;
+            let node_service = ctx.local_node();
+            let consensus_rules = ctx.consensus_rules().clone();
+            let state_machine = ctx.state_machine();
+
+            match proxy_wallet_address.parse::<tari_common_types::tari_address::TariAddress>() {
+                Ok(wallet_addr) if wallet_addr.network() == network => {
+                    task::spawn(async move {
+                        if let Err(e) = xmrig_proxy::run_xmrig_proxy(
+                            node_service,
+                            consensus_rules,
+                            state_machine,
+                            proxy_listener,
+                            wallet_addr,
+                            proxy_extra,
+                            proxy_range_proof,
+                            signal,
+                        )
+                        .await
+                        {
+                            error!(target: LOG_TARGET, "XMRig proxy error: {e}");
+                        }
+                    });
+                },
+                Ok(wallet_addr) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Invalid xmrig_proxy_wallet_payment_address: address network '{}' does not match node \
+                         network '{network}'. XMRig proxy will not start.",
+                        wallet_addr.network()
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Invalid xmrig_proxy_wallet_payment_address: {e}. XMRig proxy will not start."
+                    );
+                },
+            }
+        }
     }
 
     // 启动Profile HTTP服务器

@@ -39,21 +39,28 @@ use serde::{Deserialize, Serialize};
 
 mod blockchain_database;
 pub use blockchain_database::{
+    BlockchainDatabase,
+    BlockchainDatabaseConfig,
+    MmrRoots,
+    Validators,
     calculate_mmr_roots,
     calculate_validator_node_mr,
     fetch_header,
     fetch_headers,
     fetch_target_difficulty_for_next_block,
-    BlockchainDatabase,
-    BlockchainDatabaseConfig,
-    MmrRoots,
-    Validators,
 };
 mod blockchain_backend;
 pub use blockchain_backend::BlockchainBackend;
 mod consts;
 mod db_transaction;
-pub use db_transaction::{DbKey, DbTransaction, DbValue, WriteOperation};
+pub use db_transaction::{
+    DbKey,
+    DbTransaction,
+    DbValue,
+    HorizonStateTreeUpdate,
+    HorizonSyncOutputCheckpoint,
+    WriteOperation,
+};
 mod mmr_tree;
 pub use mmr_tree::MmrTree;
 mod error;
@@ -64,12 +71,6 @@ mod reorg;
 pub use reorg::Reorg;
 mod lmdb_db;
 pub use lmdb_db::{
-    create_lmdb_database,
-    create_lmdb_database_with_stats_channel,
-    create_readonly_lmdb_environment,
-    create_recovery_lmdb_database,
-    get_all_database_names,
-    lmdb_tree_reader::{LmdbTreeReader, OwnedLmdbTreeReader},
     AccumulatedDataRebuildStatus,
     BlockchainCheckRequest,
     BlockchainCheckStatus,
@@ -77,6 +78,12 @@ pub use lmdb_db::{
     DatabaseStats,
     LMDBDatabase,
     PayrefRebuildStatus,
+    create_lmdb_database,
+    create_lmdb_database_with_stats_channel,
+    create_readonly_lmdb_environment,
+    create_recovery_lmdb_database,
+    get_all_database_names,
+    lmdb_tree_reader::{LmdbTreeReader, OwnedLmdbTreeReader},
 };
 mod stats;
 pub use stats::{DbBasicStats, DbSize, DbStat, DbTotalSizeStats};
@@ -97,7 +104,7 @@ pub use kernel_merkle_proof::*;
 mod smt_hasher;
 
 pub use smt_hasher::SmtHasher;
-use tari_transaction_components::{transaction_components::ValidatorNodeRegistration, MicroMinotari};
+use tari_transaction_components::{MicroMinotari, transaction_components::ValidatorNodeRegistration};
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct ChainTipData {

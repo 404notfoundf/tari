@@ -31,50 +31,50 @@ use std::{
 use futures::future;
 use log::*;
 use tari_common::{
+    DnsNameServer,
     configuration::{DnsNameServerList, Network},
     exit_codes::{ExitCode, ExitError},
-    DnsNameServer,
 };
 use tari_common_sqlite::{
     connection::{DbConnection, DbConnectionUrl},
     error::StorageError,
 };
 use tari_comms::{
-    backoff::ConstantBackoff,
-    multiaddr::multiaddr,
-    peer_manager::{
-        database::{PeerDatabaseSql, MIGRATIONS},
-        NodeIdentity,
-        Peer,
-        PeerFeatures,
-        PeerFlags,
-        PeerManagerError,
-    },
-    pipeline,
-    protocol::{
-        messaging::{MessagingEventSender, MessagingProtocolExtension},
-        rpc::RpcServer,
-        NodeNetworkInfo,
-        ProtocolId,
-    },
-    tor::{self, HiddenServiceControllerError, TorIdentity},
-    transports::{
-        predicate::FalsePredicate,
-        HiddenServiceTransport,
-        MemoryTransport,
-        SocksConfig,
-        SocksTransport,
-        TcpWithTorTransport,
-    },
-    utils::cidr::parse_cidrs,
     CommsBuilder,
     CommsBuilderError,
     CommsNode,
     PeerManager,
     UnspawnedCommsNode,
+    backoff::ConstantBackoff,
+    multiaddr::multiaddr,
+    peer_manager::{
+        NodeIdentity,
+        Peer,
+        PeerFeatures,
+        PeerFlags,
+        PeerManagerError,
+        database::{MIGRATIONS, PeerDatabaseSql},
+    },
+    pipeline,
+    protocol::{
+        NodeNetworkInfo,
+        ProtocolId,
+        messaging::{MessagingEventSender, MessagingProtocolExtension},
+        rpc::RpcServer,
+    },
+    tor::{self, HiddenServiceControllerError, TorIdentity},
+    transports::{
+        HiddenServiceTransport,
+        MemoryTransport,
+        SocksConfig,
+        SocksTransport,
+        TcpWithTorTransport,
+        predicate::FalsePredicate,
+    },
+    utils::cidr::parse_cidrs,
 };
 use tari_comms_dht::{Dht, DhtInitializationError};
-use tari_service_framework::{async_trait, ServiceInitializationError, ServiceInitializer, ServiceInitializerContext};
+use tari_service_framework::{ServiceInitializationError, ServiceInitializer, ServiceInitializerContext, async_trait};
 use tari_shutdown::ShutdownSignal;
 use tari_utilities::hex::Hex;
 use thiserror::Error;
@@ -85,14 +85,14 @@ use tokio::{
 use tower::ServiceBuilder;
 
 use crate::{
+    MAJOR_NETWORK_VERSION,
+    MINOR_NETWORK_VERSION,
+    TransportConfig,
     comms_connector::{InboundDomainConnector, PubsubDomainConnector},
     config::{P2pConfig, PeerSeedsConfig},
     dns::DnsClientError,
     peer_seeds::{DnsSeedResolver, SeedPeer},
     transport::{TorTransportConfig, TransportType},
-    TransportConfig,
-    MAJOR_NETWORK_VERSION,
-    MINOR_NETWORK_VERSION,
 };
 
 const LOG_TARGET: &str = "p2p::initialization";
@@ -292,7 +292,7 @@ fn initialize_hidden_service(
         .with_control_server_auth(config.to_control_auth()?)
         .with_socks_address_override(config.socks_address_override)
         .with_control_server_address(config.control_address)
-        .with_bypass_proxy_addresses(config.proxy_bypass_addresses.into());
+        .with_bypass_proxy_addresses(config.proxy_bypass_addresses.into_vec().into());
 
     if config.proxy_bypass_for_outbound_tcp {
         builder = builder.bypass_tor_for_tcp_addresses();
@@ -569,6 +569,8 @@ impl ServiceInitializer for P2pInitializer {
                 network_wire_byte: self.network.as_wire_byte(),
                 user_agent: self.user_agent.clone(),
             })
+            .with_connection_pool_refresh_interval(config.dht.connectivity.update_interval)
+            .with_max_seed_peer_age(config.max_seed_peer_age)
             .with_peer_validator_config(config.dht.peer_validator_config.clone())
             .with_minimize_connections(if self.config.dht.minimize_connections {
                 Some(self.config.dht.num_neighbouring_nodes + self.config.dht.num_random_nodes)

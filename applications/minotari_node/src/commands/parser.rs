@@ -23,11 +23,11 @@
 use std::str::FromStr;
 
 use rustyline::{
+    Context,
     completion::Completer,
     error::ReadlineError,
     hint::{Hinter, HistoryHinter},
     line_buffer::LineBuffer,
-    Context,
 };
 use rustyline_derive::{Helper, Highlighter, Validator};
 use strum::{Display, EnumString};
@@ -36,7 +36,7 @@ use thiserror::Error;
 
 use super::command::Command;
 
-#[derive(Debug, Display, EnumString, Default)]
+#[derive(Debug, Display, EnumString, Default, Clone)]
 #[strum(serialize_all = "kebab-case")]
 pub enum Format {
     Json,
@@ -44,7 +44,7 @@ pub enum Format {
     Text,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FromHex<T>(pub T);
 
 impl<T: Hex> FromStr for FromHex<T> {

@@ -376,7 +376,6 @@ The wallet supports extensive subcommands for various operations:
 - `wallet.transactions.chain_monitoring_timeout=<seconds>` - Chain monitoring timeout (default: 60)
 - `wallet.transactions.direct_send_timeout=<seconds>` - Direct send timeout (default: 180)
 - `wallet.transactions.broadcast_send_timeout=<seconds>` - Broadcast send timeout (default: 180)
-- `wallet.transactions.low_power_polling_timeout=<seconds>` - Low power polling timeout (default: 300)
 - `wallet.transactions.transaction_resend_period=<seconds>` - Transaction resend period (default: 600)
 - `wallet.transactions.resend_response_cooldown=<seconds>` - Resend response cooldown (default: 300)
 - `wallet.transactions.pending_transaction_cancellation_timeout=<seconds>` - Pending TX cancellation timeout (default:
@@ -791,12 +790,33 @@ All applications support these networks:
 - `TARI_NETWORK` - Network selection
 - `TARI_NON_INTERACTIVE` - Non-interactive mode
 
-**Application-specific**:
+**Application-specific CLI flags (set single options)**:
 
-- `MINOTARI_NODE_ENABLE_GRPC` - Enable node gRPC
-- `MINOTARI_NODE_ENABLE_MINING` - Enable node mining
+- `MINOTARI_NODE_ENABLE_GRPC` - Enable node gRPC server (`--grpc-enabled`)
+- `MINOTARI_NODE_GRPC_ADDRESS` - Node gRPC address (`--grpc-address`)
+- `MINOTARI_NODE_ENABLE_MINING` - Enable node mining (`--mining-enabled`)
+- `MINOTARI_NODE_SECOND_LAYER_GRPC_ENABLED` - Enable second layer gRPC
 - `MINOTARI_WALLET_PASSWORD` - Wallet password
-- `MINOTARI_WALLET_ENABLE_GRPC` - Enable wallet gRPC
+- `MINOTARI_WALLET_ENABLE_GRPC` - Enable wallet gRPC server
+- `MINOTARI_WALLET_GRPC_ADDRESS` - Wallet gRPC address
+
+**Configuration-level env vars (override config file values)**:
+
+Configuration values can be set via environment variables using the `TARI_` prefix and `__` (double underscore) as the nested key separator:
+
+```bash
+# Format: TARI_<SECTION>__<KEY>=<value>
+TARI_BASE_NODE__GRPC_ENABLED=true
+TARI_BASE_NODE__GRPC_ADDRESS=/ip4/0.0.0.0/tcp/18142
+TARI_WALLET__GRPC_ENABLED=true
+
+# For nested keys, use double underscore for each level:
+TARI_BASE_NODE__P2P__TRANSPORT__TOR__PROXY_BYPASS_ADDRESSES="/ip4/192.168.1.1/tcp/1234, /ip4/192.168.1.2/tcp/5678"
+# Or using JSON array format:
+TARI_BASE_NODE__P2P__TRANSPORT__TOR__PROXY_BYPASS_ADDRESSES='["/ip4/192.168.1.1/tcp/1234","/ip4/192.168.1.2/tcp/5678"]'
+```
+
+> ⚠️ **Common mistake**: Prefixes like `MINOTARI_NODE__`, `MINOTARI_BASE_NODE__`, or `MINOTARI_WALLET__` (with double underscore) are **not** recognised for config overrides. Only `TARI_` is the correct prefix. The `MINOTARI_*` env vars listed above are CLI-level flags only and use a single underscore as separator.
 
 ---
 

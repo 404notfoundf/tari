@@ -67,29 +67,29 @@ use std::{
     convert::TryFrom,
     iter,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use error::MempoolProtocolError;
-use futures::{stream, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, Stream, StreamExt, stream};
 pub use initializer::MempoolSyncInitializer;
 use log::*;
 use prost::Message;
 use tari_comms::{
+    Bytes,
+    PeerConnection,
     connectivity::{ConnectivityEvent, ConnectivityRequester, ConnectivitySelection},
     framing,
     framing::CanonicalFraming,
     message::MessageExt,
     peer_manager::{NodeId, PeerFeatures},
     protocol::{ProtocolEvent, ProtocolNotification, ProtocolNotificationRx},
-    Bytes,
-    PeerConnection,
 };
 use tari_transaction_components::transaction_components::Transaction;
-use tari_utilities::{hex::Hex, ByteArray};
+use tari_utilities::{ByteArray, hex::Hex};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Semaphore,
@@ -102,7 +102,7 @@ use crate::mempool::metrics;
 use crate::{
     base_node::comms_interface::{BlockEvent, BlockEventReceiver},
     chain_storage::BlockAddResult,
-    mempool::{proto, Mempool, MempoolServiceConfig},
+    mempool::{Mempool, MempoolServiceConfig, proto},
     proto as shared_proto,
 };
 
@@ -152,6 +152,31 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static
         info!(target: LOG_TARGET, "Mempool protocol handler has started");
 
         let mut connectivity_events = self.connectivity.get_event_subscription();
+
+        // Trigger initial mempool sync with already-connected peers. When the mempool sync
+        // protocol starts, the node has already completed chain sync, so PeerConnected and
+        // BlockSyncComplete events have already been emitted and cannot be received by this
+        // protocol's event loop. Proactively request existing connections here.
+        if !self.is_synched() {
+            match self
+                .connectivity
+                .select_connections(ConnectivitySelection::random_nodes(
+                    self.config.initial_sync_num_peers,
+                    vec![],
+                ))
+                .await
+            {
+                Ok(connections) => {
+                    for connection in connections {
+                        self.spawn_initiator_protocol(connection).await;
+                    }
+                },
+                Err(e) => {
+                    debug!(target: LOG_TARGET, "Mempool startup sync: could not get peers: {e}");
+                },
+            }
+        }
+
         loop {
             tokio::select! {
                 Ok(block_event) = self.block_event_stream.recv() => {

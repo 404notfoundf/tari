@@ -30,8 +30,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use log::warn;
 use tari_common_types::{
-    burn_proof::BurnClaimProof,
+    burn_proof::PartialBurnClaimProof,
     epoch::VnEpoch,
+    payment_reference::PaymentReference,
     tari_address::TariAddress,
     transaction::{LegacyImportStatus, TransactionDirection, TxId},
     types::{CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput, PrivateKey},
@@ -42,6 +43,7 @@ use tari_script::CompressedCheckSigSchnorrSignature;
 use tari_service_framework::reply_channel::SenderService;
 use tari_sidechain::EvictionProof;
 use tari_transaction_components::{
+    MicroMinotari,
     multisig::types::{CreateMultisigUtxo, GetMultisigUtxoDataOutput, WithdrawMultisigUtxo},
     offline_signing::models::{
         PrepareDepositMultisigTransactionResult,
@@ -61,7 +63,6 @@ use tari_transaction_components::{
         Transaction,
         TransactionOutput,
     },
-    MicroMinotari,
 };
 use tari_transaction_key_manager::legacy_key_manager::wallet_types::FeeType;
 use tari_utilities::hex::Hex;
@@ -69,7 +70,9 @@ use tokio::sync::broadcast;
 use tower::Service;
 
 use crate::{
-    output_manager_service::{service::UseOutput, UtxoSelectionCriteria},
+    OperationId,
+    output_manager_service::{UtxoSelectionCriteria, service::UseOutput},
+    storage::sqlite_db::models::DbBurnProof,
     transaction_service::{
         error::TransactionServiceError,
         storage::models::{
@@ -80,7 +83,6 @@ use crate::{
             WalletTransaction,
         },
     },
-    OperationId,
 };
 
 const LOG_TARGET: &str = "wallet::transaction_service::handle";
@@ -258,10 +260,9 @@ pub enum TransactionServiceRequest {
         scanned_output: TransactionOutput,
         payment_id: MemoField,
         optional_tx_id: Option<TxId>,
+        lock_height: u64,
     },
     SubmitTransactionToSelf(TxId, Transaction, MicroMinotari, MicroMinotari, MemoField),
-    SetLowPowerMode,
-    SetNormalPowerMode,
     RestartBroadcastProtocols,
     GetNumConfirmationsRequired,
     SetNumConfirmationsRequired(u64),
@@ -287,6 +288,10 @@ pub enum TransactionServiceRequest {
     },
     /// Get all transactions with their PayRefs (for listing/filtering)
     GetTransactionByPaymentReference(FixedHash),
+    /// Get historical (superseded) payrefs for a transaction
+    GetPayrefHistoryByTxId(TxId),
+    /// Get transactions that previously had this payref (before reorg)
+    GetTransactionByHistoricalPayref(FixedHash),
     PrepareDepositMultisigTransaction {
         request: CreateMultisigUtxo,
     },
@@ -306,6 +311,9 @@ pub enum TransactionServiceRequest {
     },
     ProcessReorg {
         height: u64,
+    },
+    GetBurnProof {
+        output_hash: HashOutput,
     },
 }
 
@@ -509,8 +517,6 @@ impl fmt::Display for TransactionServiceRequest {
                  status: {import_status:?}, height: {current_height:?}, mined at: {mined_timestamp:?}"
             ),
             Self::SubmitTransactionToSelf(tx_id, _, _, _, _) => write!(f, "SubmitTransaction ({tx_id})"),
-            Self::SetLowPowerMode => write!(f, "SetLowPowerMode "),
-            Self::SetNormalPowerMode => write!(f, "SetNormalPowerMode"),
             Self::RestartBroadcastProtocols => write!(f, "RestartBroadcastProtocols"),
             Self::GetNumConfirmationsRequired => write!(f, "GetNumConfirmationsRequired"),
             Self::SetNumConfirmationsRequired(_) => write!(f, "SetNumConfirmationsRequired"),
@@ -542,6 +548,12 @@ impl fmt::Display for TransactionServiceRequest {
             },
             Self::GetTransactionByPaymentReference(payref) => {
                 write!(f, "GetTransactionByPaymentReference({payref})")
+            },
+            Self::GetPayrefHistoryByTxId(tx_id) => {
+                write!(f, "GetPayrefHistoryByTxId({tx_id})")
+            },
+            Self::GetTransactionByHistoricalPayref(payref) => {
+                write!(f, "GetTransactionByHistoricalPayref({payref})")
             },
 
             Self::SubmitValidatorEvictionProof {
@@ -585,6 +597,9 @@ impl fmt::Display for TransactionServiceRequest {
             Self::PrepareWithdrawMultisigTransaction { request } => {
                 write!(f, "PrepareWithdrawMultisigTransaction (request: {:?})", request)
             },
+            Self::GetBurnProof { output_hash } => {
+                write!(f, "GetBurnProof (output: {output_hash})")
+            },
         }
     }
 }
@@ -607,7 +622,7 @@ pub enum TransactionServiceResponse {
     TransactionImported(TxId),
     BurntTransactionSent {
         tx_id: TxId,
-        proof: Option<Box<BurnClaimProof>>,
+        proof: Option<Box<PartialBurnClaimProof>>,
     },
     TemplateRegistrationTransactionSent {
         tx_id: TxId,
@@ -621,8 +636,6 @@ pub enum TransactionServiceResponse {
     BaseNodePublicKeySet,
     UtxoImported(TxId),
     TransactionSubmitted,
-    LowPowerModeSet,
-    NormalPowerModeSet,
     ProtocolsRestarted,
     ReorgProcessed,
     AnyTransaction(Box<Option<WalletTransaction>>),
@@ -636,6 +649,10 @@ pub enum TransactionServiceResponse {
     TransactionPayRefs(Vec<FixedHash>),
     /// Response containing payment details for a PayRef
     PaymentDetails(Option<PaymentDetails>),
+    /// Response containing historical payrefs for a transaction (output_hash, payment_reference)
+    PayrefHistory(Vec<(FixedHash, PaymentReference)>),
+    /// Response containing transactions found via historical payref
+    HistoricalPayrefTransactions(Vec<CompletedTransaction>),
     OneSidedTransactionPreparedForSigning(Box<PrepareOneSidedTransactionForSigningResult>),
     SignedOneSidedTransaction(Box<SignedOneSidedTransactionResult>),
     SignedOneSidedDepositMultisigTransaction(Box<SignedOneSidedDepositMultisigTransactionResult>),
@@ -654,6 +671,9 @@ pub enum TransactionServiceResponse {
     CreateMultisigUtxo(TxId),
     GetMultisigUtxoData(Box<GetMultisigUtxoDataOutput>),
     SendMultisigUtxo(TxId),
+    GetBurnProof {
+        proof: Option<Box<DbBurnProof>>,
+    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Default)]
@@ -674,7 +694,7 @@ impl Display for TransactionSendStatus {
 }
 
 /// Events that can be published on the Text Message Service Event Stream
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransactionEvent {
     ReceivedTransaction(TxId),
     ReceivedTransactionReply(TxId),
@@ -709,6 +729,10 @@ pub enum TransactionEvent {
     },
     TransactionValidationCompleted(OperationId),
     TransactionValidationFailed(OperationId, u64),
+    TransactionBurnConfirmed {
+        output_hash: HashOutput,
+        commitment: Box<CompressedCommitment>,
+    },
     Error(String),
 }
 
@@ -778,6 +802,9 @@ impl fmt::Display for TransactionEvent {
             },
             TransactionEvent::TransactionValidationCompleted(operation_id) => {
                 write!(f, "Transaction validation(#{operation_id}) completed")
+            },
+            TransactionEvent::TransactionBurnConfirmed { output_hash, .. } => {
+                write!(f, "Transaction Burn Confirmed for output hash {output_hash}")
             },
             TransactionEvent::TransactionValidationFailed(operation_id, reason) => {
                 write!(f, "Transaction validation(#{operation_id}) failed: {reason}")
@@ -1066,7 +1093,7 @@ impl TransactionServiceHandle {
     pub async fn broadcast_signed_one_sided_transaction(
         &mut self,
         request: SignedOneSidedTransactionResult,
-    ) -> Result<TxId, TransactionServiceError> {
+    ) -> Result<Vec<TxId>, TransactionServiceError> {
         match self
             .handle
             .call(TransactionServiceRequest::BroadcastSignedOneSidedTransaction { request })
@@ -1074,7 +1101,7 @@ impl TransactionServiceHandle {
             .inspect_err(
                 |e| warn!(target: LOG_TARGET, "TransactionServiceRequest::BroadcastSignedOneSidedTransaction({e})"),
             )?? {
-            TransactionServiceResponse::TransactionSent(tx_id) => Ok(tx_id),
+            TransactionServiceResponse::TransactionsSent(tx_ids) => Ok(tx_ids),
             _ => Err(TransactionServiceError::UnexpectedApiResponse(
                 "TransactionServiceRequest::BroadcastSignedOneSidedTransaction".to_string(),
             )),
@@ -1147,7 +1174,7 @@ impl TransactionServiceHandle {
         payment_id: MemoField,
         claim_public_key: Option<CompressedPublicKey>,
         sidechain_deployment_key: Option<PrivateKey>,
-    ) -> Result<(TxId, Option<BurnClaimProof>), TransactionServiceError> {
+    ) -> Result<(TxId, Option<PartialBurnClaimProof>), TransactionServiceError> {
         match self
             .handle
             .call(TransactionServiceRequest::BurnTari {
@@ -1596,6 +1623,7 @@ impl TransactionServiceHandle {
         scanned_output: TransactionOutput,
         payment_id: MemoField,
         optional_tx_id: Option<TxId>,
+        lock_height: u64,
     ) -> Result<TxId, TransactionServiceError> {
         match self
             .handle
@@ -1608,6 +1636,7 @@ impl TransactionServiceHandle {
                 scanned_output,
                 payment_id,
                 optional_tx_id,
+                lock_height,
             })
             .await
             .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::ImportUtxoWithStatus({e})"))??
@@ -1642,20 +1671,6 @@ impl TransactionServiceHandle {
         }
     }
 
-    pub async fn set_low_power_mode(&mut self) -> Result<(), TransactionServiceError> {
-        match self
-            .handle
-            .call(TransactionServiceRequest::SetLowPowerMode)
-            .await
-            .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::SetLowPowerMode({e})"))??
-        {
-            TransactionServiceResponse::LowPowerModeSet => Ok(()),
-            _ => Err(TransactionServiceError::UnexpectedApiResponse(
-                "TransactionServiceRequest::SetLowPowerMode".to_string(),
-            )),
-        }
-    }
-
     pub async fn revalidate_all_transactions(&mut self) -> Result<(), TransactionServiceError> {
         match self
             .handle
@@ -1681,20 +1696,6 @@ impl TransactionServiceHandle {
             TransactionServiceResponse::ValidationStarted(_) => Ok(()),
             _ => Err(TransactionServiceError::UnexpectedApiResponse(
                 "TransactionServiceRequest::ReValidateRejectedTransactions".to_string(),
-            )),
-        }
-    }
-
-    pub async fn set_normal_power_mode(&mut self) -> Result<(), TransactionServiceError> {
-        match self
-            .handle
-            .call(TransactionServiceRequest::SetNormalPowerMode)
-            .await
-            .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::SetNormalPowerMode({e})"))??
-        {
-            TransactionServiceResponse::NormalPowerModeSet => Ok(()),
-            _ => Err(TransactionServiceError::UnexpectedApiResponse(
-                "TransactionServiceRequest::SetNormalPowerMode".to_string(),
             )),
         }
     }
@@ -1962,6 +1963,43 @@ impl TransactionServiceHandle {
         }
     }
 
+    /// Get historical (superseded) payrefs for a transaction
+    pub async fn get_payref_history_by_tx_id(
+        &mut self,
+        tx_id: TxId,
+    ) -> Result<Vec<(FixedHash, PaymentReference)>, TransactionServiceError> {
+        match self
+            .handle
+            .call(TransactionServiceRequest::GetPayrefHistoryByTxId(tx_id))
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::GetPayrefHistoryByTxId({e})"))??
+        {
+            TransactionServiceResponse::PayrefHistory(history) => Ok(history),
+            _ => Err(TransactionServiceError::UnexpectedApiResponse(
+                "TransactionServiceRequest::GetPayrefHistoryByTxId".to_string(),
+            )),
+        }
+    }
+
+    /// Get transactions that previously had this payref (before reorg)
+    pub async fn get_transaction_by_historical_payref(
+        &mut self,
+        payref: FixedHash,
+    ) -> Result<Vec<CompletedTransaction>, TransactionServiceError> {
+        match self
+            .handle
+            .call(TransactionServiceRequest::GetTransactionByHistoricalPayref(payref))
+            .await
+            .inspect_err(
+                |e| warn!(target: LOG_TARGET, "TransactionServiceRequest::GetTransactionByHistoricalPayref({e})"),
+            )?? {
+            TransactionServiceResponse::HistoricalPayrefTransactions(txs) => Ok(txs),
+            _ => Err(TransactionServiceError::UnexpectedApiResponse(
+                "TransactionServiceRequest::GetTransactionByHistoricalPayref".to_string(),
+            )),
+        }
+    }
+
     /// Replace a pending outbound transaction with a new one with higher fee
     ///
     /// # Arguments
@@ -2030,6 +2068,23 @@ impl TransactionServiceHandle {
             TransactionServiceResponse::ReorgProcessed => Ok(()),
             _ => Err(TransactionServiceError::UnexpectedApiResponse(
                 "TransactionServiceRequest::ProcessReorg".to_string(),
+            )),
+        }
+    }
+
+    pub async fn get_burn_proof(
+        &mut self,
+        output_hash: HashOutput,
+    ) -> Result<Option<DbBurnProof>, TransactionServiceError> {
+        match self
+            .handle
+            .call(TransactionServiceRequest::GetBurnProof { output_hash })
+            .await
+            .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::GetBurnProof({e})"))??
+        {
+            TransactionServiceResponse::GetBurnProof { proof } => Ok(proof.map(|p| *p)),
+            _ => Err(TransactionServiceError::UnexpectedApiResponse(
+                "TransactionServiceRequest::GetBurnProof".to_string(),
             )),
         }
     }

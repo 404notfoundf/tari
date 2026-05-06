@@ -31,15 +31,13 @@ use std::{
 
 use anyhow::anyhow;
 use futures::{
+    SinkExt,
     channel::mpsc::{self, Sender},
     future,
-    SinkExt,
 };
 use log::*;
 use minotari_app_grpc::tari_rpc::{
     self,
-    payment_recipient::PaymentType,
-    wallet_server,
     BroadcastSignedOneSidedTransactionRequest,
     BroadcastSignedOneSidedTransactionResponse,
     CheckConnectivityResponse,
@@ -56,6 +54,9 @@ use minotari_app_grpc::tari_rpc::{
     CreateBurnTransactionResponse,
     CreateTemplateRegistrationRequest,
     CreateTemplateRegistrationResponse,
+    DbWalletOutputInfo,
+    DebugTransactionRequest,
+    DebugTransactionResponse,
     FeePerGramStat,
     GetAddressResponse,
     GetAllCompletedTransactionsRequest,
@@ -92,6 +93,7 @@ use minotari_app_grpc::tari_rpc::{
     ImportTransactionsResponse,
     ImportUtxosRequest,
     ImportUtxosResponse,
+    OutputValidationFeedback,
     OutputValidationMode,
     PrepareDepositMultisigTransactionRequest,
     PrepareDepositMultisigTransactionResponse,
@@ -131,27 +133,33 @@ use minotari_app_grpc::tari_rpc::{
     TransferResult,
     UserPayForFeeRequest,
     UserPayForFeeResponse,
+    ValidateOutputsRequest,
+    ValidateOutputsResponse,
     ValidateRequest,
     ValidateResponse,
+    ValidateTransactionRequest,
+    ValidateTransactionResponse,
+    payment_recipient::PaymentType,
+    wallet_server,
 };
 use minotari_node_wallet_client::BaseNodeWalletClient;
 use minotari_wallet::{
-    connectivity_service::{OnlineStatus, WalletConnectivityInterface, UNKNOWN_LATENCY_MS},
+    WalletKeyManager,
+    WalletSqlite,
+    connectivity_service::{OnlineStatus, UNKNOWN_LATENCY_MS, WalletConnectivityInterface},
     error::WalletStorageError,
     legacy_transaction_protocol::recipient::RecipientState,
     output_manager_service::{
-        error::OutputManagerError,
-        handle::OutputManagerHandle,
         RangeLimit,
         UtxoSelectionCriteria,
+        error::OutputManagerError,
+        handle::OutputManagerHandle,
     },
     transaction_service::{
         error::TransactionServiceError,
         handle::TransactionServiceHandle,
         storage::models::{self, CompletedTransaction, WalletTransaction},
     },
-    WalletKeyManager,
-    WalletSqlite,
 };
 use rand::rngs::OsRng;
 use tari_common_types::{
@@ -172,29 +180,29 @@ use tari_comms::{connectivity::ConnectivityStatus, types::CommsPublicKey};
 use tari_hashing::WalletMessageSigningDomain;
 use tari_script::CompressedCheckSigSchnorrSignature;
 use tari_transaction_components::{
+    MicroMinotari,
     consensus::{ConsensusConstants, ConsensusManager},
     key_manager::TransactionKeyManagerInterface,
     offline_signing::models::SignedOneSidedTransactionResult,
     transaction_components::{
-        memo_field::{MemoField, TxType},
         OutputFeatures,
         TransactionOutput,
         UnblindedOutput,
         WalletOutput,
+        memo_field::{MemoField, TxType},
     },
-    MicroMinotari,
 };
-use tari_transaction_key_manager::legacy_key_manager::{wallet_types::FeeType, LegacyTransactionKeyManagerInterface};
-use tari_utilities::{hex::Hex, message_format::MessageFormat, ByteArray};
+use tari_transaction_key_manager::legacy_key_manager::{LegacyTransactionKeyManagerInterface, wallet_types::FeeType};
+use tari_utilities::{ByteArray, hex::Hex, message_format::MessageFormat};
 use tokio::{
-    sync::{broadcast, Mutex},
+    sync::{Mutex, broadcast},
     task,
     time::{sleep, timeout},
 };
 use tonic::{Request, Response, Status};
 
 use crate::{
-    grpc::{convert_to_transaction_event, wallet_debouncer::WalletDebouncer, TransactionWrapper},
+    grpc::{TransactionWrapper, convert_to_transaction_event, wallet_debouncer::WalletDebouncer},
     notifier::{CANCELLED, CONFIRMATION, MINED, QUEUED, RECEIVED, SENT},
 };
 
@@ -379,13 +387,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
     ) -> Result<Response<tari_rpc::SoftwareUpdate>, Status> {
         let mut resp = tari_rpc::SoftwareUpdate::default();
 
-        if let Some(ref updater) = self.wallet.get_software_updater() {
-            if let Some(ref update) = *updater.latest_update() {
-                resp.has_update = true;
-                resp.version = update.version().to_string();
-                resp.sha = update.to_hash_hex();
-                resp.download_url = update.download_url().to_string();
-            }
+        if let Some(ref updater) = self.wallet.get_software_updater() &&
+            let Some(ref update) = *updater.latest_update()
+        {
+            resp.has_update = true;
+            resp.version = update.version().to_string();
+            resp.sha = update.to_hash_hex();
+            resp.download_url = update.download_url().to_string();
         }
 
         Ok(Response::new(resp))
@@ -905,7 +913,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
         {
             Ok(result) => BroadcastSignedOneSidedTransactionResponse {
                 is_success: true,
-                transaction_id: result.as_u64(),
+                transaction_id: result.first().map(|id| id.as_u64()).unwrap_or_default(),
                 failure_message: Default::default(),
             },
             Err(err) => {
@@ -1101,8 +1109,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 ));
             }
             let payment_id = if !raw_payment_id.is_empty() {
-                MemoField::new_open(raw_payment_id.to_vec(), TxType::PaymentToOther)
-                    .map_err(|e| Status::internal(e.to_string()))?
+                MemoField::from_bytes(&raw_payment_id)
             } else if let Some(user_pay_id) = user_payment_id {
                 let bytes = match (
                     user_pay_id.u256.is_empty(),
@@ -1274,7 +1281,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 _ => {
                     return Err(Status::invalid_argument(
                         "user_payment_id must be one of u256, utf8_string or user_bytes".to_string(),
-                    ))
+                    ));
                 },
             };
             MemoField::new_open(bytes, TxType::PaymentToSelf).map_err(|e| {
@@ -1316,11 +1323,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     if let TransactionServiceError::OutputManagerError(OutputManagerError::RangeLimitError {
                         range_exhausted,
                         ..
-                    }) = err
+                    }) = err &&
+                        range_exhausted &&
+                        !results.is_empty()
                     {
-                        if range_exhausted && !results.is_empty() {
-                            break Ok(());
-                        }
+                        break Ok(());
                     }
                     break Err(err);
                 },
@@ -1338,7 +1345,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
                                 LegacyTransactionStatus::MinedUnconfirmed |
                                 LegacyTransactionStatus::MinedConfirmed |
                                 LegacyTransactionStatus::OneSidedUnconfirmed |
-                                LegacyTransactionStatus::OneSidedConfirmed => break Ok(tx),
+                                LegacyTransactionStatus::OneSidedConfirmed |
+                                LegacyTransactionStatus::MinedConfirmedLocked |
+                                LegacyTransactionStatus::OneSidedConfirmedLocked |
+                                LegacyTransactionStatus::CoinbaseConfirmedLocked => break Ok(tx),
                                 LegacyTransactionStatus::Rejected => {
                                     let error = if let Some(reason) = tx.cancelled_reason() {
                                         TransactionServiceError::MempoolRejection {
@@ -1370,7 +1380,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     break Err(TransactionServiceError::Other(format!(
                         "Transaction {tx_id} not found within timeout of {:.2?}",
                         Duration::from_millis(self.wallet.config.grpc_broadcast_confirmation)
-                    )))
+                    )));
                 },
             };
 
@@ -1437,7 +1447,11 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     failure_message: Default::default(),
                     commitment: proof.commitment.to_vec(),
                     ownership_proof: Some(proof.ownership_proof.into()),
-                    reciprocal_claim_public_key: proof.reciprocal_claim_public_key.to_vec(),
+                    claim_public_key: proof.claim_public_key.to_vec(),
+                    kernel_excess: proof.kernel_excess,
+                    kernel_excess_nonce: proof.kernel_excess_nonce,
+                    kernel_excess_signature: proof.kernel_excess_signature,
+                    sender_offset_public_key: proof.sender_offset_public_key.to_vec(),
                 }
             },
             Ok((tx_id, None)) => {
@@ -1681,6 +1695,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .into_iter()
                             .map(|pr| pr.to_vec())
                             .collect(),
+                        rejected_reason: txn.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+                        lock_height: txn.lock_height,
                     }),
                 };
                 match sender.send(Ok(response)).await {
@@ -1819,6 +1835,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         .into_iter()
                         .map(|pr| pr.to_vec())
                         .collect(),
+                    rejected_reason: txn.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+                    lock_height: txn.lock_height,
                 });
             }
 
@@ -1980,6 +1998,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .into_iter()
                             .map(|pr| pr.to_vec())
                             .collect(),
+                        rejected_reason: txn.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+                        lock_height: txn.lock_height,
                     };
 
                     let response = GetCompletedTransactionsResponse {
@@ -2122,6 +2142,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     .into_iter()
                     .map(|pr| pr.to_vec())
                     .collect(),
+                rejected_reason: txn.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+                lock_height: txn.lock_height,
             });
         }
 
@@ -2330,13 +2352,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     return Ok(Response::new(tari_rpc::CancelTransactionResponse {
                         is_success: true,
                         failure_message: "".to_string(),
-                    }))
+                    }));
                 },
                 Err(e) => {
                     return Ok(Response::new(tari_rpc::CancelTransactionResponse {
                         is_success: false,
                         failure_message: e.to_string(),
-                    }))
+                    }));
                 },
             }
         } else if txn.status().is_completed() {
@@ -2355,13 +2377,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     return Ok(Response::new(tari_rpc::CancelTransactionResponse {
                         is_success: true,
                         failure_message: "".to_string(),
-                    }))
+                    }));
                 },
                 Err(e) => {
                     return Ok(Response::new(tari_rpc::CancelTransactionResponse {
                         is_success: false,
                         failure_message: e.to_string(),
-                    }))
+                    }));
                 },
             }
         } else {
@@ -2644,8 +2666,52 @@ impl wallet_server::Wallet for WalletGrpcServer {
             .map_err(|_| Status::invalid_argument("payment_reference must be exactly 32 bytes".to_string()))?;
         let mut tms = self.get_transaction_service();
 
-        match tms.get_transaction_by_payref(payment_ref).await {
-            Ok(txn) => {
+        // Look up current payref
+        let current_tx = tms.get_transaction_by_payref(payment_ref).await.ok();
+
+        // Look up historical payrefs (from reorgs)
+        let historical_txs = tms
+            .get_transaction_by_historical_payref(payment_ref)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(
+                    target: LOG_TARGET,
+                    "get_payment_by_reference: Error looking up historical PayRef: {e}"
+                );
+                vec![]
+            });
+
+        if current_tx.is_none() && historical_txs.is_empty() {
+            return Err(Status::not_found(format!("PayRef {} not found", payment_ref.to_hex())));
+        }
+
+        let transaction = current_tx.map(|txn| {
+            let output_commitments: Vec<Vec<u8>> = txn
+                .transaction
+                .body
+                .outputs()
+                .iter()
+                .map(|o| o.commitment().as_bytes().to_vec())
+                .collect();
+            let input_commitments: Vec<Vec<u8>> = txn
+                .transaction
+                .body
+                .inputs()
+                .iter()
+                .map(|i| match i.commitment() {
+                    Ok(c) => c.as_bytes().to_vec(),
+                    Err(e) => {
+                        warn!(target: LOG_TARGET, "Failed to get input commitment: {e}");
+                        vec![]
+                    },
+                })
+                .collect();
+            completed_tx_to_transaction_info(&txn, output_commitments, input_commitments)
+        });
+
+        let historical_transactions = historical_txs
+            .iter()
+            .map(|txn| {
                 let output_commitments: Vec<Vec<u8>> = txn
                     .transaction
                     .body
@@ -2666,57 +2732,14 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         },
                     })
                     .collect();
-                let transaction_info = TransactionInfo {
-                    tx_id: txn.tx_id.into(),
-                    source_address: txn.source_address.to_vec(),
-                    dest_address: txn.destination_address.to_vec(),
-                    status: TransactionStatus::from(txn.status) as i32,
-                    amount: txn.amount.into(),
-                    is_cancelled: txn.cancelled.is_some(),
-                    direction: TransactionDirection::from(txn.direction) as i32,
-                    fee: txn.fee.into(),
-                    timestamp: txn.timestamp.timestamp() as u64,
-                    excess_sig: txn
-                        .transaction
-                        .first_kernel_excess_sig()
-                        .unwrap_or(&CompressedSignature::default())
-                        .get_signature()
-                        .to_vec(),
-                    raw_payment_id: txn.payment_id.to_bytes(),
-                    user_payment_id: txn.payment_id.payment_id_as_bytes(),
-                    mined_in_block_height: txn.mined_height.unwrap_or(0),
-                    output_commitments,
-                    input_commitments,
-                    payment_references_sent: txn
-                        .calculate_sent_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                    payment_references_received: txn
-                        .calculate_received_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                    payment_references_change: txn
-                        .calculate_change_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                };
-                Ok(Response::new(GetPaymentByReferenceResponse {
-                    transaction: Some(transaction_info),
-                }))
-            },
-            Err(e) => {
-                warn!(
-                    target: LOG_TARGET,
-                    "get_transaction_by_payref: Error looking up PayRef {}: {}",
-                    payment_ref.to_hex(),
-                    e
-                );
-                Err(Status::internal(format!("Error looking up payment reference: {e}")))
-            },
-        }
+                completed_tx_to_transaction_info(txn, output_commitments, input_commitments)
+            })
+            .collect();
+
+        Ok(Response::new(GetPaymentByReferenceResponse {
+            transaction,
+            historical_transactions,
+        }))
     }
 
     async fn get_transaction_pay_refs(
@@ -2789,10 +2812,29 @@ impl wallet_server::Wallet for WalletGrpcServer {
             }
         };
 
+        // Fetch historical payrefs for this transaction
+        let historical_payment_references = match transaction_service.get_payref_history_by_tx_id(tx_id).await {
+            Ok(history) => history
+                .into_iter()
+                .map(|(output_hash, payref)| tari_rpc::HistoricalPayRef {
+                    output_hash: output_hash.to_vec(),
+                    payment_reference: payref.to_vec(),
+                })
+                .collect(),
+            Err(e) => {
+                debug!(
+                    target: LOG_TARGET,
+                    "get_transaction_pay_refs: Error fetching payref history for {}: {}", tx_id, e
+                );
+                vec![]
+            },
+        };
+
         Ok(Response::new(GetTransactionPayRefsResponse {
             #[allow(deprecated)]
             payment_references,
             output_commitments_info: get_transaction_output_commitments_info(&completed_tx),
+            historical_payment_references,
         }))
     }
 
@@ -3014,30 +3056,15 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 ))
             })?;
 
-        let output = self
-            .get_output_manager_service()
-            .get_many_outputs(vec![proof.output_hash])
-            .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to get output for commitment {}: {}",
-                    commitment.to_compressed_key(),
-                    e
-                ))
-            })?
-            .pop()
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "No output found for commitment {}",
-                    commitment.to_compressed_key()
-                ))
-            })?;
-
         Ok(Response::new(GetBurnClaimProofResponse {
             claim_proof: Some(tari_rpc::BurnClaimProof {
                 commitment: commitment.as_bytes().to_vec(),
                 ownership_proof: Some(proof.burn_proof.ownership_proof.into()),
-                reciprocal_claim_public_key: proof.burn_proof.reciprocal_claim_public_key.to_vec(),
+                claim_public_key: proof.burn_proof.claim_public_key.to_vec(),
+                kernel_excess: proof.burn_proof.kernel_excess.clone(),
+                kernel_excess_nonce: proof.burn_proof.kernel_excess_nonce.clone(),
+                kernel_excess_signature: proof.burn_proof.kernel_excess_signature.clone(),
+                sender_offset_public_key: proof.burn_proof.sender_offset_public_key.to_vec(),
             }),
             merkle_proof: proof.kernel_merkle_proof.map(|p| tari_rpc::EncodedMerkleProof {
                 block_hash: p.block_hash.to_vec(),
@@ -3045,8 +3072,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 leaf_index: p.leaf_index,
             }),
             kernel: Some(proof.kernel.into()),
-            encrypted_data: output.1.encrypted_data().to_byte_vec(),
-            value: output.1.value().as_u64(),
+            encrypted_data: proof.encrypted_data.map(|ed| ed.into_vec()).unwrap_or_default(),
+            value: proof.value.as_ref().map(|v| v.as_u64()).unwrap_or_default(),
         }))
     }
 
@@ -3224,7 +3251,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
             if !db_result.is_empty() {
                 add_to_oms = false;
                 is_found = true;
-                let db_output = &db_result.first().expect("Should not be empty, this is checked").0;
+                let db_output = db_result.first().expect("Should not be empty, this is checked");
                 debug_info.push(format!(
                     "UTXO with hash {} already exists in Output Manager with status: {}",
                     hex, db_output.status
@@ -3331,6 +3358,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                         output,
                         wallet_output.payment_id().clone(),
                         tx_id.map(TxId::from),
+                        wallet_output.max_lock_height(),
                     )
                     .await
                 {
@@ -3366,6 +3394,545 @@ impl wallet_server::Wallet for WalletGrpcServer {
             }
         }
         Ok(Response::new(ScanAndImportUtxosResponse { feedback: results }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn debug_transaction(
+        &self,
+        request: Request<DebugTransactionRequest>,
+    ) -> Result<Response<DebugTransactionResponse>, Status> {
+        let message = request.into_inner();
+        let tx_id: TxId = message.tx_id.into();
+        debug!(
+            target: LOG_TARGET,
+            "debug_transaction: Incoming GRPC request for tx_id: {}", tx_id
+        );
+
+        let mut transaction_service = self.get_transaction_service();
+        let transaction = transaction_service
+            .get_any_transaction(tx_id)
+            .await
+            .map_err(|e| Status::not_found(format!("Completed transaction not found: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("Transaction with id {} not found", tx_id)))?;
+
+        let wallet_address = self
+            .wallet
+            .get_wallet_interactive_address()
+            .map_err(|e| Status::internal(format!("{e:?}")))?;
+        let transaction_info = convert_wallet_transaction_into_transaction_info(transaction, &wallet_address);
+
+        let mut oms = self.wallet.output_manager_service.clone();
+        let db_outputs = oms
+            .fetch_outputs_by_tx_id(tx_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to fetch outputs: {e}")))?;
+
+        let (input_outputs, output_outputs): (Vec<_>, Vec<_>) = db_outputs
+            .into_iter()
+            .map(|o| db_wallet_output_to_info(&o))
+            .partition(|info| info.spent_in_tx_id == tx_id.as_u64());
+
+        Ok(Response::new(DebugTransactionResponse {
+            transaction_info: Some(transaction_info),
+            inputs: input_outputs,
+            outputs: output_outputs,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn validate_transaction(
+        &self,
+        request: Request<ValidateTransactionRequest>,
+    ) -> Result<Response<ValidateTransactionResponse>, Status> {
+        let message = request.into_inner();
+        let tx_id: TxId = message.tx_id.into();
+        debug!(
+            target: LOG_TARGET,
+            "validate_transaction: Incoming GRPC request for tx_id: {}", tx_id
+        );
+
+        let mut debug_info = Vec::new();
+
+        let mut transaction_service = self.get_transaction_service();
+        let completed_tx = transaction_service
+            .get_completed_transaction(tx_id)
+            .await
+            .map_err(|e| Status::not_found(format!("Completed transaction not found: {e}")))?;
+
+        let has_signature = completed_tx.transaction_signature != CompressedSignature::default();
+
+        if has_signature {
+            debug_info.push(format!(
+                "Transaction {} has a signature, validating via base node excess signature query",
+                tx_id
+            ));
+
+            let client = self
+                .wallet
+                .wallet_connectivity
+                .obtain_base_node_wallet_rpc_client()
+                .await;
+
+            let tip_info = client
+                .get_tip_info()
+                .await
+                .map_err(|e| Status::internal(format!("Failed to get tip info: {e}")))?;
+            let tip = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+            debug_info.push(format!("Current chain tip height: {}", tip));
+
+            let sig = &completed_tx.transaction_signature;
+            match client
+                .transaction_query(
+                    sig.get_compressed_public_nonce().as_bytes().to_vec(),
+                    sig.get_signature().as_bytes().to_vec(),
+                )
+                .await
+            {
+                Ok(response) => {
+                    use tari_transaction_components::rpc::models::TxLocation;
+                    if response.location == TxLocation::Mined {
+                        match response.mined_height {
+                            Some(mined_height) => {
+                                let num_confirmations = tip.saturating_sub(mined_height);
+                                debug_info.push(format!("Transaction is MINED at height {}", mined_height));
+                                debug_info.push(format!("Confirmations: {}", num_confirmations));
+                                if let Some(hash) = &response.mined_header_hash {
+                                    debug_info.push(format!("Mined in block: {}", hash.to_hex()));
+                                }
+                                if let Some(ts) = response.mined_timestamp {
+                                    debug_info.push(format!("Mined timestamp: {}", ts));
+                                }
+
+                                let num_confirmations_required =
+                                    self.wallet.config.transaction_service_config.num_confirmations_required;
+                                let is_confirmed = num_confirmations >= num_confirmations_required;
+                                debug_info.push(format!("Confirmed: {}", is_confirmed));
+
+                                if completed_tx.mined_height == Some(mined_height) {
+                                    debug_info.push("Wallet mined_height matches chain".to_string());
+                                } else {
+                                    debug_info.push(format!(
+                                        "Wallet stored mined_height ({:?}) differs from chain ({})",
+                                        completed_tx.mined_height, mined_height
+                                    ));
+                                }
+                            },
+                            None => {
+                                debug_info.push("Transaction is reported as mined but has no height".to_string());
+                            },
+                        }
+                    } else {
+                        debug_info.push(format!("Transaction is UNMINED (location: {:?})", response.location));
+                        if completed_tx.mined_height.is_some() {
+                            debug_info.push(format!(
+                                "WARNING: Wallet has mined_height {:?} but chain says unmined",
+                                completed_tx.mined_height
+                            ));
+                        }
+                    }
+                },
+                Err(e) => {
+                    debug_info.push(format!("Error querying base node for transaction: {}", e));
+                },
+            }
+        } else {
+            debug_info.push(format!(
+                "Transaction {} has no signature (detected/imported), validating via output manager",
+                tx_id
+            ));
+
+            let mut oms = self.get_output_manager_service();
+            match oms.get_output_info_for_tx_id(tx_id).await {
+                Ok(output_info) => {
+                    debug_info.push(format!("Output statuses: {:?}", output_info.statuses));
+
+                    if let (Some(mined_height), Some(block_hash)) = (output_info.mined_height, output_info.block_hash) {
+                        let client = self
+                            .wallet
+                            .wallet_connectivity
+                            .obtain_base_node_wallet_rpc_client()
+                            .await;
+                        let tip = match client.get_tip_info().await {
+                            Ok(tip_info) => {
+                                let t = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+                                debug_info.push(format!("Current chain tip height: {}", t));
+                                t
+                            },
+                            Err(e) => {
+                                debug_info.push(format!("Error getting tip info: {}", e));
+                                0
+                            },
+                        };
+
+                        let num_confirmations = tip.saturating_sub(mined_height);
+                        debug_info.push(format!("Transaction outputs MINED at height {}", mined_height));
+                        debug_info.push(format!("Mined in block: {}", block_hash.to_hex()));
+                        debug_info.push(format!("Confirmations: {}", num_confirmations));
+
+                        let num_confirmations_required =
+                            self.wallet.config.transaction_service_config.num_confirmations_required;
+                        let is_confirmed = num_confirmations >= num_confirmations_required;
+                        debug_info.push(format!("Confirmed: {}", is_confirmed));
+
+                        if completed_tx.mined_height == Some(mined_height) {
+                            debug_info.push("Wallet mined_height matches output manager".to_string());
+                        } else {
+                            debug_info.push(format!(
+                                "Wallet stored mined_height ({:?}) differs from output manager ({})",
+                                completed_tx.mined_height, mined_height
+                            ));
+                        }
+                    } else {
+                        debug_info.push("Transaction outputs are NOT mined (not detected on chain)".to_string());
+                        if completed_tx.mined_height.is_some() {
+                            debug_info.push(format!(
+                                "WARNING: Wallet has mined_height {:?} but output manager says unmined",
+                                completed_tx.mined_height
+                            ));
+                        }
+                    }
+                },
+                Err(e) => {
+                    debug_info.push(format!("Error getting output info for tx_id: {}", e));
+                },
+            }
+        }
+
+        debug_info.push(format!("Transaction status: {:?}", completed_tx.status));
+        debug_info.push(format!("Transaction direction: {:?}", completed_tx.direction));
+
+        for info in &debug_info {
+            debug!(target: LOG_TARGET, "validate_transaction: {}", info);
+        }
+
+        Ok(Response::new(ValidateTransactionResponse { debug_info }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn validate_outputs(
+        &self,
+        request: Request<ValidateOutputsRequest>,
+    ) -> Result<Response<ValidateOutputsResponse>, Status> {
+        use minotari_wallet::output_manager_service::storage::sqlite_db::{
+            ReceivedOutputInfoForBatch,
+            SpentOutputInfoForBatch,
+        };
+
+        let message = request.into_inner();
+        debug!(
+            target: LOG_TARGET,
+            "validate_outputs: Incoming GRPC request to validate and fix outputs by commitment",
+        );
+        let mut results = Vec::new();
+        let mut oms = self.wallet.output_manager_service.clone();
+
+        let client = self
+            .wallet
+            .wallet_connectivity
+            .obtain_base_node_wallet_rpc_client()
+            .await;
+
+        let tip_info = client
+            .get_tip_info()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get tip info: {e}")))?;
+        let tip_height = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+
+        let num_confirmations_required = self.wallet.config.transaction_service_config.num_confirmations_required;
+
+        let mut mined_updates = Vec::new();
+        let mut spent_updates = Vec::new();
+        let mut unmined_invalid = Vec::new();
+        let mut unspent_updates = Vec::new();
+
+        for hex in message.commitments {
+            let commitment = match CompressedCommitment::from_hex(&hex) {
+                Ok(c) => c,
+                Err(e) => {
+                    results.push(OutputValidationFeedback {
+                        commitment: hex,
+                        status: "error".to_string(),
+                        debug_info: vec![format!("Invalid commitment hex format: {}", e)],
+                    });
+                    continue;
+                },
+            };
+
+            let mut debug_info = Vec::new();
+
+            // Step 1: Look up the output in the wallet DB by commitment
+            let db_output = match oms.get_outputs_by_commitments(vec![commitment.clone()]).await {
+                Ok(outputs) if !outputs.is_empty() => {
+                    let output = outputs.into_iter().next().expect("checked not empty");
+                    debug_info.push(format!(
+                        "Found output in wallet DB with status: {}, hash: {}",
+                        output.status,
+                        output.hash.to_hex()
+                    ));
+                    output
+                },
+                Ok(_) => {
+                    debug_info.push(format!("Output with commitment {} not found in wallet DB", hex));
+                    results.push(OutputValidationFeedback {
+                        commitment: hex,
+                        status: "not_found".to_string(),
+                        debug_info,
+                    });
+                    continue;
+                },
+                Err(e) => {
+                    debug_info.push(format!("Error querying wallet DB: {}", e));
+                    results.push(OutputValidationFeedback {
+                        commitment: hex,
+                        status: "error".to_string(),
+                        debug_info,
+                    });
+                    continue;
+                },
+            };
+
+            // Step 2: Report wallet state
+            if let Some(mined_height) = db_output.mined_height {
+                debug_info.push(format!("Wallet reports output mined at height: {}", mined_height));
+                if let Some(block_hash) = db_output.mined_in_block {
+                    debug_info.push(format!("Mined in block: {}", block_hash.to_hex()));
+                }
+                if let Some(ts) = db_output.mined_timestamp {
+                    debug_info.push(format!("Mined timestamp: {}", ts));
+                }
+            } else {
+                debug_info.push("Wallet reports output as unmined".to_string());
+            }
+
+            if let Some(height) = db_output.marked_deleted_at_height {
+                debug_info.push(format!("Wallet reports output marked deleted at height: {}", height));
+                if let Some(block_hash) = db_output.marked_deleted_in_block {
+                    debug_info.push(format!("Deleted in block: {}", block_hash.to_hex()));
+                }
+            }
+
+            if let Some(tx_id) = db_output.received_in_tx_id {
+                debug_info.push(format!("Received in tx_id: {}", tx_id));
+            }
+            if let Some(tx_id) = db_output.spent_in_tx_id {
+                debug_info.push(format!("Spent in tx_id: {}", tx_id));
+            }
+
+            // Step 3: Validate against base node - check mined info
+            let output_hash = db_output.hash.to_vec();
+            match client.get_utxos_mined_info(vec![output_hash.clone()], 2).await {
+                Ok(response) => {
+                    debug_info.push(format!("Chain tip height: {}", tip_height));
+
+                    let found_in_utxos = response.utxos.iter().find(|u| u.utxo_hash == output_hash);
+                    let found_in_mempool = response.mempool_utxos.contains(&output_hash);
+
+                    if let Some(mined_info) = found_in_utxos {
+                        let mined_height = mined_info.mined_in_height;
+                        let confirmations = tip_height.saturating_sub(mined_height);
+                        let confirmed = confirmations >= num_confirmations_required;
+                        debug_info.push(format!(
+                            "Base node: output is MINED at height {} (confirmations: {}, confirmed: {})",
+                            mined_height, confirmations, confirmed
+                        ));
+                        debug_info.push(format!("Mined in block: {}", mined_info.mined_in_hash.to_hex()));
+
+                        match db_output.mined_height {
+                            Some(wallet_height) if wallet_height != mined_height => {
+                                let block_hash =
+                                    FixedHash::try_from(mined_info.mined_in_hash.as_slice()).unwrap_or_default();
+                                mined_updates.push(ReceivedOutputInfoForBatch {
+                                    commitment: commitment.clone(),
+                                    mined_height,
+                                    mined_in_block: block_hash,
+                                    confirmed,
+                                    mined_timestamp: mined_info.mined_in_timestamp,
+                                });
+                                debug_info.push(format!(
+                                    "FIX: wallet mined_height ({}) differs from chain ({}), updating",
+                                    wallet_height, mined_height
+                                ));
+                            },
+                            None => {
+                                let block_hash =
+                                    FixedHash::try_from(mined_info.mined_in_hash.as_slice()).unwrap_or_default();
+                                mined_updates.push(ReceivedOutputInfoForBatch {
+                                    commitment: commitment.clone(),
+                                    mined_height,
+                                    mined_in_block: block_hash,
+                                    confirmed,
+                                    mined_timestamp: mined_info.mined_in_timestamp,
+                                });
+                                debug_info.push(format!(
+                                    "FIX: wallet reports unmined but chain says mined at {}, updating",
+                                    mined_height
+                                ));
+                            },
+                            _ => {
+                                debug_info.push("Wallet mined_height matches chain".to_string());
+                            },
+                        }
+                    } else if found_in_mempool {
+                        debug_info.push("Base node: output is IN MEMPOOL (not yet mined)".to_string());
+                    } else {
+                        debug_info.push("Base node: output is NOT FOUND in UTXO set or mempool".to_string());
+                        if db_output.mined_height.is_some() {
+                            unmined_invalid.push(db_output.hash);
+                            debug_info.push(
+                                "FIX: wallet reports mined but chain says not found, marking as unmined and invalid"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    debug_info.push(format!("Error querying base node for mined info: {}", e));
+                },
+            }
+
+            // Step 4: Check if spent
+            match client.query_deleted_utxos(vec![output_hash], vec![]).await {
+                Ok(response) => {
+                    if let Some(deleted_info) = response.utxos.first() {
+                        match (&deleted_info.found_in_header, &deleted_info.spent_in_header) {
+                            (Some((found_height, found_hash)), Some((spent_height, spent_hash))) => {
+                                let confirmations = tip_height.saturating_sub(*spent_height);
+                                let confirmed = confirmations >= num_confirmations_required;
+                                debug_info.push(format!(
+                                    "Base node: output found at height {} in block {}",
+                                    found_height,
+                                    found_hash.to_hex()
+                                ));
+                                debug_info.push(format!(
+                                    "Base node: output SPENT at height {} in block {} (confirmations: {}, confirmed: \
+                                     {})",
+                                    spent_height,
+                                    spent_hash.to_hex(),
+                                    confirmations,
+                                    confirmed
+                                ));
+
+                                match db_output.marked_deleted_at_height {
+                                    Some(wallet_height) if wallet_height != *spent_height => {
+                                        let block_hash = FixedHash::try_from(spent_hash.as_slice()).unwrap_or_default();
+                                        spent_updates.push(SpentOutputInfoForBatch {
+                                            commitment: commitment.clone(),
+                                            confirmed,
+                                            mark_deleted_at_height: *spent_height,
+                                            mark_deleted_in_block: block_hash,
+                                        });
+                                        debug_info.push(format!(
+                                            "FIX: wallet deleted_at_height ({}) differs from chain ({}), updating",
+                                            wallet_height, spent_height
+                                        ));
+                                    },
+                                    None => {
+                                        let block_hash = FixedHash::try_from(spent_hash.as_slice()).unwrap_or_default();
+                                        spent_updates.push(SpentOutputInfoForBatch {
+                                            commitment: commitment.clone(),
+                                            confirmed,
+                                            mark_deleted_at_height: *spent_height,
+                                            mark_deleted_in_block: block_hash,
+                                        });
+                                        debug_info.push(format!(
+                                            "FIX: wallet reports not deleted but chain says spent at {}, updating",
+                                            spent_height
+                                        ));
+                                    },
+                                    _ => {
+                                        debug_info.push("Wallet spent state matches chain".to_string());
+                                    },
+                                }
+                            },
+                            (Some((found_height, _)), None) => {
+                                debug_info.push(format!(
+                                    "Base node: output found at height {} and NOT spent",
+                                    found_height
+                                ));
+                                if db_output.marked_deleted_at_height.is_some() {
+                                    let confirmed = db_output
+                                        .mined_height
+                                        .map(|h| tip_height.saturating_sub(h) >= num_confirmations_required)
+                                        .unwrap_or(false);
+                                    unspent_updates.push((db_output.hash, confirmed));
+                                    debug_info.push(
+                                        "FIX: wallet reports deleted but chain says not spent, marking as unspent"
+                                            .to_string(),
+                                    );
+                                }
+                            },
+                            (None, _) => {
+                                debug_info.push("Base node: output NOT FOUND in deleted UTXO query".to_string());
+                            },
+                        }
+                    } else {
+                        debug_info.push("Base node: no deletion info returned for output".to_string());
+                    }
+                },
+                Err(e) => {
+                    debug_info.push(format!("Error querying base node for deleted info: {}", e));
+                },
+            }
+
+            let final_status = format!("{}", db_output.status);
+
+            for info in &debug_info {
+                debug!(target: LOG_TARGET, "validate_outputs [{}]: {}", hex, info);
+            }
+
+            results.push(OutputValidationFeedback {
+                commitment: hex,
+                status: final_status,
+                debug_info,
+            });
+        }
+
+        // Apply collected fixes
+        if !mined_updates.is_empty() ||
+            !spent_updates.is_empty() ||
+            !unmined_invalid.is_empty() ||
+            !unspent_updates.is_empty()
+        {
+            debug!(
+                target: LOG_TARGET,
+                "validate_outputs: Applying fixes - mined: {}, spent: {}, unmined_invalid: {}, unspent: {}",
+                mined_updates.len(),
+                spent_updates.len(),
+                unmined_invalid.len(),
+                unspent_updates.len()
+            );
+            oms.update_output_validation_state(mined_updates, spent_updates, unmined_invalid, unspent_updates)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to apply fixes: {e}")))?;
+        }
+
+        Ok(Response::new(ValidateOutputsResponse { feedback: results }))
+    }
+}
+
+fn db_wallet_output_to_info(
+    o: &minotari_wallet::output_manager_service::storage::models::DbWalletOutput,
+) -> DbWalletOutputInfo {
+    DbWalletOutputInfo {
+        commitment: o.commitment.as_bytes().to_vec(),
+        hash: o.hash.to_vec(),
+        value: o.wallet_output.value().into(),
+        status: format!("{}", o.status),
+        mined_height: o.mined_height.unwrap_or(0),
+        mined_in_block: o.mined_in_block.map(|b| b.to_vec()).unwrap_or_default(),
+        mined_timestamp: o.mined_timestamp.map(|t| t.timestamp() as u64).unwrap_or(0),
+        marked_deleted_at_height: o.marked_deleted_at_height.unwrap_or(0),
+        marked_deleted_in_block: o.marked_deleted_in_block.map(|b| b.to_vec()).unwrap_or_default(),
+        spending_priority: format!("{:?}", o.spending_priority),
+        source: format!("{}", o.source),
+        received_in_tx_id: o.received_in_tx_id.map(|t| t.into()).unwrap_or(0),
+        spent_in_tx_id: o.spent_in_tx_id.map(|t| t.into()).unwrap_or(0),
+        payment_id: o.payment_id.to_bytes(),
+        script: format!("{}", o.wallet_output.script()),
+        maturity: o.wallet_output.features().maturity,
+        features_output_type: format!("{}", o.wallet_output.features().output_type),
+        sender_offset_public_key: o.wallet_output.sender_offset_public_key().as_bytes().to_vec(),
+        script_lock_height: o.wallet_output.script_lock_height(),
     }
 }
 
@@ -3489,6 +4056,52 @@ async fn import_output_to_oms<KM: LegacyTransactionKeyManagerInterface>(
     Ok(found_outputs.first().expect("already checked for empty").1.clone())
 }
 
+fn completed_tx_to_transaction_info(
+    txn: &CompletedTransaction,
+    output_commitments: Vec<Vec<u8>>,
+    input_commitments: Vec<Vec<u8>>,
+) -> TransactionInfo {
+    TransactionInfo {
+        tx_id: txn.tx_id.into(),
+        source_address: txn.source_address.to_vec(),
+        dest_address: txn.destination_address.to_vec(),
+        status: TransactionStatus::from(txn.status) as i32,
+        amount: txn.amount.into(),
+        is_cancelled: txn.cancelled.is_some(),
+        direction: TransactionDirection::from(txn.direction) as i32,
+        fee: txn.fee.into(),
+        timestamp: txn.timestamp.timestamp() as u64,
+        excess_sig: txn
+            .transaction
+            .first_kernel_excess_sig()
+            .unwrap_or(&CompressedSignature::default())
+            .get_signature()
+            .to_vec(),
+        raw_payment_id: txn.payment_id.to_bytes(),
+        user_payment_id: txn.payment_id.payment_id_as_bytes(),
+        mined_in_block_height: txn.mined_height.unwrap_or(0),
+        output_commitments,
+        input_commitments,
+        payment_references_sent: txn
+            .calculate_sent_payment_references()
+            .into_iter()
+            .map(|pr| pr.to_vec())
+            .collect(),
+        payment_references_received: txn
+            .calculate_received_payment_references()
+            .into_iter()
+            .map(|pr| pr.to_vec())
+            .collect(),
+        payment_references_change: txn
+            .calculate_change_payment_references()
+            .into_iter()
+            .map(|pr| pr.to_vec())
+            .collect(),
+        rejected_reason: txn.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+        lock_height: txn.lock_height,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn convert_wallet_transaction_into_transaction_info(
     tx: models::WalletTransaction,
@@ -3520,6 +4133,8 @@ fn convert_wallet_transaction_into_transaction_info(
                 payment_references_sent: vec![],
                 payment_references_received: vec![],
                 payment_references_change: vec![],
+                rejected_reason: String::new(),
+                lock_height: 0,
             }
         },
         PendingOutbound(tx) => {
@@ -3556,6 +4171,8 @@ fn convert_wallet_transaction_into_transaction_info(
                 payment_references_sent: vec![],
                 payment_references_received: vec![],
                 payment_references_change: vec![],
+                rejected_reason: String::new(),
+                lock_height: 0,
             }
         },
         Completed(tx) => {
@@ -3614,6 +4231,8 @@ fn convert_wallet_transaction_into_transaction_info(
                     .into_iter()
                     .map(|pr| pr.to_vec())
                     .collect(),
+                rejected_reason: tx.cancelled.map(|r| r.to_string()).unwrap_or_default(),
+                lock_height: tx.lock_height,
             }
         },
     }

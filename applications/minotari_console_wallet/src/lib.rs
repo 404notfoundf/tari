@@ -30,9 +30,11 @@ mod grpc;
 pub mod init;
 mod notifier;
 mod recovery;
+mod transaction_event_handler;
 mod ui;
 mod utils;
 mod wallet_modes;
+
 pub use cli::{
     Cli,
     CliCommands,
@@ -44,7 +46,7 @@ pub use cli::{
     SetBaseNodeArgs,
     WhoisArgs,
 };
-use init::{change_password, init_wallet, start_wallet, tari_splash_screen, WalletBoot};
+use init::{WalletBoot, change_password, init_wallet, start_wallet, tari_splash_screen};
 use log::*;
 use minotari_app_utilities::{common_cli_args::CommonCliArgs, consts};
 use minotari_wallet::transaction_service::config::TransactionRoutingMechanism;
@@ -54,12 +56,10 @@ use tari_common::{
     exit_codes::{ExitCode, ExitError},
 };
 use tari_common_types::seeds::cipher_seed::CipherSeed;
-#[cfg(all(unix, feature = "libtor"))]
-use tari_libtor::tor::Tor;
 use tari_shutdown::Shutdown;
 use tari_utilities::SafePassword;
 use tokio::runtime::Runtime;
-use wallet_modes::{command_mode, grpc_mode, recovery_mode, script_mode, tui_mode, WalletMode};
+use wallet_modes::{WalletMode, command_mode, grpc_mode, recovery_mode, script_mode, tui_mode};
 
 pub use crate::config::ApplicationConfig;
 use crate::{
@@ -102,8 +102,10 @@ pub fn run_wallet(shutdown: &mut Shutdown, runtime: Runtime, config: &mut Applic
         view_private_key: None,
         spend_key: None,
         birthday: None,
+        burn_proof_out: None,
         libtor_data_dir: None,
         skip_recovery: false,
+        print_env: false,
     };
 
     run_wallet_with_cli(shutdown, runtime, config, cli)
@@ -157,24 +159,6 @@ pub fn run_wallet_with_cli(
         ));
     }
 
-    // Run our own Tor instance, if configured
-    // This is currently only possible on linux/macos
-    #[cfg(all(unix, feature = "libtor"))]
-    if config.wallet.use_libtor && config.wallet.p2p.transport.is_tor() {
-        let data_dir = if let Some(dir) = cli.libtor_data_dir.clone() {
-            dir.join("libtor").join("wallet")
-        } else {
-            cli.common.get_base_path().join("libtor").join("wallet")
-        };
-        let tor = Tor::initialize(data_dir)?;
-        tor.update_comms_transport(&mut config.wallet.p2p.transport)?;
-        tor.run_background();
-        debug!(
-            target: LOG_TARGET,
-            "Updated Tor comms transport: {:?}", config.wallet.p2p.transport
-        );
-    }
-
     let on_init = matches!(boot_mode, WalletBoot::New);
     let not_recovery = recovery_seed.is_none();
     let hardware_wallet = matches!(wallet_type, Some(LegacyWalletType::Ledger(_)));
@@ -191,6 +175,8 @@ pub fn run_wallet_with_cli(
         cli.non_interactive_mode,
         wallet_type,
     ))?;
+
+    runtime.spawn(transaction_event_handler::start(&wallet));
 
     if !cli.non_interactive_mode &&
         config.wallet.transaction_service_config.transaction_routing_mechanism ==

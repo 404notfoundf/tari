@@ -51,7 +51,7 @@ impl Filter for FieldsHashedEqFilter {
 mod test {
     #![allow(clippy::indexing_slicing)]
     use blake2::Blake2b;
-    use digest::{consts::U32, Update};
+    use digest::{Update, consts::U32};
     use tari_crypto::hashing::DomainSeparation;
 
     use super::*;
@@ -59,17 +59,17 @@ mod test {
         covenant,
         key_manager::KeyManager,
         transaction_components::{
+            OutputFeatures,
             covenants::{
-                filters::test::setup_filter_test,
-                test::{create_input, make_sample_sidechain_feature},
                 BaseLayerCovenantsDomain,
                 COVENANTS_FIELD_HASHER_LABEL,
+                filters::test::setup_filter_test,
+                test::{create_input, make_sample_sidechain_feature},
             },
-            OutputFeatures,
         },
     };
-    #[tokio::test]
-    async fn it_filters_outputs_with_fields_that_hash_to_given_hash() {
+    #[test]
+    fn it_filters_outputs_with_fields_that_hash_to_given_hash() {
         let key_manager = KeyManager::new_random().unwrap();
         let features = OutputFeatures {
             maturity: 42,

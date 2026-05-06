@@ -24,6 +24,7 @@ use std::{
     collections::VecDeque,
     fmt::{Debug, Formatter},
     path::PathBuf,
+    time::Instant,
 };
 
 use cucumber::gherkin::{Feature, Scenario};
@@ -104,7 +105,10 @@ pub struct TariWorld {
     // This receiver wallet address will be used for default one-sided coinbase payments
     pub default_payment_address: TariAddress,
     pub consensus_manager: BaseNodeConsensusManager,
-    pub assigned_ports: IndexMap<u64, u64>,
+    pub assigned_ports: IndexMap<u16, u16>,
+    /// Named benchmark timers, keyed by a label set in the feature file.
+    /// Used by "I start benchmark timer {word}" / "I stop benchmark timer {word} and log elapsed time" steps.
+    pub benchmark_timers: IndexMap<String, Instant>,
 }
 
 impl Debug for TariWorld {
@@ -138,7 +142,6 @@ pub enum NodeClient {
 
 impl TariWorld {
     pub async fn new() -> Self {
-        println!("\nWorld initialized - remove this line when called!\n");
         let wallet_private_key = PrivateKey::random(&mut OsRng);
         let default_payment_address = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&wallet_private_key),
@@ -174,6 +177,7 @@ impl TariWorld {
             default_payment_address,
             consensus_manager: BaseNodeConsensusManager::builder(Network::LocalNet).build().unwrap(),
             assigned_ports: Default::default(),
+            benchmark_timers: Default::default(),
         }
     }
 
@@ -181,7 +185,11 @@ impl TariWorld {
         &self,
         name: &S,
     ) -> anyhow::Result<minotari_node_grpc_client::BaseNodeGrpcClient<tonic::transport::Channel>> {
-        self.get_node(name)?.get_grpc_client().await
+        let node_name = name.as_ref();
+        self.get_node(name)?
+            .get_grpc_client()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect gRPC client to base node '{node_name}': {e}"))
     }
 
     pub async fn get_base_node_or_wallet_client<S: core::fmt::Debug + AsRef<str>>(
@@ -201,21 +209,45 @@ impl TariWorld {
         if let Some(address) = self.wallet_addresses.get(name.as_ref()) {
             return Ok(address.clone());
         }
+        let wallet_name = name.as_ref();
         let address_bytes = match self.get_wallet_client(name).await {
-            Ok(wallet) => {
-                let mut wallet = wallet;
-
+            Ok(mut wallet) => {
                 wallet
                     .get_address(minotari_wallet_grpc_client::grpc::Empty {})
                     .await
-                    .unwrap()
+                    .map_err(|e| anyhow::anyhow!("Failed to get address for wallet '{wallet_name}': {e}"))?
                     .into_inner()
                     .interactive_address
             },
             Err(_) => {
-                let ffi_wallet = self.get_ffi_wallet(name).unwrap();
+                let ffi_wallet = self
+                    .get_ffi_wallet(name)
+                    .map_err(|e| anyhow::anyhow!("No wallet or FFI wallet found for '{wallet_name}': {e}"))?;
 
                 ffi_wallet.get_address().address().get_vec()
+            },
+        };
+        let tari_address = TariAddress::from_bytes(&address_bytes)?;
+        Ok(tari_address.to_base58())
+    }
+
+    pub async fn get_wallet_one_sided_address<S: AsRef<str>>(&self, name: &S) -> anyhow::Result<String> {
+        let wallet_name = name.as_ref();
+        let address_bytes = match self.get_wallet_client(name).await {
+            Ok(mut wallet) => {
+                wallet
+                    .get_address(minotari_wallet_grpc_client::grpc::Empty {})
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to get one-sided address for wallet '{wallet_name}': {e}"))?
+                    .into_inner()
+                    .one_sided_address
+            },
+            Err(_) => {
+                let ffi_wallet = self
+                    .get_ffi_wallet(name)
+                    .map_err(|e| anyhow::anyhow!("No wallet or FFI wallet found for '{wallet_name}': {e}"))?;
+
+                ffi_wallet.get_one_sided_address().address().get_vec()
             },
         };
         let tari_address = TariAddress::from_bytes(&address_bytes)?;
@@ -227,7 +259,11 @@ impl TariWorld {
         &self,
         name: &S,
     ) -> anyhow::Result<minotari_wallet_grpc_client::WalletGrpcClient<tonic::transport::Channel>> {
-        self.get_wallet(name)?.get_grpc_client().await
+        let wallet_name = name.as_ref();
+        self.get_wallet(name)?
+            .get_grpc_client()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect gRPC client to wallet '{wallet_name}': {e}"))
     }
 
     pub fn get_node<S: AsRef<str>>(&self, node_name: &S) -> anyhow::Result<&BaseNodeProcess> {
@@ -293,14 +329,50 @@ impl TariWorld {
     }
 
     pub async fn after(&mut self, _scenario: &Scenario) {
+        let pool = crate::port_pool::global_port_pool();
+
+        // Destroy FFI wallets first — they hold native resources and open connections
+        for (name, mut ffi_wallet) in self.ffi_wallets.drain(..) {
+            println!("Destroying FFI wallet {name}");
+            ffi_wallet.destroy();
+        }
+
+        // Kill wallets — they depend on base nodes
         for (name, mut p) in self.wallets.drain(..) {
             println!("Shutting down wallet {name}");
-            p.kill_signal.trigger();
+            let grpc_port = p.grpc_port;
+            p.kill();
+            // Return wallet gRPC port to pool for reuse
+            pool.return_wallet_ports(crate::port_pool::WalletPorts {
+                grpc: grpc_port,
+                http: 0, // wallet doesn't own an http port
+            });
         }
+
+        // Clear merge mining proxies (they are lightweight HTTP clients, no ports to return)
+        for (name, _proxy) in self.merge_mining_proxies.drain(..) {
+            println!("Shutting down merge mining proxy {name}");
+        }
+
+        // Drop miners (they don't own ports or long-lived resources, but clear them
+        // so they don't hold references to base nodes or wallets)
+        for (name, _miner) in self.miners.drain(..) {
+            println!("Dropping miner {name}");
+        }
+
+        // Kill base nodes last — kill() waits for ports to be released,
+        // preventing port conflicts with the next scenario
         for (name, mut p) in self.base_nodes.drain(..) {
             println!("Shutting down base node {name}");
-            // You have explicitly trigger the shutdown now because of the change to use Arc/Mutex in tari_shutdown
-            p.kill_signal.trigger();
+            let ports = crate::port_pool::BaseNodePorts {
+                p2p: p.port,
+                grpc: p.grpc_port,
+                http: p.http_port,
+                xmrig_proxy: p.xmrig_proxy_port,
+            };
+            p.kill();
+            // Return ports to pool for reuse by next scenario
+            pool.return_base_node_ports(ports);
         }
     }
 

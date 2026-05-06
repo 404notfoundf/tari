@@ -223,9 +223,9 @@ typedef struct TransactionSendStatus TariTransactionSendStatus;
 
 typedef struct Balance TariBalance;
 
-typedef struct FeePerGramStat TariFeePerGramStat;
-
 typedef struct FeePerGramStatsResponse TariFeePerGramStats;
+
+typedef struct FeePerGramStat TariFeePerGramStat;
 
 /**
  * Payment Record FFI Types
@@ -2142,6 +2142,24 @@ unsigned long long completed_transaction_get_mined_height(TariCompletedTransacti
                                                           int *error_out);
 
 /**
+ * Gets the lock height of a TariCompletedTransaction. This is the highest maturity / script_lock_height
+ * across all outputs. Outputs cannot be spent until this height is reached.
+ *
+ * ## Arguments
+ * `transaction` - The pointer to a TariCompletedTransaction
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - Returns the lock height, note that it will be zero if transaction is null
+ *
+ * # Safety
+ * None
+ */
+unsigned long long completed_transaction_get_lock_height(TariCompletedTransaction *transaction,
+                                                         int *error_out);
+
+/**
  * Gets the mined in block hash of a TariCompletedTransaction
  *
  * ## Arguments
@@ -3755,33 +3773,6 @@ struct TariSeedWords *wallet_get_seed_words(struct TariWallet *wallet,
                                             int *error_out);
 
 /**
- * Set the power mode of the wallet to Low Power mode which will reduce the amount of network operations the wallet
- * performs to conserve power
- *
- * ## Arguments
- * `wallet` - The TariWallet pointer
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter. Returns if any pointer argument is null.
- * # Safety
- * None
- */
-void wallet_set_low_power_mode(struct TariWallet *wallet,
-                               int *error_out);
-
-/**
- * Set the power mode of the wallet to Normal Power mode which will then use the standard level of network traffic
- *
- * ## Arguments
- * `wallet` - The TariWallet pointer
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter. Returns if any pointer argument is null.
- * # Safety
- * None
- */
-void wallet_set_normal_power_mode(struct TariWallet *wallet,
-                                  int *error_out);
-
-/**
  * Set a Key Value in the Wallet storage used for Client Key Value store
  *
  * ## Arguments
@@ -4044,9 +4035,9 @@ void log_debug_message(const char *msg,
  * The ```fee_per_gram_stats_destroy``` method must be called when finished with a TariFeePerGramStats to prevent
  * a memory leak.
  */
-TariFeePerGramStat *wallet_get_fee_per_gram_stats(struct TariWallet *wallet,
-                                                  unsigned int count,
-                                                  int *error_out);
+TariFeePerGramStats *wallet_get_fee_per_gram_stats(struct TariWallet *wallet,
+                                                   unsigned int count,
+                                                   int *error_out);
 
 /**
  * Get length of stats from the TariFeePerGramStats.
@@ -4263,5 +4254,5 @@ unsigned long long basenode_state_get_latency(struct TariBaseNodeState *ptr,
                                               int *error_out);
 
 #ifdef __cplusplus
-} // extern "C"
-#endif // __cplusplus
+}  // extern "C"
+#endif  // __cplusplus

@@ -23,7 +23,7 @@ use std::{mem, ops::RangeBounds, sync::Arc, time::Instant};
 
 use log::*;
 use primitive_types::U512;
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use tari_common_types::{
     chain_metadata::ChainMetadata,
     epoch::VnEpoch,
@@ -56,9 +56,6 @@ use super::{BlockchainCheckStatus, MinedInfo, TemplateRegistrationEntry, Validat
 use crate::{
     blocks::{BlockAccumulatedData, UpdateBlockAccumulatedData},
     chain_storage::{
-        blockchain_database::MmrRoots,
-        kernel_merkle_proof::KernelMerkleProof,
-        utxo_mined_info::{InputMinedInfo, OutputMinedInfo},
         BlockAddResult,
         BlockchainBackend,
         BlockchainDatabase,
@@ -67,8 +64,13 @@ use crate::{
         DbTotalSizeStats,
         DbTransaction,
         HorizonData,
+        HorizonStateTreeUpdate,
+        HorizonSyncOutputCheckpoint,
         MmrTree,
         TargetDifficulties,
+        blockchain_database::MmrRoots,
+        kernel_merkle_proof::KernelMerkleProof,
+        utxo_mined_info::{InputMinedInfo, OutputMinedInfo},
     },
     common::rolling_vec::RollingVec,
     proof_of_work::TargetDifficultyWindow,
@@ -159,6 +161,10 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
     make_async_fn!(get_chain_metadata() -> ChainMetadata, "get_chain_metadata");
 
     make_async_fn!(fetch_horizon_data() -> HorizonData, "fetch_horizon_data");
+
+    make_async_fn!(fetch_horizon_sync_output_checkpoint() -> Option<HorizonSyncOutputCheckpoint>, "fetch_horizon_sync_output_checkpoint");
+
+    make_async_fn!(verify_horizon_sync_output_root(version: u64, expected_root: HashOutput) -> (), "verify_horizon_sync_output_root");
 
     //---------------------------------- TXO --------------------------------------------//
 
@@ -372,6 +378,17 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
         self
     }
 
+    pub fn apply_horizon_state_tree_updates(
+        &mut self,
+        previous_version: u64,
+        version: u64,
+        updates: Vec<HorizonStateTreeUpdate>,
+    ) -> &mut Self {
+        self.transaction
+            .apply_horizon_state_tree_updates(previous_version, version, updates);
+        self
+    }
+
     pub fn insert_kernel_via_horizon_sync(
         &mut self,
         kernel: TransactionKernel,
@@ -402,6 +419,15 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
     ) -> &mut Self {
         self.transaction
             .prune_output_from_all_dbs(output_hash, commitment, output_type);
+        self
+    }
+
+    pub fn delete_validator_node(
+        &mut self,
+        sidechain_public_key: Option<CompressedPublicKey>,
+        public_key: CompressedPublicKey,
+    ) -> &mut Self {
+        self.transaction.delete_validator_node(sidechain_public_key, public_key);
         self
     }
 
@@ -439,6 +465,16 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
         self
     }
 
+    pub fn set_horizon_sync_output_checkpoint(&mut self, checkpoint: HorizonSyncOutputCheckpoint) -> &mut Self {
+        self.transaction.set_horizon_sync_output_checkpoint(checkpoint);
+        self
+    }
+
+    pub fn clear_horizon_sync_output_checkpoint(&mut self) -> &mut Self {
+        self.transaction.clear_horizon_sync_output_checkpoint();
+        self
+    }
+
     pub async fn commit(&mut self) -> Result<(), ChainStorageError> {
         let transaction = mem::take(&mut self.transaction);
         self.db.write(transaction).await
@@ -448,7 +484,7 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::blockchain::{create_new_blockchain, TempDatabase};
+    use crate::test_helpers::blockchain::{TempDatabase, create_new_blockchain};
 
     impl AsyncBlockchainDb<TempDatabase> {
         pub fn sample() -> Self {

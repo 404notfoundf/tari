@@ -27,6 +27,7 @@ pub use helpers::{
     construct_monero_data,
     create_blockhashing_blob_from_block,
     create_ordered_transaction_hashes_from_block,
+    create_tari_mining_blob,
     deserialize_monero_block_from_hex,
     extract_aux_merkle_root_from_block,
     insert_aux_chain_mr_and_info_into_block,
@@ -48,7 +49,7 @@ pub use merkle_tree::{create_merkle_proof, tree_hash};
 pub use merkle_tree_parameters::MerkleTreeParameters;
 // Re-exports
 pub use monero::{
-    consensus::{deserialize, serialize},
     Block as MoneroBlock,
     BlockHeader as MoneroBlockHeader,
+    consensus::{deserialize, serialize},
 };

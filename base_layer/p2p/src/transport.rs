@@ -22,16 +22,17 @@
 use std::{num::NonZeroU16, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use tari_common::configuration::MultiaddrList;
 use tari_comms::{
     multiaddr::Multiaddr,
     socks,
     tor::{self, TorIdentity},
-    transports::{predicate::FalsePredicate, SocksConfig},
+    transports::{SocksConfig, predicate::FalsePredicate},
     types::TransportProtocol,
     utils::multiaddr::multiaddr_to_socketaddr,
 };
 
-use crate::{initialization::CommsInitializationError, SocksAuthentication, TorControlAuthentication};
+use crate::{SocksAuthentication, TorControlAuthentication, initialization::CommsInitializationError};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +156,7 @@ pub struct TorTransportConfig {
     pub onion_port: NonZeroU16,
     /// When these peer addresses are encountered when dialing another peer, the tor proxy is bypassed and the
     /// connection is made directly over TCP. /ip4, /ip6, /dns, /dns4 and /dns6 are supported.
-    pub proxy_bypass_addresses: Vec<Multiaddr>,
+    pub proxy_bypass_addresses: MultiaddrList,
     /// When set to true, outbound TCP connections bypass the tor proxy. Defaults to 'true' for better network
     /// performance for TCP nodes; set it to 'false' for better privacy.
     pub proxy_bypass_for_outbound_tcp: bool,
@@ -207,7 +208,7 @@ impl Default for TorTransportConfig {
             socks_address_override: None,
             control_auth: TorControlAuthentication::Auto,
             onion_port: NonZeroU16::new(18141).unwrap(),
-            proxy_bypass_addresses: vec![],
+            proxy_bypass_addresses: MultiaddrList::new(),
             proxy_bypass_for_outbound_tcp: true,
             forward_address: None,
             listener_address_override: None,

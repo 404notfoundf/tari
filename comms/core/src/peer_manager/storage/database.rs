@@ -26,15 +26,15 @@ use bytes::Bytes;
 use chrono::{NaiveDateTime, TimeDelta};
 use diesel::{
     self,
-    dsl::not,
-    prelude::*,
-    r2d2::{ConnectionManager, PooledConnection},
     ExpressionMethods,
     QueryDsl,
     RunQueryDsl,
     SqliteConnection,
+    dsl::not,
+    prelude::*,
+    r2d2::{ConnectionManager, PooledConnection},
 };
-use diesel_migrations::{embed_migrations, EmbeddedMigrations};
+use diesel_migrations::{EmbeddedMigrations, embed_migrations};
 use log::{trace, warn};
 use multiaddr::Multiaddr;
 use tari_common_sqlite::{connection::DbConnection, error::StorageError};
@@ -43,15 +43,14 @@ use tari_utilities::{hex, hex::Hex};
 use crate::{
     net_address::{MultiaddrWithStats, MultiaddressesWithStats, PeerAddressSource},
     peer_manager::{
-        generate_peer_id_as_i64,
-        peer_id::peer_id_from_i64,
-        storage::schema::{multi_addresses, node_identity, peers},
-        NodeDistance,
         NodeId,
         Peer,
         PeerFeatures,
         PeerFlags,
         PeerId,
+        generate_peer_id_as_i64,
+        peer_id::peer_id_from_i64,
+        storage::schema::{multi_addresses, node_identity, peers},
     },
     protocol::ProtocolId,
     types::{CommsPublicKey, TransportProtocol},
@@ -138,8 +137,6 @@ impl PeerDatabaseSql {
                             affected
                         )));
                     }
-                    // Re-index distance_to_self for all peers to reflect the new local NodeId.
-                    self.reindex_all_peer_distances_in_tx(conn, &self.this_peer_identity.node_id)?;
                     return Ok(());
                 }
             }
@@ -164,354 +161,14 @@ impl PeerDatabaseSql {
         })
     }
 
-    /// Re-indexes the distance_to_self field for all peers in the database based on a new local NodeId.
-    /// This is necessary when the node's identity changes to maintain accurate distance calculations
-    /// for DHT routing and peer selection.
-    ///
-    /// # Arguments
-    /// * `conn` - The database connection to use for the transaction
-    /// * `new_node_id` - The new local NodeId to calculate distances from
-    ///
-    /// # Returns
-    /// * `Ok(())` if all peer distances were successfully updated
-    /// * `Err(StorageError)` if there was a database error during the update
-    fn reindex_all_peer_distances_in_tx(
-        &self,
-        conn: &mut SqliteConnection,
-        new_node_id: &NodeId,
-    ) -> Result<(), StorageError> {
-        use crate::peer_manager::storage::schema::peers;
-        let rows: Vec<(i64, String)> = peers::table
-            .select((peers::peer_id, peers::node_id))
-            .load::<(i64, String)>(conn)?;
-        for (peer_id, node_id_hex) in rows {
-            let Ok(node_id) = NodeId::from_hex(&node_id_hex) else {
-                continue;
-            };
-            let distance = format!("{:032}", new_node_id.distance(&node_id).as_u128());
-            diesel::update(peers::table.filter(peers::peer_id.eq(peer_id)))
-                .set(peers::distance_to_self.eq(distance))
-                .execute(conn)?;
-        }
-        Ok(())
-    }
-
-    // Note: This function is not properly working at the moment, but must be kept here for in its commented out form
-    // for further evaluation.
-    // ==============================================================================================================
-    // /// This function will add peers and their associated multi-addresses in batch mode:
-    // /// - New peers are added with all their information.
-    // /// - Existing peers are not modified.
-    // /// - Only missing multi-addresses are added for existing peers.
-    // ///
-    // ///   Note:
-    // ///   SQLite does not support the DEFAULT keyword in INSERT statements, which Diesel uses for batch inserts.
-    // ///   Diesel's batch insert API is designed for databases like PostgreSQL that support this feature.
-    // #[allow(clippy::too_many_lines)]
-    // pub fn batch_add_peers_with_addresses(
-    //     &self,
-    //     peers_with_addresses: Vec<NewPeerWithAddressesSql>,
-    // ) -> Result<usize, StorageError> {
-    //     let mut conn = self.connection.get_pooled_connection()?;
-    //     conn.immediate_transaction::<_, StorageError, _>(|conn| {
-    //         // Step 1: Insert new peers with ON CONFLICT DO NOTHING
-    //         let values = peers_with_addresses
-    //             .iter()
-    //             .map(|p| {
-    //                 let peer_id = generate_peer_id_as_i64();
-    //                 let public_key = sql_escape(&p.peer.public_key);
-    //                 let node_id = sql_escape(&p.peer.node_id);
-    //                 let distance_to_self = self
-    //                     .this_peer_identity
-    //                     .node_id
-    //                     .distance(&NodeId::from_hex(&p.peer.node_id)?)
-    //                     .to_string();
-    //                 let flags = p.peer.flags;
-    //                 let banned_until = p.peer.banned_until.map_or("NULL".to_string(), |dt| format!("'{}'", dt));
-    //                 let banned_reason = p
-    //                     .peer
-    //                     .banned_reason
-    //                     .clone()
-    //                     .map_or("NULL".to_string(), |reason| format!("'{}'", sql_escape(&reason)));
-    //                 let features = p.peer.features;
-    //                 let supported_protocols = sql_escape(&p.peer.supported_protocols);
-    //                 let added_at = p.peer.added_at;
-    //                 let user_agent = sql_escape(&p.peer.user_agent);
-    //                 let metadata = p
-    //                     .peer
-    //                     .metadata
-    //                     .clone()
-    //                     .map_or("NULL".to_string(), |meta| format!("x'{}'", hex::to_hex(&meta)));
-    //                 let deleted_at = p.peer.deleted_at.map_or("NULL".to_string(), |dt| format!("'{}'", dt));
-    //
-    //                 Ok::<String, StorageError>(format!(
-    //                     "({}, '{}', '{}', '{}', {}, {}, {}, {}, '{}', '{}', '{}', {}, {})",
-    //                     peer_id,
-    //                     public_key,
-    //                     node_id,
-    //                     distance_to_self,
-    //                     flags,
-    //                     banned_until,
-    //                     banned_reason,
-    //                     features,
-    //                     supported_protocols,
-    //                     added_at,
-    //                     user_agent,
-    //                     metadata,
-    //                     deleted_at
-    //                 ))
-    //             })
-    //             .collect::<Result<Vec<String>, _>>()?;
-    //
-    //         let mut peer_query = format!(
-    //             "INSERT INTO peers (peer_id, public_key, node_id, distance_to_self, flags, banned_until, \
-    //              banned_reason, features, supported_protocols, added_at, user_agent, metadata, deleted_at) VALUES
-    // {}",             values.join(", ")
-    //         );
-    //
-    //         peer_query.push_str(" ON CONFLICT (node_id) DO NOTHING");
-    //         conn.batch_execute(&peer_query)?;
-    //
-    //         // Step 2: Collect all multi-addresses into a map
-    //         let mut address_map: HashMap<String, Vec<NewMultiaddrWithStatsSql>> = HashMap::new();
-    //         for item in peers_with_addresses {
-    //             address_map
-    //                 .entry(item.peer.node_id.to_string())
-    //                 .or_default()
-    //                 .extend(item.addresses);
-    //         }
-    //
-    //         // Step 3: Insert missing multi-addresses
-    //         let mut address_query = String::from(
-    //             "INSERT INTO multi_addresses (peer_id, address, last_seen, connection_attempts, \
-    //              avg_initial_dial_time, initial_dial_time_sample_count, avg_latency, latency_sample_count, \
-    //              last_attempted, last_failed_reason, quality_score, source) VALUES ",
-    //         );
-    //
-    //         let mut total_addresses_inserted = 0;
-    //         for (node_id, addresses) in address_map {
-    //             // Retrieve peer_id for the node_id
-    //             let peer_id = peers::table
-    //                 .filter(peers::node_id.eq(node_id))
-    //                 .select(peers::peer_id)
-    //                 .first::<i64>(conn)?;
-    //
-    //             // Filter out existing addresses
-    //             let existing_addresses: Vec<_> = multi_addresses::table
-    //                 .filter(multi_addresses::peer_id.eq(peer_id))
-    //                 .select(multi_addresses::address)
-    //                 .load::<String>(conn)?;
-    //
-    //             let new_addresses: Vec<_> = addresses
-    //                 .into_iter()
-    //                 .filter(|addr| !existing_addresses.contains(&addr.address.to_string()))
-    //                 .collect();
-    //
-    //             if !new_addresses.is_empty() {
-    //                 address_query.push_str(
-    //                     &new_addresses
-    //                         .iter()
-    //                         .map(|addr| {
-    //                             format!(
-    //                                 "({}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}')",
-    //                                 peer_id,
-    //                                 sql_escape(&addr.address),
-    //                                 addr.last_seen.map_or("NULL".to_string(), |dt| format!("'{}'", dt)),
-    //                                 addr.connection_attempts.map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 addr.avg_initial_dial_time.map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 addr.initial_dial_time_sample_count
-    //                                     .map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 addr.avg_latency.map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 addr.latency_sample_count.map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 addr.last_attempted.map_or("NULL".to_string(), |dt| format!("'{}'", dt)),
-    //                                 addr.last_failed_reason
-    //                                     .clone()
-    //                                     .map_or("NULL".to_string(), |reason| format!("'{}'", sql_escape(&reason))),
-    //                                 addr.quality_score.map_or("NULL".to_string(), |v| v.to_string()),
-    //                                 sql_escape(&addr.source),
-    //                             )
-    //                         })
-    //                         .collect::<Vec<String>>()
-    //                         .join(", "),
-    //                 );
-    //
-    //                 total_addresses_inserted += new_addresses.len();
-    //             }
-    //         }
-    //
-    //         if total_addresses_inserted > 0 {
-    //             address_query.push_str(" ON CONFLICT (address) DO NOTHING");
-    //             conn.batch_execute(&address_query)?;
-    //         }
-    //
-    //         Ok(total_addresses_inserted)
-    //     })
-    // }
-    // ==============================================================================================================
-
-    // Note: This function is not properly working at the moment, but must be kept here for in its commented out form
-    // for further evaluation.
-    // ==============================================================================================================
-    // /// This function will update peers and their associated multi-addresses in batch mode.
-    // #[allow(clippy::too_many_lines)]
-    // pub fn batch_update_peers_with_addresses(
-    //     &self,
-    //     peers_with_addresses: Vec<UpdatePeerWithAddressesSql>,
-    // ) -> Result<(), StorageError> {
-    //     let mut conn = self.connection.get_pooled_connection()?;
-    //     conn.immediate_transaction::<_, StorageError, _>(|conn| {
-    //         // Batch update peers
-    //         if !peers_with_addresses.is_empty() {
-    //             let mut peer_query = String::from("UPDATE peers SET ");
-    //             let mut set_clauses = vec![];
-    //             let mut node_ids = vec![];
-    //
-    //             for update in &peers_with_addresses {
-    //                 let peer_update = update.peer.clone();
-    //
-    //                 if let Some(banned_until) = peer_update.banned_until {
-    //                     set_clauses.push(format!(
-    //                         "banned_until = CASE WHEN node_id = '{}' THEN '{}' ELSE banned_until END",
-    //                         peer_update.node_id, banned_until
-    //                     ));
-    //                 }
-    //                 if let Some(banned_reason) = peer_update.banned_reason {
-    //                     set_clauses.push(format!(
-    //                         "banned_reason = CASE WHEN node_id = '{}' THEN '{}' ELSE banned_reason END",
-    //                         peer_update.node_id,
-    //                         sql_escape(&banned_reason)
-    //                     ));
-    //                 }
-    //                 if let Some(supported_protocols) = peer_update.supported_protocols {
-    //                     set_clauses.push(format!(
-    //                         "supported_protocols = CASE WHEN node_id = '{}' THEN '{}' ELSE supported_protocols END",
-    //                         peer_update.node_id,
-    //                         sql_escape(&supported_protocols)
-    //                     ));
-    //                 }
-    //                 if let Some(user_agent) = peer_update.user_agent {
-    //                     set_clauses.push(format!(
-    //                         "user_agent = CASE WHEN node_id = '{}' THEN '{}' ELSE user_agent END",
-    //                         peer_update.node_id,
-    //                         sql_escape(&user_agent)
-    //                     ));
-    //                 }
-    //                 if let Some(metadata) = peer_update.metadata {
-    //                     set_clauses.push(format!(
-    //                         "metadata = CASE WHEN node_id = '{}' THEN x'{}' ELSE metadata END",
-    //                         peer_update.node_id,
-    //                         hex::to_hex(&metadata)
-    //                     ));
-    //                 }
-    //                 if let Some(deleted_at) = peer_update.deleted_at {
-    //                     set_clauses.push(format!(
-    //                         "deleted_at = CASE WHEN node_id = '{}' THEN '{}' ELSE deleted_at END",
-    //                         peer_update.node_id, deleted_at
-    //                     ));
-    //                 }
-    //                 node_ids.push(format!("'{}'", peer_update.node_id.replace('\'', "''")));
-    //             }
-    //
-    //             peer_query.push_str(&set_clauses.join(", "));
-    //             peer_query.push_str(&format!(" WHERE node_id IN ({})", node_ids.join(", ")));
-    //             conn.batch_execute(&peer_query)?;
-    //         }
-    //
-    //         // Batch update multi-addresses
-    //         let mut address_query = String::from("UPDATE multi_addresses SET ");
-    //         let mut set_clauses = vec![];
-    //         let mut addresses = vec![];
-    //
-    //         for update in peers_with_addresses {
-    //             for address_update in update.addresses {
-    //                 if let Some(last_seen) = address_update.last_seen {
-    //                     set_clauses.push(format!(
-    //                         "last_seen = CASE WHEN address = '{}' THEN '{}' ELSE last_seen END",
-    //                         address_update.address, last_seen
-    //                     ));
-    //                 }
-    //                 if let Some(connection_attempts) = address_update.connection_attempts {
-    //                     set_clauses.push(format!(
-    //                         "connection_attempts = CASE WHEN address = '{}' THEN {} ELSE connection_attempts END",
-    //                         address_update.address, connection_attempts
-    //                     ));
-    //                 }
-    //                 if let Some(avg_initial_dial_time) = address_update.avg_initial_dial_time {
-    //                     set_clauses.push(format!(
-    //                         "avg_initial_dial_time = CASE WHEN address = '{}' THEN {} ELSE avg_initial_dial_time
-    // END",                         address_update.address, avg_initial_dial_time
-    //                     ));
-    //                 }
-    //                 if let Some(initial_dial_time_sample_count) = address_update.initial_dial_time_sample_count {
-    //                     set_clauses.push(format!(
-    //                         "initial_dial_time_sample_count = CASE WHEN address = '{}' THEN {} ELSE \
-    //                          initial_dial_time_sample_count END",
-    //                         address_update.address, initial_dial_time_sample_count
-    //                     ));
-    //                 }
-    //                 if let Some(avg_latency) = address_update.avg_latency {
-    //                     set_clauses.push(format!(
-    //                         "avg_latency = CASE WHEN address = '{}' THEN {} ELSE avg_latency END",
-    //                         address_update.address, avg_latency
-    //                     ));
-    //                 }
-    //                 if let Some(latency_sample_count) = address_update.latency_sample_count {
-    //                     set_clauses.push(format!(
-    //                         "latency_sample_count = CASE WHEN address = '{}' THEN {} ELSE latency_sample_count END",
-    //                         address_update.address, latency_sample_count
-    //                     ));
-    //                 }
-    //                 if let Some(last_attempted) = address_update.last_attempted {
-    //                     set_clauses.push(format!(
-    //                         "last_attempted = CASE WHEN address = '{}' THEN '{}' ELSE last_attempted END",
-    //                         address_update.address, last_attempted
-    //                     ));
-    //                 }
-    //                 if let Some(last_failed_reason) = address_update.last_failed_reason {
-    //                     set_clauses.push(format!(
-    //                         "last_failed_reason = CASE WHEN address = '{}' THEN '{}' ELSE last_failed_reason END",
-    //                         address_update.address,
-    //                         sql_escape(&last_failed_reason)
-    //                     ));
-    //                 }
-    //                 if let Some(quality_score) = address_update.quality_score {
-    //                     set_clauses.push(format!(
-    //                         "quality_score = CASE WHEN address = '{}' THEN {} ELSE quality_score END",
-    //                         address_update.address, quality_score
-    //                     ));
-    //                 }
-    //                 if let Some(source) = address_update.source {
-    //                     set_clauses.push(format!(
-    //                         "source = CASE WHEN address = '{}' THEN '{}' ELSE source END",
-    //                         address_update.address,
-    //                         sql_escape(&source)
-    //                     ));
-    //                 }
-    //                 addresses.push(format!("'{}'", address_update.address.replace('\'', "''")));
-    //             }
-    //         }
-    //
-    //         if !set_clauses.is_empty() {
-    //             address_query.push_str(&set_clauses.join(", "));
-    //             address_query.push_str(&format!(" WHERE address IN ({})", addresses.join(", ")));
-    //             conn.batch_execute(&address_query)?;
-    //         }
-    //
-    //         Ok(())
-    //     })
-    // }
-    // ==============================================================================================================
-
     /// Add a new peer or update an existing peer with its associated multi-addresses
     pub fn add_or_update_peer(&self, peer: Peer) -> Result<PeerId, StorageError> {
         let mut conn = self.connection.get_pooled_connection()?;
-
         conn.immediate_transaction::<_, StorageError, _>(|conn| {
             let node_id = peer.node_id.clone();
 
             match self.get_peer_by_node_id_inner(&node_id, conn)? {
                 Some(mut existing_peer) => {
-                    trace!(target: LOG_TARGET, "Replacing peer that has NodeId '{node_id}'");
                     existing_peer.merge(&peer);
                     let update_peer_sql = PeerDatabaseSql::update_peer_sql(existing_peer.clone())?;
                     self.update_peer_inner(update_peer_sql, conn)?;
@@ -576,10 +233,6 @@ impl PeerDatabaseSql {
             peer_id: generate_peer_id_as_i64(),
             public_key: peer.public_key.to_hex(),
             node_id: peer.node_id.to_hex(),
-            distance_to_self: format!(
-                "{:032}",
-                self.this_peer_identity.node_id.distance(&peer.node_id).as_u128()
-            ),
             flags: peer.flags.to_i32(),
             banned_until: peer.banned_until,
             banned_reason: peer.banned_reason.clone(),
@@ -677,8 +330,10 @@ impl PeerDatabaseSql {
     fn update_peer_sql(peer: Peer) -> Result<UpdatePeerWithAddressesSql, StorageError> {
         let update_peer_sql = UpdatePeerSql {
             node_id: Some(peer.node_id.to_hex()),
+            flags: Some(peer.flags.to_i32()),
             banned_until: Some(peer.banned_until),
             banned_reason: Some(peer.banned_reason.clone()),
+            features: Some(peer.features.to_i32()),
             supported_protocols: Some(serialize_protocols(&peer.supported_protocols)),
             user_agent: Some(peer.user_agent.clone()),
             metadata: Some(serialize_metadata(&peer.metadata)?),
@@ -1197,11 +852,11 @@ impl PeerDatabaseSql {
         exclude_failed: bool,
         randomize: bool,
     ) -> Result<Vec<Peer>, StorageError> {
-        if let Some(n) = n {
-            if n == 0 {
-                warn!(target: LOG_TARGET, "'0' requested for 'get_available_dial_candidates'");
-                return Ok(Vec::new());
-            }
+        if let Some(n) = n &&
+            n == 0
+        {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_available_dial_candidates'");
+            return Ok(Vec::new());
         }
         let mut conn = self.connection.get_pooled_connection()?;
         let addr_filter_sql = Self::build_addr_filter_sql(transport_protocols);
@@ -1397,105 +1052,6 @@ impl PeerDatabaseSql {
         })
     }
 
-    // Get the closest `n` not failed, banned or deleted node ids, ordered by their distance to the given node ID.
-    fn get_closest_n_good_standing_peer_node_ids_inner(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-        conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
-    ) -> Result<Vec<NodeId>, StorageError> {
-        // Step 1: Retrieve relevant (node_ids)
-        let mut query = peers::table
-            .inner_join(
-                multi_addresses::table.on(multi_addresses::peer_id
-                    .eq(peers::peer_id)
-                    .and(multi_addresses::last_failed_reason.is_null())),
-            )
-            .filter(
-                peers::banned_until
-                    .is_null()
-                    .or(peers::banned_until.lt(chrono::Utc::now().naive_utc())),
-            )
-            .filter(peers::deleted_at.is_null())
-            .distinct()
-            .into_boxed();
-
-        if features == PeerFeatures::COMMUNICATION_CLIENT {
-            query = query.filter(peers::features.eq(features.to_i32()));
-        } else {
-            query = query.filter(diesel::dsl::sql::<diesel::sql_types::Bool>(&format!(
-                "features & {} != 0",
-                features.to_i32()
-            )));
-        }
-
-        query = query
-            .order_by(peers::distance_to_self.asc())
-            .limit(i64::try_from(n).unwrap_or(i64::MAX));
-
-        // Note: To debug the SQL query, uncomment the following lines:
-        // --------------------------------
-        // use diesel::{debug_query, sqlite::Sqlite};
-        // println!();
-        // println!("SQL Query: {}", debug_query::<Sqlite, _>(&query));
-        // --------------------------------
-
-        let nodes_ids_hex = query.select(peers::node_id).load::<String>(conn)?;
-
-        let nodes_ids = nodes_ids_hex
-            .into_iter()
-            .filter_map(|v| NodeId::from_hex(&v).ok())
-            .collect::<Vec<_>>();
-
-        Ok(nodes_ids)
-    }
-
-    /// Get the closest `n` not failed, banned or deleted node ids, ordered by their distance to the given node ID.
-    pub fn get_closest_n_good_standing_peer_node_ids(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-    ) -> Result<Vec<NodeId>, StorageError> {
-        if n == 0 {
-            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_good_standing_peer_node_ids'");
-            return Ok(Vec::new());
-        }
-
-        let mut conn = self.connection.get_pooled_connection()?;
-
-        conn.transaction::<_, StorageError, _>(|conn| {
-            self.get_closest_n_good_standing_peer_node_ids_inner(n, features, conn)
-        })
-    }
-
-    /// Get the closest `n` not failed, banned or deleted peers, ordered by their distance to the given node ID.
-    pub fn get_closest_n_good_standing_peers(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-    ) -> Result<Vec<Peer>, StorageError> {
-        if n == 0 {
-            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_good_standing_peers'");
-            return Ok(Vec::new());
-        }
-        let mut conn = self.connection.get_pooled_connection()?;
-
-        conn.transaction::<_, StorageError, _>(|conn| {
-            let node_ids = self.get_closest_n_good_standing_peer_node_ids_inner(n, features, conn)?;
-
-            let node_ids_hex = node_ids.iter().map(|id| id.to_hex()).collect::<Vec<_>>();
-            let results = peers::table
-                .inner_join(multi_addresses::table.on(multi_addresses::peer_id.eq(peers::peer_id)))
-                .filter(peers::node_id.eq_any(node_ids_hex))
-                .order_by(peers::distance_to_self.asc())
-                .load::<(NewPeerSql, NewMultiaddrWithStatsSql)>(conn)?;
-
-            let peers = PeerDatabaseSql::peers_from_join_query(results)?;
-
-            Ok(peers)
-        })
-    }
-
     // Get the closest `n` active peer ids (have been seen, optionally within a threshold, not banned, not deleted,
     // optional features, optionally that have at least one external address).
     fn get_active_peer_node_ids(
@@ -1510,11 +1066,11 @@ impl PeerDatabaseSql {
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
         transport_protocols: &[TransportProtocol],
     ) -> Result<Vec<String>, StorageError> {
-        if let Some(n) = n {
-            if n == 0 {
-                warn!(target: LOG_TARGET, "'0' requested for 'get_active_peer_node_ids'");
-                return Ok(Vec::new());
-            }
+        if let Some(n) = n &&
+            n == 0
+        {
+            warn!(target: LOG_TARGET, "'0' requested for 'get_active_peer_node_ids'");
+            return Ok(Vec::new());
         }
         let excluded_node_ids_hex = excluded_peers.iter().map(|id| id.to_hex()).collect::<Vec<_>>();
         let addr_filter_sql = Self::build_addr_filter_sql(transport_protocols);
@@ -1592,67 +1148,6 @@ impl PeerDatabaseSql {
         Ok(node_ids_hex)
     }
 
-    /// Get the closest `n` active peers (have been seen, optionally within a threshold, not banned, not deleted,
-    /// optional features), ordered by their distance to the given region node ID.
-    pub fn get_closest_n_active_peers(
-        &self,
-        region_node_id: &NodeId,
-        n: usize,
-        excluded_peers: &[NodeId],
-        features: Option<PeerFeatures>,
-        peer_flags: Option<PeerFlags>,
-        stale_peer_threshold: Option<Duration>,
-        exclude_if_all_address_failed: bool,
-        exclusion_distance: Option<NodeDistance>,
-        external_addresses_only: bool,
-        transport_protocols: &[TransportProtocol],
-    ) -> Result<Vec<Peer>, StorageError> {
-        if n == 0 {
-            warn!(target: LOG_TARGET, "'0' requested for 'get_closest_n_active_peers'");
-            return Ok(Vec::new());
-        }
-
-        let mut conn = self.connection.get_pooled_connection()?;
-
-        conn.transaction::<_, StorageError, _>(|conn| {
-            let node_ids_hex = self.get_active_peer_node_ids(
-                excluded_peers,
-                features,
-                peer_flags,
-                stale_peer_threshold,
-                exclude_if_all_address_failed,
-                external_addresses_only,
-                None,
-                conn,
-                transport_protocols,
-            )?;
-
-            let mut node_ids = node_ids_hex
-                .into_iter()
-                .filter_map(|id| NodeId::from_hex(&id).ok())
-                .filter(|id| {
-                    exclusion_distance
-                        .clone()
-                        .map(|d| id.distance(region_node_id) < d)
-                        .unwrap_or(true)
-                })
-                .collect::<Vec<_>>();
-            node_ids.sort_by_key(|a| a.distance(region_node_id));
-            node_ids.truncate(n);
-
-            let selected_node_ids_hex = node_ids.iter().map(|id| id.to_hex()).collect::<Vec<_>>();
-            let mut peers = self.get_peers_by_node_ids_str(&selected_node_ids_hex, external_addresses_only, conn)?;
-
-            peers.sort_by(|a, b| {
-                a.node_id
-                    .distance(region_node_id)
-                    .cmp(&b.node_id.distance(region_node_id))
-            });
-
-            Ok(peers)
-        })
-    }
-
     /// Get `n` active random peers, ordered by their distance to the given node ID.
     pub fn get_n_random_active_peers(
         &self,
@@ -1698,6 +1193,7 @@ impl PeerDatabaseSql {
         exclude_node_ids: &[NodeId],
         peer_flags: Option<PeerFlags>,
         transport_protocols: &[TransportProtocol],
+        known_good: bool,
     ) -> Result<Vec<Peer>, StorageError> {
         if n == 0 {
             warn!(target: LOG_TARGET, "'0' requested for 'get_n_random_peers'");
@@ -1707,7 +1203,6 @@ impl PeerDatabaseSql {
         let mut conn = self.connection.get_pooled_connection()?;
         let exclude_node_ids = exclude_node_ids.iter().map(|id| id.to_hex()).collect::<Vec<_>>();
         let addr_filter_sql = Self::build_addr_filter_sql(transport_protocols);
-
         conn.transaction::<_, StorageError, _>(|conn| {
             // Step 1: Filtered, random and truncated list of node_ids
             let mut query = peers::table
@@ -1722,7 +1217,6 @@ impl PeerDatabaseSql {
                     "features & {} != 0",
                     PeerFeatures::COMMUNICATION_NODE.to_i32()
                 )))
-                .filter(multi_addresses::last_seen.is_not_null())
                 .filter(peers::node_id.ne_all(exclude_node_ids))
                 .order_by(diesel::dsl::sql::<diesel::sql_types::Integer>("RANDOM()"))
                 .limit(i64::try_from(n).unwrap_or(i64::MAX))
@@ -1730,6 +1224,9 @@ impl PeerDatabaseSql {
                 .distinct()
                 .into_boxed();
 
+            if known_good {
+                query = query.filter(multi_addresses::last_seen.is_not_null());
+            }
             if let Some(flags) = peer_flags {
                 query = query.filter(peers::flags.eq(flags.to_i32()));
             }
@@ -1756,7 +1253,10 @@ impl PeerDatabaseSql {
         // Perform a join query to fetch peers and their addresses
         let results = peers::table
             .inner_join(multi_addresses::table.on(multi_addresses::peer_id.eq(peers::peer_id)))
-            .filter(peers::flags.eq(PeerFlags::SEED.to_i32()))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(&format!(
+                "flags & {} != 0",
+                PeerFlags::SEED.to_i32()
+            )))
             .load::<(NewPeerSql, NewMultiaddrWithStatsSql)>(&mut conn)?;
 
         PeerDatabaseSql::peers_from_join_query(results)
@@ -1817,7 +1317,6 @@ pub struct NewPeerSql {
     pub peer_id: i64,
     pub public_key: String,
     pub node_id: String,
-    pub distance_to_self: String,
     pub flags: i32,
     pub banned_until: Option<NaiveDateTime>,
     pub banned_reason: String,
@@ -1833,8 +1332,10 @@ pub struct NewPeerSql {
 #[diesel(table_name = peers)]
 pub struct UpdatePeerSql {
     pub node_id: Option<String>,
+    pub flags: Option<i32>,
     pub banned_until: Option<Option<NaiveDateTime>>,
     pub banned_reason: Option<String>,
+    pub features: Option<i32>,
     pub supported_protocols: Option<String>,
     pub user_agent: Option<String>,
     pub metadata: Option<Option<Vec<u8>>>,
@@ -2062,25 +1563,25 @@ mod tests {
     use chrono::TimeDelta;
     use diesel::{self, ExpressionMethods, QueryDsl, RunQueryDsl};
     use tari_common_sqlite::connection::DbConnection;
-    use tari_utilities::{hex::Hex, ByteArray};
+    use tari_utilities::{ByteArray, hex::Hex};
 
     use crate::{
         multiaddr::Multiaddr,
         net_address::{MultiaddressesWithStats, PeerAddressSource},
         peer_manager::{
+            NodeId,
+            Peer,
+            PeerFeatures,
+            PeerFlags,
             create_test_peer,
             create_test_peer_add_internal_addresses,
             create_test_peer_internal_addresses_only,
-            database::{NewMultiaddrWithStatsSql, NewPeerSql, PeerDatabaseSql, MIGRATIONS},
+            database::{MIGRATIONS, NewMultiaddrWithStatsSql, NewPeerSql, PeerDatabaseSql},
             manager::create_test_peer_with_onion_address,
             storage::{
                 database::{duration_to_i64_ms_infallible, u32_to_i32_infallible},
                 schema::{multi_addresses, peers},
             },
-            NodeId,
-            Peer,
-            PeerFeatures,
-            PeerFlags,
         },
         protocol::ProtocolId,
         types::{CommsPublicKey, TransportProtocol},
@@ -2207,13 +1708,17 @@ mod tests {
         assert!(nodes_with_onion_addresses.is_empty());
 
         // - Has external address
-        assert!(nodes_with_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) }));
+        assert!(
+            nodes_with_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) })
+        );
         // - Has internal address
-        assert!(nodes_with_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) }));
+        assert!(
+            nodes_with_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) })
+        );
 
         // Add peer with onion addresses only
         let onion_peer = create_test_peer_with_onion_address(false, PeerFeatures::COMMUNICATION_NODE);
@@ -2311,100 +1816,6 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn test_peer_features() {
-        let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
-        let peers_db = PeerDatabaseSql::new(
-            db_connection,
-            &create_test_peer(false, PeerFeatures::COMMUNICATION_NODE),
-        )
-        .unwrap();
-
-        // Create new node peers
-        let mut node_peers = Vec::with_capacity(12);
-        for i in 0..12 {
-            let mut peer = create_test_peer(false, PeerFeatures::COMMUNICATION_NODE);
-            if i % 4 == 0 {
-                peer.flags = PeerFlags::SEED;
-            }
-            node_peers.push(peer.clone());
-            peers_db.add_or_update_peer(peer).unwrap();
-        }
-        // Create new wallet peers
-        let mut wallet_peers = Vec::with_capacity(12);
-        for _i in 0..12 {
-            let peer = create_test_peer(false, PeerFeatures::COMMUNICATION_CLIENT);
-            wallet_peers.push(peer.clone());
-            peers_db.add_or_update_peer(peer).unwrap();
-        }
-
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                5,
-                &[node_peers[6].node_id.clone(), node_peers[7].node_id.clone()],
-                Some(PeerFeatures::MESSAGE_PROPAGATION),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 5);
-
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                5,
-                &[node_peers[6].node_id.clone(), node_peers[7].node_id.clone()],
-                Some(PeerFeatures::DHT_STORE_FORWARD),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 5);
-
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                5,
-                &[node_peers[6].node_id.clone(), node_peers[7].node_id.clone()],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 5);
-
-        // Test 'get_closest_n_active_peers' - wallets
-        let closest_peers = peers_db
-            .get_closest_n_active_peers(
-                &wallet_peers[5].node_id,
-                5,
-                &[wallet_peers[6].node_id.clone(), wallet_peers[7].node_id.clone()],
-                Some(PeerFeatures::COMMUNICATION_CLIENT),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_peers.len(), 5);
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
     fn test_seed_peer_exclusion() {
         let transport_protocols = TransportProtocol::get_all();
         let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
@@ -2425,122 +1836,35 @@ mod tests {
             peers_db.add_or_update_peer(peer).unwrap();
         }
 
-        // All peers as closest
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                12,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 12);
-
-        // All seed peers only as closest
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                12,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                Some(PeerFlags::SEED),
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 4);
-        assert!(closest_nodes.iter().all(|p| p.flags == PeerFlags::SEED));
-
-        // One seed peer as closest
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                1,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                Some(PeerFlags::SEED),
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes[0].flags, PeerFlags::SEED);
-
-        // All normal peers only as closest
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                12,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                Some(PeerFlags::NONE),
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 8);
-        assert!(closest_nodes.iter().all(|p| p.flags == PeerFlags::NONE));
-
-        // One normal peer as closest
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                1,
-                &[],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                Some(PeerFlags::NONE),
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes[0].flags, PeerFlags::NONE);
-
         // All peers as random
         let random_peers = peers_db
-            .get_n_random_peers(12, &[], None, &transport_protocols)
+            .get_n_random_peers(12, &[], None, &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers.len(), 12);
 
         // All seed peers only as random
         let random_peers = peers_db
-            .get_n_random_peers(12, &[], Some(PeerFlags::SEED), &transport_protocols)
+            .get_n_random_peers(12, &[], Some(PeerFlags::SEED), &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers.len(), 4);
         assert!(random_peers.iter().all(|p| p.flags == PeerFlags::SEED));
 
         // One seed peer as random
         let random_peers = peers_db
-            .get_n_random_peers(1, &[], Some(PeerFlags::SEED), &transport_protocols)
+            .get_n_random_peers(1, &[], Some(PeerFlags::SEED), &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers[0].flags, PeerFlags::SEED);
 
         // All normal peers only as random
         let random_peers = peers_db
-            .get_n_random_peers(12, &[], Some(PeerFlags::NONE), &transport_protocols)
+            .get_n_random_peers(12, &[], Some(PeerFlags::NONE), &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers.len(), 8);
         assert!(random_peers.iter().all(|p| p.flags == PeerFlags::NONE));
 
         // One normal peer as random
         let random_peers = peers_db
-            .get_n_random_peers(1, &[], Some(PeerFlags::NONE), &transport_protocols)
+            .get_n_random_peers(1, &[], Some(PeerFlags::NONE), &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers[0].flags, PeerFlags::NONE);
     }
@@ -2601,10 +1925,12 @@ mod tests {
         assert!(deleted_peer.deleted_at.is_some());
 
         // Test 'peer_exists_by_node_id'
-        assert!(peers_db
-            .peer_exists_by_node_id(&node_peers[2].node_id)
-            .unwrap()
-            .is_some());
+        assert!(
+            peers_db
+                .peer_exists_by_node_id(&node_peers[2].node_id)
+                .unwrap()
+                .is_some()
+        );
 
         // Test 'get_peer_by_public_key'
         let peer = peers_db
@@ -2614,10 +1940,12 @@ mod tests {
         assert_eq!(peer, node_peers[3]);
 
         // Test 'peer_exists_by_public_key'
-        assert!(peers_db
-            .peer_exists_by_public_key(&node_peers[4].public_key)
-            .unwrap()
-            .is_some());
+        assert!(
+            peers_db
+                .peer_exists_by_public_key(&node_peers[4].public_key)
+                .unwrap()
+                .is_some()
+        );
 
         // Test 'get_all_peers'
         let all_peers = peers_db.get_all_peers(None).unwrap();
@@ -2642,12 +1970,16 @@ mod tests {
         // node peer 1 is deleted, node peer 4 is banned
         // wallet peer 1 is deleted, wallet peer 4 is banned
         assert_eq!(n_peers.len(), 20);
-        assert!(!n_peers
-            .iter()
-            .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id));
-        assert!(!n_peers
-            .iter()
-            .any(|n| n.node_id == wallet_peers[1].node_id || n.node_id == wallet_peers[4].node_id));
+        assert!(
+            !n_peers
+                .iter()
+                .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id)
+        );
+        assert!(
+            !n_peers
+                .iter()
+                .any(|n| n.node_id == wallet_peers[1].node_id || n.node_id == wallet_peers[4].node_id)
+        );
 
         // Test 'set_last_seen'
         let last_seen = chrono::Utc::now().naive_utc() -
@@ -2681,117 +2013,6 @@ mod tests {
             last_seen
         );
 
-        // Test 'get_closest_n_active_peers' - nodes
-        let closest_nodes = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                5,
-                &[node_peers[6].node_id.clone(), node_peers[7].node_id.clone()],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_nodes.len(), 5);
-        // Verify deleted & banned
-        assert!(!closest_nodes
-            .iter()
-            .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id));
-        // Verify stale
-        assert!(!closest_nodes.iter().any(|n| n.node_id == node_peers[8].node_id));
-        // Verify excluded
-        assert!(!closest_nodes
-            .iter()
-            .any(|n| n.node_id == node_peers[6].node_id || n.node_id == node_peers[7].node_id));
-        // Verify all are nodes
-        assert!(closest_nodes.iter().all(|n| n.features.is_node()));
-        // Verify sorting by distance
-        for i in 0..closest_nodes.len() - 1 {
-            assert!(
-                closest_nodes[i].node_id.distance(&node_peers[5].node_id) <=
-                    closest_nodes[i + 1].node_id.distance(&node_peers[5].node_id)
-            );
-        }
-
-        // Test 'get_closest_n_active_peer_node_ids' - nodes
-        let closest_peers = peers_db
-            .get_closest_n_active_peers(
-                &node_peers[5].node_id,
-                5,
-                &[node_peers[6].node_id.clone(), node_peers[7].node_id.clone()],
-                Some(PeerFeatures::COMMUNICATION_NODE),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_peers.len(), 5);
-        // Verify deleted & banned
-        assert!(!closest_peers
-            .iter()
-            .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id));
-        // Verify stale
-        assert!(!closest_peers.iter().any(|n| n.node_id == node_peers[8].node_id));
-        // Verify excluded
-        assert!(!closest_peers
-            .iter()
-            .any(|n| n.node_id == node_peers[6].node_id || n.node_id == node_peers[7].node_id));
-        // Verify all are nodes
-        let node_ids_from_closest_nodes = closest_nodes.iter().map(|n| n.node_id.clone()).collect::<Vec<_>>();
-        assert!(closest_peers
-            .iter()
-            .all(|n| node_ids_from_closest_nodes.contains(&n.node_id)));
-        // Verify sorting by distance
-        for i in 0..closest_peers.len() - 1 {
-            assert!(
-                closest_peers[i].node_id.distance(&node_peers[5].node_id) <=
-                    closest_peers[i + 1].node_id.distance(&node_peers[5].node_id)
-            );
-        }
-
-        // Test 'get_closest_n_active_peers' - wallets
-        let closest_peers = peers_db
-            .get_closest_n_active_peers(
-                &wallet_peers[5].node_id,
-                5,
-                &[wallet_peers[6].node_id.clone(), wallet_peers[7].node_id.clone()],
-                Some(PeerFeatures::COMMUNICATION_CLIENT),
-                None,
-                Some(Duration::from_secs(60)),
-                true,
-                None,
-                false,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(closest_peers.len(), 5);
-        // Verify deleted & banned
-        assert!(!closest_peers
-            .iter()
-            .any(|n| n.node_id == wallet_peers[1].node_id || n.node_id == wallet_peers[4].node_id));
-        // Verify stale
-        assert!(!closest_peers.iter().any(|n| n.node_id == wallet_peers[8].node_id));
-        // Verify excluded
-        assert!(!closest_peers
-            .iter()
-            .any(|n| n.node_id == wallet_peers[6].node_id || n.node_id == wallet_peers[7].node_id));
-        // Verify all are nodes
-        assert!(closest_peers.iter().all(|n| n.features.is_client()));
-        // Verify sorting by distance
-        for i in 0..closest_peers.len() - 1 {
-            assert!(
-                closest_peers[i].node_id.distance(&wallet_peers[5].node_id) <=
-                    closest_peers[i + 1].node_id.distance(&wallet_peers[5].node_id)
-            );
-        }
-
         // Test 'get_seed_peers'
         let seed_peers = peers_db.get_seed_peers().unwrap();
         assert_eq!(seed_peers.len(), 3);
@@ -2801,13 +2022,15 @@ mod tests {
 
         // Test 'random_peers_sqlite'
         let random_peers = peers_db
-            .get_n_random_peers(5, &[node_peers[0].node_id.clone()], None, &transport_protocols)
+            .get_n_random_peers(5, &[node_peers[0].node_id.clone()], None, &transport_protocols, false)
             .unwrap();
         assert_eq!(random_peers.len(), 5);
         // Verify deleted & banned
-        assert!(!random_peers
-            .iter()
-            .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id));
+        assert!(
+            !random_peers
+                .iter()
+                .any(|n| n.node_id == node_peers[1].node_id || n.node_id == node_peers[4].node_id)
+        );
         // Verify excluded
         assert!(!random_peers.iter().any(|n| n.node_id == node_peers[0].node_id));
 
@@ -2950,82 +2173,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_closest_n_good_standing_peer_node_ids() {
-        let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
-        let peers_db = PeerDatabaseSql::new(
-            db_connection,
-            &create_test_peer(false, PeerFeatures::COMMUNICATION_NODE),
-        )
-        .unwrap();
-
-        // Create new node peers
-        let mut node_peers = Vec::with_capacity(20);
-        for i in 0..20 {
-            let mut peer = create_test_peer(false, PeerFeatures::COMMUNICATION_NODE);
-            if i % 4 == 0 {
-                peer.ban_for(Duration::from_secs(3600), "Test ban".to_string());
-            }
-            if i % 5 == 0 {
-                peer.deleted_at = Some(chrono::Utc::now().naive_utc());
-            }
-            node_peers.push(peer.clone());
-            peers_db.add_or_update_peer(peer).unwrap();
-        }
-        // Create new wallet peers
-        let mut wallet_peers = Vec::with_capacity(20);
-        for i in 0..20 {
-            let mut peer = create_test_peer(false, PeerFeatures::COMMUNICATION_CLIENT);
-            if i % 4 == 0 {
-                peer.ban_for(Duration::from_secs(3600), "Test ban".to_string());
-            }
-            if i % 5 == 0 {
-                peer.deleted_at = Some(chrono::Utc::now().naive_utc());
-            }
-            wallet_peers.push(peer.clone());
-            peers_db.add_or_update_peer(peer).unwrap();
-        }
-        // Mark some peers as failed
-        for address in node_peers[6].addresses.addresses() {
-            peers_db
-                .set_last_failed_reason(
-                    &node_peers[6].node_id,
-                    "Connection failed".to_string(),
-                    address.address(),
-                )
-                .unwrap();
-        }
-        for address in wallet_peers[6].addresses.addresses() {
-            peers_db
-                .set_last_failed_reason(
-                    &wallet_peers[6].node_id,
-                    "Connection failed".to_string(),
-                    address.address(),
-                )
-                .unwrap();
-        }
-
-        // Test the function
-        let closest_peers = peers_db
-            .get_closest_n_good_standing_peer_node_ids(10, PeerFeatures::COMMUNICATION_NODE)
-            .unwrap();
-
-        // Verify the results
-        assert_eq!(closest_peers.len(), 10);
-        for node_id in &closest_peers {
-            let peer = peers_db.get_peer_by_node_id(node_id).unwrap().unwrap();
-            assert!(!peer.is_banned());
-            assert!(peer.deleted_at.is_none());
-            assert!(!peer.all_addresses_failed());
-        }
-
-        // Verify sorting by distance
-        let region_node_id = peers_db.this_peer_identity().node_id;
-        for i in 0..closest_peers.len() - 1 {
-            assert!(closest_peers[i].distance(&region_node_id) <= closest_peers[i + 1].distance(&region_node_id));
-        }
-    }
-
-    #[test]
     fn discovery_syncing_peers_with_external_addresses_only() {
         let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
         let peers_db = PeerDatabaseSql::new(
@@ -3049,13 +2196,17 @@ mod tests {
             .unwrap();
         assert_eq!(nodes_with_all_addresses.len(), 40);
         // - Has external address
-        assert!(nodes_with_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) }));
+        assert!(
+            nodes_with_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) })
+        );
         // - Has internal address
-        assert!(nodes_with_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) }));
+        assert!(
+            nodes_with_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) })
+        );
 
         // Add peers with internal addresses only
         for _i in 0..4 {
@@ -3083,9 +2234,11 @@ mod tests {
             .unwrap();
         assert_eq!(nodes_with_external_addresses_only.len(), 40);
         // - Has external address only
-        assert!(nodes_with_external_addresses_only
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().all(|addr| addr.is_external()) }));
+        assert!(
+            nodes_with_external_addresses_only
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().all(|addr| addr.is_external()) })
+        );
     }
 
     #[test]

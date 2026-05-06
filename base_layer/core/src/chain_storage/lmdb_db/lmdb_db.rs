@@ -97,10 +97,12 @@ use std::{
 };
 
 use fs2::FileExt;
-use jmt::{storage::TreeWriter, JellyfishMerkleTree, KeyHash};
+use jmt::{
+    JellyfishMerkleTree,
+    KeyHash,
+    storage::{NibblePath, NodeKey, TreeReader, TreeWriter},
+};
 use lmdb_zero::{
-    open,
-    traits::AsLmdbBytes,
     ConstTransaction,
     Database,
     EnvBuilder,
@@ -108,10 +110,12 @@ use lmdb_zero::{
     LmdbResultExt,
     ReadTransaction,
     WriteTransaction,
+    open,
+    traits::AsLmdbBytes,
 };
 use log::*;
 use primitive_types::{U256, U512};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tari_common_types::{
     chain_metadata::ChainMetadata,
     epoch::VnEpoch,
@@ -130,10 +134,11 @@ use tari_common_types::{
 };
 use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
 use tari_sidechain::ShardGroup;
-use tari_storage::lmdb_store::{db, LMDBBuilder, LMDBConfig, LMDBStore, BYTES_PER_MB};
+use tari_storage::lmdb_store::{BYTES_PER_MB, LMDBBuilder, LMDBConfig, LMDBStore, db};
 use tari_transaction_components::{
+    MicroMinotari,
     aggregated_body::AggregateBody,
-    consensus::{consensus_constants::BlockVersion, ConsensusConstants},
+    consensus::{ConsensusConstants, consensus_constants::BlockVersion},
     tari_proof_of_work::{AccumulatedDifficulty, Difficulty, PowAlgorithm},
     transaction_components::{
         OutputType,
@@ -145,11 +150,10 @@ use tari_transaction_components::{
         TransactionOutput,
         ValidatorNodeRegistration,
     },
-    MicroMinotari,
 };
 use tari_utilities::{
-    hex::{to_hex, Hex},
     ByteArray,
+    hex::{Hex, to_hex},
 };
 use tokio::sync::watch;
 
@@ -161,11 +165,35 @@ use super::{
     stats_collector::{DatabaseStats, LMDBStatsCollector},
 };
 use crate::{
+    PrunedKernelMmr,
     blocks::{BlockAccumulatedData, UpdateBlockAccumulatedData},
     chain_storage::{
-        db_transaction::{DbKey, DbTransaction, DbValue, WriteOperation},
+        BlockchainBackend,
+        ChainTipData,
+        DbBasicStats,
+        DbSize,
+        HorizonData,
+        InputMinedInfo,
+        MinedInfo,
+        MmrTree,
+        Reorg,
+        TemplateRegistrationEntry,
+        ValidatorNodeEntry,
+        ValidatorNodeRegistrationInfo,
+        db_transaction::{
+            DbKey,
+            DbTransaction,
+            DbValue,
+            HorizonStateTreeUpdate,
+            HorizonSyncOutputCheckpoint,
+            WriteOperation,
+        },
         error::{ChainStorageError, OrNotFound},
         lmdb_db::{
+            TransactionInputRowData,
+            TransactionInputRowDataRef,
+            TransactionKernelRowData,
+            TransactionOutputRowData,
             composite_key::{CompositeKey, InputKey, OutputKey},
             helpers::deserialize,
             lmdb::{
@@ -197,30 +225,13 @@ use crate::{
                 LmdbRowBlockHeaderAccumulatedDataV2,
             },
             validator_node_store::ValidatorNodeStore,
-            TransactionInputRowData,
-            TransactionInputRowDataRef,
-            TransactionKernelRowData,
-            TransactionOutputRowData,
         },
         smt_hasher::SmtHasher,
         stats::DbTotalSizeStats,
         utxo_mined_info::OutputMinedInfo,
-        BlockchainBackend,
-        ChainTipData,
-        DbBasicStats,
-        DbSize,
-        HorizonData,
-        InputMinedInfo,
-        MinedInfo,
-        MmrTree,
-        Reorg,
-        TemplateRegistrationEntry,
-        ValidatorNodeEntry,
-        ValidatorNodeRegistrationInfo,
     },
     consensus::BaseNodeConsensusManager,
     proof_of_work::monero_rx::MoneroPowData,
-    PrunedKernelMmr,
 };
 
 type DatabaseRef = Arc<Database<'static>>;
@@ -673,6 +684,14 @@ impl LMDBDatabase {
                 DeleteTipBlock(hash) => {
                     self.delete_tip_block_body(&write_txn, hash)?;
                 },
+                DeleteBlockAccumulatedData(height) => {
+                    lmdb_delete(
+                        &write_txn,
+                        &self.block_accumulated_data_db,
+                        height,
+                        "block_accumulated_data_db",
+                    )?;
+                },
                 InsertMoneroSeedHeight(data, height) => {
                     self.insert_monero_seed_height(&write_txn, data, *height)?;
                 },
@@ -699,6 +718,13 @@ impl LMDBDatabase {
                     output_type,
                 } => {
                     self.prune_output_from_all_dbs(&write_txn, output_hash, commitment, *output_type)?;
+                },
+                DeleteValidatorNode {
+                    sidechain_public_key,
+                    public_key,
+                } => {
+                    self.validator_node_store(&write_txn)
+                        .delete(sidechain_public_key.as_ref(), public_key)?;
                 },
                 DeleteAllKernelsInBlock { block_hash } => {
                     self.delete_all_kernels_in_block(&write_txn, block_hash)?;
@@ -775,6 +801,13 @@ impl LMDBDatabase {
                         &MetadataValue::HorizonData(horizon_data.clone()),
                     )?;
                 },
+                ApplyHorizonStateTreeUpdates {
+                    previous_version,
+                    version,
+                    updates,
+                } => {
+                    self.apply_horizon_state_tree_updates(&write_txn, *previous_version, *version, updates)?;
+                },
                 InsertBadBlock { hash, height, reason } => {
                     self.insert_bad_block_and_cleanup(&write_txn, hash, *height, reason.to_string())?;
                 },
@@ -783,6 +816,23 @@ impl LMDBDatabase {
                 },
                 ClearAllReorgs => {
                     lmdb_clear(&write_txn, &self.reorgs)?;
+                },
+                SetHorizonSyncOutputCheckpoint { checkpoint } => match checkpoint {
+                    Some(cp) => {
+                        self.set_metadata(
+                            &write_txn,
+                            MetadataKey::HorizonSyncOutputCheckpoint,
+                            &MetadataValue::HorizonSyncOutputCheckpoint(cp.clone()),
+                        )?;
+                    },
+                    None => {
+                        let _unused = lmdb_delete(
+                            &write_txn,
+                            &self.metadata_db,
+                            &MetadataKey::HorizonSyncOutputCheckpoint.as_u32(),
+                            "metadata_db",
+                        );
+                    },
                 },
             }
         }
@@ -1707,11 +1757,11 @@ impl LMDBDatabase {
             batch.push((smt_key, None));
 
             let features = input_with_output_data.features()?;
-            if let Some(sidechain_feature) = features.sidechain_feature.as_ref() {
-                if let Some(vn_reg) = sidechain_feature.validator_node_registration() {
-                    self.validator_node_store(txn)
-                        .delete(sidechain_feature.sidechain_public_key(), vn_reg.public_key())?;
-                }
+            if let Some(sidechain_feature) = features.sidechain_feature.as_ref() &&
+                let Some(vn_reg) = sidechain_feature.validator_node_registration()
+            {
+                self.validator_node_store(txn)
+                    .delete(sidechain_feature.sidechain_public_key(), vn_reg.public_key())?;
             }
             trace!(
                 target: LOG_TARGET,
@@ -2021,6 +2071,37 @@ impl LMDBDatabase {
         Ok(())
     }
 
+    fn header_hash_from_output_index_key(key_bytes: &[u8]) -> Result<FixedHash, ChainStorageError> {
+        let mut buffer = [0u8; 32];
+        buffer.copy_from_slice(key_bytes.get(0..32).ok_or(ChainStorageError::InvalidOperation(
+            "Key bytes for output hash are too short".to_string(),
+        ))?);
+        Ok(FixedHash::from(buffer))
+    }
+
+    fn delete_payref_index_entry(
+        &self,
+        write_txn: &WriteTransaction<'_>,
+        header_hash: &HashOutput,
+        output_hash: &HashOutput,
+    ) -> Result<(), ChainStorageError> {
+        let payref = Self::generate_payment_reference_for_output(header_hash, output_hash);
+        debug!(target: LOG_TARGET, "Pruning output from 'payref_to_output_index': key '{}'", payref.to_hex());
+        match lmdb_delete(
+            write_txn,
+            &self.payref_to_output_index,
+            payref.as_slice(),
+            "payref_to_output_index",
+        ) {
+            Ok(()) => Ok(()),
+            Err(ChainStorageError::ValueNotFound { .. }) => {
+                // Payref may not exist for older outputs created before the payref feature.
+                Ok(())
+            },
+            Err(e) => Err(e),
+        }
+    }
+
     fn prune_outputs_spent_at_hash(
         &self,
         write_txn: &WriteTransaction<'_>,
@@ -2041,28 +2122,28 @@ impl LMDBDatabase {
                     "utxo_commitment_index",
                 )?;
             }
+            let output_hash = input.output_hash();
             // From 'utxos_db::utxos_db'
             if let Some(key_bytes) =
-                lmdb_get::<_, Vec<u8>>(write_txn, &self.txos_hash_to_index_db, input.output_hash().as_slice())?
+                lmdb_get::<_, Vec<u8>>(write_txn, &self.txos_hash_to_index_db, output_hash.as_slice())?
             {
-                let mut buffer = [0u8; 32];
-                buffer.copy_from_slice(key_bytes.get(0..32).ok_or(ChainStorageError::InvalidOperation(
-                    "Key bytes for output hash are too short".to_string(),
-                ))?);
-                let key = OutputKey::new(&FixedHash::from(buffer), &input.output_hash())?;
+                let header_hash = Self::header_hash_from_output_index_key(&key_bytes)?;
+                let key = OutputKey::new(&header_hash, &output_hash)?;
                 debug!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
                 lmdb_delete(write_txn, &self.utxos_db, &key.convert_to_comp_key(), LMDB_DB_UTXOS)?;
+
+                self.delete_payref_index_entry(write_txn, &header_hash, &output_hash)?;
             };
             // From 'txos_hash_to_index_db::utxos_db'
             debug!(
                 target: LOG_TARGET,
                 "Pruning output from 'txos_hash_to_index_db': key '{}'",
-                input.output_hash().to_hex()
+                output_hash.to_hex()
             );
             lmdb_delete(
                 write_txn,
                 &self.txos_hash_to_index_db,
-                input.output_hash().as_slice(),
+                output_hash.as_slice(),
                 LMDB_DB_UTXOS,
             )?;
         }
@@ -2096,16 +2177,73 @@ impl LMDBDatabase {
                     LMDB_DB_UTXOS,
                 )?;
 
-                let mut buffer = [0u8; 32];
-                buffer.copy_from_slice(key_bytes.get(0..32).ok_or(ChainStorageError::InvalidOperation(
-                    "Key bytes for output hash are too short".to_string(),
-                ))?);
-                let key = OutputKey::new(&FixedHash::from(buffer), output_hash)?;
+                let header_hash = Self::header_hash_from_output_index_key(&key_bytes)?;
+                let key = OutputKey::new(&header_hash, output_hash)?;
                 debug!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
                 lmdb_delete(write_txn, &self.utxos_db, &key.convert_to_comp_key(), LMDB_DB_UTXOS)?;
+
+                self.delete_payref_index_entry(write_txn, &header_hash, output_hash)?;
             },
-            None => return Err(ChainStorageError::InvalidOperation("Output key not found".to_string())),
+            None => {
+                // The output is already absent. This is expected during horizon sync when a previous attempt
+                // pruned this STXO but failed before cleanup could restore it, so the retry finds it gone.
+                debug!(
+                    target: LOG_TARGET,
+                    "prune_output_from_all_dbs: output {} not found, skipping (already pruned)",
+                    output_hash.to_hex()
+                );
+            },
         }
+
+        Ok(())
+    }
+
+    fn apply_horizon_state_tree_updates(
+        &self,
+        write_txn: &WriteTransaction<'_>,
+        previous_version: u64,
+        version: u64,
+        updates: &[HorizonStateTreeUpdate],
+    ) -> Result<(), ChainStorageError> {
+        let reader = LmdbTreeReader::new(write_txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let writer = LmdbTreeWriter::new(
+            write_txn,
+            self.jmt_node_data.clone(),
+            self.jmt_value_data.clone(),
+            self.jmt_unique_key_data.clone(),
+        );
+
+        // if the previous committed version is not contiguous with the new version,
+        // write a bridge root node at (version - 1) that copies the root from previous_version
+        if version > 0 && previous_version != version.saturating_sub(1) {
+            let empty_path: NibblePath = std::iter::empty().collect();
+            let prev_root_key = NodeKey::new(previous_version, empty_path.clone());
+            let bridge_key = NodeKey::new(version - 1, empty_path);
+
+            let old_root = reader
+                .get_node_option(&prev_root_key)
+                .map_err(|e| ChainStorageError::CriticalError(e.to_string()))?;
+
+            if let Some(root_node) = old_root {
+                writer
+                    .put_node(&bridge_key, &root_node)
+                    .map_err(|e| ChainStorageError::CriticalError(e.to_string()))?;
+            }
+        }
+
+        let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
+        let batch = updates
+            .iter()
+            .map(|update| (KeyHash(update.key.into_array()), update.value.map(|v| v.to_vec())))
+            .collect::<Vec<_>>();
+
+        let (_root, ops) = output_smt
+            .put_value_set(batch, version)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+
+        writer
+            .write_node_batch(&ops.node_batch)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
         Ok(())
     }
@@ -2388,13 +2526,12 @@ impl LMDBDatabase {
 
     #[cfg(test)]
     pub(crate) fn create_lmdb_tree_writer<'a: 'b, 'b>(&self, txn: &'a WriteTransaction<'b>) -> LmdbTreeWriter<'a> {
-        let res = LmdbTreeWriter::new(
+        LmdbTreeWriter::new(
             txn,
             self.jmt_node_data.clone(),
             self.jmt_value_data.clone(),
             self.jmt_unique_key_data.clone(),
-        );
-        res
+        )
     }
 }
 
@@ -3271,7 +3408,7 @@ impl BlockchainBackend for LMDBDatabase {
         }
 
         // Sort the orphans by age, oldest first
-        orphans.sort_by(|a, b| a.0.cmp(&b.0));
+        orphans.sort_by_key(|a| a.0);
         let mut txn = DbTransaction::new();
         for (removed_count, (height, block_hash)) in orphans.into_iter().enumerate() {
             if height > horizon_height && removed_count >= num_over_limit {
@@ -3298,6 +3435,40 @@ impl BlockchainBackend for LMDBDatabase {
     fn fetch_horizon_data(&self) -> Result<Option<HorizonData>, ChainStorageError> {
         let txn = self.read_transaction()?;
         Ok(Some(fetch_horizon_data(&txn, &self.metadata_db)?))
+    }
+
+    fn fetch_horizon_sync_output_checkpoint(&self) -> Result<Option<HorizonSyncOutputCheckpoint>, ChainStorageError> {
+        let txn = self.read_transaction()?;
+        let val: Option<MetadataValue> = lmdb_get(
+            &txn,
+            &self.metadata_db,
+            &MetadataKey::HorizonSyncOutputCheckpoint.as_u32(),
+        )?;
+        match val {
+            Some(MetadataValue::HorizonSyncOutputCheckpoint(cp)) => Ok(Some(cp)),
+            _ => Ok(None),
+        }
+    }
+
+    fn verify_horizon_sync_output_root(
+        &self,
+        version: u64,
+        expected_root: HashOutput,
+    ) -> Result<(), ChainStorageError> {
+        let txn = self.read_transaction()?;
+        let reader = OwnedLmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
+        let root = output_smt
+            .get_root_hash(version)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+        if root.0.as_slice() != expected_root.as_slice() {
+            return Err(ChainStorageError::InvalidOperation(format!(
+                "Horizon sync output root mismatch at version {version}. Expected {}, got {}",
+                expected_root.to_hex(),
+                root.0.to_hex()
+            )));
+        }
+        Ok(())
     }
 
     fn get_stats(&self) -> Result<DbBasicStats, ChainStorageError> {
@@ -3922,6 +4093,7 @@ pub enum MetadataKey {
     AccumulatedDataRebuildStatus,
     AccumulatedDataCheckStatus,
     BlockchainConsistencyCheckStatus,
+    HorizonSyncOutputCheckpoint,
 }
 
 impl MetadataKey {
@@ -3946,6 +4118,7 @@ impl fmt::Display for MetadataKey {
             MetadataKey::AccumulatedDataRebuildStatus => write!(f, "Accumulated data rebuild status"),
             MetadataKey::AccumulatedDataCheckStatus => write!(f, "Accumulated data check status"),
             MetadataKey::BlockchainConsistencyCheckStatus => write!(f, "Blockchain check status"),
+            MetadataKey::HorizonSyncOutputCheckpoint => write!(f, "Horizon sync output checkpoint"),
         }
     }
 }
@@ -4136,6 +4309,7 @@ pub enum MetadataValue {
     PayrefRebuildStatus(PayrefRebuildStatus),
     AccumulatedDataRebuildStatus(AccumulatedDataRebuildStatus),
     BlockchainCheckStatus(BlockchainCheckStatus),
+    HorizonSyncOutputCheckpoint(HorizonSyncOutputCheckpoint),
 }
 
 impl fmt::Display for MetadataValue {
@@ -4158,6 +4332,11 @@ impl fmt::Display for MetadataValue {
             MetadataValue::BlockchainCheckStatus(status) => {
                 write!(f, "Blockchain has been checked - {:?}", status.has_concluded)
             },
+            MetadataValue::HorizonSyncOutputCheckpoint(cp) => write!(
+                f,
+                "Horizon sync output checkpoint at height {} targeting height {}",
+                cp.checkpoint_height, cp.sync_target_height
+            ),
         }
     }
 }
@@ -4337,15 +4516,15 @@ fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
                         &MetadataKey::PayrefRebuildStatus.as_u32(),
                     )?
                     .unwrap_or(MetadataValue::PayrefRebuildStatus(PayrefRebuildStatus::default()));
-                    if let MetadataValue::PayrefRebuildStatus(status) = status_key {
-                        if status.is_rebuilt {
-                            info!(
-                                target: LOG_TARGET,
-                                "[MIGRATIONS] v{migrate_from_version}: PayRef index already rebuilt in the background"
-                            );
-                            payref_index_done = true;
-                            continue;
-                        }
+                    if let MetadataValue::PayrefRebuildStatus(status) = status_key &&
+                        status.is_rebuilt
+                    {
+                        info!(
+                            target: LOG_TARGET,
+                            "[MIGRATIONS] v{migrate_from_version}: PayRef index already rebuilt in the background"
+                        );
+                        payref_index_done = true;
+                        continue;
                     }
                     info!(
                         target: LOG_TARGET,
@@ -4730,7 +4909,8 @@ fn verify_metadata_keys(db: &LMDBDatabase) -> Result<(), ChainStorageError> {
                 Some(MetadataKey::PayrefRebuildStatus) |
                 Some(MetadataKey::AccumulatedDataRebuildStatus) |
                 Some(MetadataKey::AccumulatedDataCheckStatus) |
-                Some(MetadataKey::BlockchainConsistencyCheckStatus) => {
+                Some(MetadataKey::BlockchainConsistencyCheckStatus) |
+                Some(MetadataKey::HorizonSyncOutputCheckpoint) => {
                     warn!(
                         target: LOG_TARGET,
                         "Removed corrupt metadata entry {metadata_key:?} with key bytes: 0x{hex_key}",
@@ -4784,6 +4964,7 @@ fn num_to_key(n: u32) -> Option<MetadataKey> {
         9 => Some(MetadataKey::AccumulatedDataRebuildStatus),
         10 => Some(MetadataKey::AccumulatedDataCheckStatus),
         11 => Some(MetadataKey::BlockchainConsistencyCheckStatus),
+        12 => Some(MetadataKey::HorizonSyncOutputCheckpoint),
         _ => None,
     }
 }
@@ -4801,6 +4982,7 @@ fn variant_name(v: &MetadataValue) -> &'static str {
         MetadataValue::PayrefRebuildStatus(_) => "PayrefRebuildStatus",
         MetadataValue::AccumulatedDataRebuildStatus(_) => "AccumulatedDataRebuildStatus",
         MetadataValue::BlockchainCheckStatus(_) => "BlockchainCheckStatus",
+        MetadataValue::HorizonSyncOutputCheckpoint(_) => "HorizonSyncOutputCheckpoint",
     }
 }
 
@@ -4817,5 +4999,8 @@ fn summarize_value(v: &MetadataValue) -> String {
         MetadataValue::PayrefRebuildStatus(s) => format!("{s:?}"),
         MetadataValue::AccumulatedDataRebuildStatus(s) => format!("{s:?}"),
         MetadataValue::BlockchainCheckStatus(s) => format!("{s:?}"),
+        MetadataValue::HorizonSyncOutputCheckpoint(cp) => {
+            format!("{} targeting {}", cp.checkpoint_height, cp.sync_target_height)
+        },
     }
 }

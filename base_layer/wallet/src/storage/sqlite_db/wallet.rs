@@ -23,23 +23,23 @@
 use std::{
     convert::TryFrom,
     mem::size_of,
-    str::{from_utf8, FromStr},
+    str::{FromStr, from_utf8},
     sync::{Arc, RwLock},
 };
 
 use argon2::password_hash::{
-    rand_core::{OsRng, RngCore},
     SaltString,
+    rand_core::{OsRng, RngCore},
 };
 use blake2::Blake2b;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use diesel::{prelude::*, result::Error};
-use digest::{consts::U32, generic_array::GenericArray, FixedOutput};
+use digest::{FixedOutput, consts::U32, generic_array::GenericArray};
 use log::*;
 use tari_common_sqlite::sqlite_connection_pool::PooledDbConnection;
 use tari_common_types::{
     chain_metadata::ChainMetadata,
-    encryption::{decrypt_bytes_integral_nonce, encrypt_bytes_integral_nonce, Encryptable},
+    encryption::{Encryptable, decrypt_bytes_integral_nonce, encrypt_bytes_integral_nonce},
     seeds::cipher_seed::CipherSeed,
     types::CompressedCommitment,
 };
@@ -49,12 +49,12 @@ use tari_comms::{
 };
 use tari_crypto::{hash_domain, hashing::DomainSeparatedHasher};
 use tari_utilities::{
-    hex::{from_hex, Hex},
-    hidden_type,
-    safe_array::SafeArray,
     ByteArray,
     Hidden,
     SafePassword,
+    hex::{Hex, from_hex},
+    hidden_type,
+    safe_array::SafeArray,
 };
 use tokio::time::Instant;
 use zeroize::Zeroize;
@@ -542,13 +542,14 @@ impl WalletBackend for WalletSqliteDatabase {
         ScannedBlockSql::clear_from_and_higher(height, &mut conn)
     }
 
-    fn clear_scanned_blocks_before_height(
-        &self,
-        height: u64,
-        exclude_recovered: bool,
-    ) -> Result<(), WalletStorageError> {
+    fn clear_scanned_blocks_before_height(&self, height: u64) -> Result<(), WalletStorageError> {
         let mut conn = self.database_connection.get_pooled_connection()?;
-        ScannedBlockSql::clear_before_height(height, exclude_recovered, &mut conn)
+        ScannedBlockSql::clear_before_height(height, &mut conn)
+    }
+
+    fn apply_sparse_scanned_blocks_schedule(&self, tip_height: u64) -> Result<(), WalletStorageError> {
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        ScannedBlockSql::apply_sparse_schedule(tip_height, &mut conn)
     }
 
     fn change_passphrase(&self, existing: &SafePassword, new: &SafePassword) -> Result<(), WalletStorageError> {
@@ -596,7 +597,7 @@ impl WalletBackend for WalletSqliteDatabase {
             _ => {
                 return Err(WalletStorageError::UnexpectedResult(
                     "Unable to get valid key-related data from database".into(),
-                ))
+                ));
             },
         };
 
@@ -920,23 +921,29 @@ impl Encryptable<XChaCha20Poly1305> for ClientKeyValueSql {
 #[cfg(test)]
 mod test {
     #![allow(clippy::indexing_slicing)]
+
+    use chrono::Utc;
     use tari_common_sqlite::sqlite_connection_pool::PooledDbConnection;
     use tari_common_types::{
-        encryption::{decrypt_bytes_integral_nonce, Encryptable},
+        encryption::{Encryptable, decrypt_bytes_integral_nonce},
         seeds::cipher_seed::CipherSeed,
+        types::FixedHash,
     };
     use tari_test_utils::random::string;
     use tari_utilities::{
-        hex::{from_hex, Hex},
         ByteArray,
         SafePassword,
+        hex::{Hex, from_hex},
     };
     use tempfile::tempdir;
 
-    use crate::storage::{
-        database::{DbKey, DbValue, WalletBackend},
-        sqlite_db::wallet::{ClientKeyValueSql, WalletSettingSql, WalletSqliteDatabase},
-        sqlite_utilities::run_migration_and_create_sqlite_connection,
+    use crate::{
+        storage::{
+            database::{DbKey, DbValue, WalletBackend},
+            sqlite_db::wallet::{ClientKeyValueSql, WalletSettingSql, WalletSqliteDatabase},
+            sqlite_utilities::run_migration_and_create_sqlite_connection,
+        },
+        utxo_scanner_service::service::ScannedBlock,
     };
     #[test]
     fn test_passphrase() {
@@ -957,12 +964,13 @@ mod test {
         assert!(WalletSqliteDatabase::new(connection.clone(), "evil passphrase".to_string().into()).is_err());
 
         // Try to change the passphrase, but fail
-        assert!(db
-            .change_passphrase(
+        assert!(
+            db.change_passphrase(
                 &"evil passphrase".to_string().into(),
                 &"new passphrase".to_string().into()
             )
-            .is_err());
+            .is_err()
+        );
 
         // The existing passphrase still works
         assert!(WalletSqliteDatabase::new(connection.clone(), "passphrase".to_string().into()).is_ok());
@@ -971,9 +979,10 @@ mod test {
         assert!(WalletSqliteDatabase::new(connection.clone(), "new passphrase".to_string().into()).is_err());
 
         // Successfully change the passphrase
-        assert!(db
-            .change_passphrase(&"passphrase".to_string().into(), &"new passphrase".to_string().into())
-            .is_ok());
+        assert!(
+            db.change_passphrase(&"passphrase".to_string().into(), &"new passphrase".to_string().into())
+                .is_ok()
+        );
 
         // The existing passphrase no longer works
         assert!(WalletSqliteDatabase::new(connection.clone(), "passphrase".to_string().into()).is_err());
@@ -1171,5 +1180,38 @@ mod test {
         .unwrap();
 
         assert_eq!(decrypted_db_seed, seed_bytes);
+    }
+
+    #[test]
+    fn duplicate_blocks() {
+        let db_name = format!("{}.sqlite3", string(8).as_str());
+        let db_tempdir = tempdir().unwrap();
+        let db_folder = db_tempdir.path().to_str().unwrap().to_string();
+        let connection = run_migration_and_create_sqlite_connection(format!("{db_folder}{db_name}"), 16).unwrap();
+
+        let passphrase = SafePassword::from("an example very very secret key.".to_string());
+
+        let wallet = WalletSqliteDatabase::new(connection.clone(), passphrase).unwrap();
+
+        let block1 = ScannedBlock {
+            header_hash: FixedHash::from_hex("0000000000000000000769b1c3f6a1b4b3c2d1e0f9e8d7c6b5a4b3c2d1e0f9e8")
+                .unwrap(),
+            height: 700000,
+            timestamp: Utc::now().naive_utc(),
+        };
+
+        let block2 = ScannedBlock {
+            header_hash: FixedHash::from_hex("0000000000000000000769b1c3f6a1b4b3c2d1e0f9e8d7c6b5a4b3c2d1e0f9e8")
+                .unwrap(),
+            height: 700001,
+            timestamp: Utc::now().naive_utc(),
+        };
+
+        wallet.save_scanned_block(block1).unwrap();
+        let result = wallet.save_scanned_block(block2.clone());
+        assert!(result.is_ok());
+        let blocks = wallet.get_scanned_blocks().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], block2);
     }
 }

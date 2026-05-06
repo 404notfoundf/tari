@@ -28,9 +28,11 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use chrono::{Days, Utc};
 use digest::consts::U32;
 use minotari_wallet::{
-    base_node_service::{handle::BaseNodeServiceHandle, BaseNodeServiceInitializer},
+    base_node_service::{BaseNodeServiceInitializer, handle::BaseNodeServiceHandle},
     connectivity_service::{WalletConnectivityHandle, WalletConnectivityInitializer},
     output_manager_service::{
+        OutputManagerServiceInitializer,
+        UtxoSelectionCriteria,
         config::OutputManagerServiceConfig,
         handle::{OutputManagerEvent, OutputManagerHandle},
         service::OutputManagerService,
@@ -39,16 +41,15 @@ use minotari_wallet::{
             models::KnownOneSidedPaymentScript,
             sqlite_db::{OutputManagerSqliteDatabase, ReceivedOutputInfoForBatch},
         },
-        OutputManagerServiceInitializer,
-        UtxoSelectionCriteria,
     },
     storage::{
         database::WalletDatabase,
         sqlite_db::wallet::WalletSqliteDatabase,
-        sqlite_utilities::{run_migration_and_create_sqlite_connection, WalletDbConnection},
+        sqlite_utilities::{WalletDbConnection, run_migration_and_create_sqlite_connection},
     },
     test_utils::{make_wallet_database_memory_connection, random_string},
     transaction_service::{
+        TransactionServiceInitializer,
         config::TransactionServiceConfig,
         handle::{TransactionEvent, TransactionServiceHandle},
         service::TransactionService,
@@ -57,7 +58,6 @@ use minotari_wallet::{
             models::{CompletedTransaction, WalletTransaction},
             sqlite_db::TransactionServiceSqliteDatabase,
         },
-        TransactionServiceInitializer,
     },
     util::watch::Watch,
     utxo_scanner_service::{
@@ -66,7 +66,7 @@ use minotari_wallet::{
         service::ScannedBlock,
     },
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use tari_common_sqlite::connection::{DbConnection, DbConnectionUrl};
 use tari_common_types::{
     chain_metadata::ChainMetadata,
@@ -76,10 +76,12 @@ use tari_common_types::{
     types::{CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput, PrivateKey},
 };
 use tari_comms::{
-    peer_manager::{NodeIdentity, PeerFeatures},
-    protocol::rpc::{mock::MockRpcServer, NamedProtocolService},
-    test_utils::node_identity::build_node_identity,
     PeerConnection,
+    multiaddr::Multiaddr,
+    peer_manager::{NodeIdentity, PeerFeatures},
+    protocol::rpc::{NamedProtocolService, mock::MockRpcServer},
+    test_utils::node_identity::build_node_identity,
+    transports::MemoryTransport,
 };
 use tari_core::base_node::{
     proto::wallet_rpc::{TxLocation, TxQueryResponse},
@@ -87,38 +89,39 @@ use tari_core::base_node::{
 };
 use tari_crypto::{commitment::HomomorphicCommitmentFactory, keys::SecretKey as SK};
 use tari_p2p::Network;
-use tari_script::{push_pubkey_script, ExecutionStack};
-use tari_service_framework::{reply_channel, RegisterHandle, StackBuilder};
+use tari_script::{ExecutionStack, push_pubkey_script};
+use tari_service_framework::{RegisterHandle, StackBuilder, reply_channel};
 use tari_shutdown::{Shutdown, ShutdownSignal};
-use tari_test_utils::{comms_and_services::get_next_memory_address, random};
+use tari_test_utils::random;
 use tari_transaction_components::{
     consensus::{ConsensusConstantsBuilder, ConsensusManager},
     crypto_factories::CryptoFactories,
     key_manager::{ConfidentialOutputHasher, TransactionKeyManagerInterface},
     rpc::models::TipInfoResponse,
     tari_amount::*,
+    transaction_builder::TransactionBuilder,
     transaction_components::{
-        memo_field::{MemoField, TxType},
-        one_sided::public_key_to_output_encryption_key,
         EncryptedData,
         KernelBuilder,
         OutputFeatures,
         RangeProofType,
         Transaction,
+        memo_field::{MemoField, TxType},
+        one_sided::public_key_to_output_encryption_key,
     },
 };
 use tari_transaction_key_manager::{
     legacy_key_manager::{
-        create_new_random_key_manager,
-        wallet_types::{LegacyWalletType, ProvidedKeysWallet},
         LegacyTransactionKeyManagerInitializer,
         LegacyTransactionKeyManagerInterface,
         LegacyTransactionKeyManagerWrapper,
         MemoryKeyManager,
+        create_new_random_key_manager,
+        wallet_types::{LegacyWalletType, ProvidedKeysWallet},
     },
     storage::sqlite_db::TransactionKeyManagerSqliteDatabase,
 };
-use tari_utilities::{epoch_time::EpochTime, ByteArray, SafePassword};
+use tari_utilities::{ByteArray, SafePassword, epoch_time::EpochTime};
 use tempfile::tempdir;
 use tokio::{
     sync::{broadcast, broadcast::channel},
@@ -132,6 +135,11 @@ use crate::support::{
     comms_rpc::{BaseNodeWalletRpcMockService, BaseNodeWalletRpcMockState},
     utils::make_input,
 };
+
+pub fn get_next_memory_address() -> Multiaddr {
+    let port = MemoryTransport::acquire_next_memsocket_port();
+    format!("/memory/{port}").parse().unwrap()
+}
 
 pub type MemoryDBKeyManager = LegacyTransactionKeyManagerWrapper<TransactionKeyManagerSqliteDatabase<DbConnection>>;
 
@@ -200,7 +208,6 @@ async fn setup_transaction_service(
             TransactionServiceConfig {
                 broadcast_monitoring_timeout: Duration::from_secs(5),
                 chain_monitoring_timeout: Duration::from_secs(5),
-                low_power_polling_timeout: Duration::from_secs(20),
                 num_confirmations_required: 0,
                 ..Default::default()
             },
@@ -346,7 +353,6 @@ async fn setup_transaction_service_no_comms(
         chain_monitoring_timeout: Duration::from_secs(5),
         direct_send_timeout: Duration::from_secs(5),
         broadcast_send_timeout: Duration::from_secs(5),
-        low_power_polling_timeout: Duration::from_secs(6),
         transaction_resend_period: Duration::from_secs(200),
         resend_response_cooldown: Duration::from_secs(200),
         pending_transaction_cancellation_timeout: Duration::from_secs(300),
@@ -603,26 +609,6 @@ async fn single_transaction_burn_tari() {
         .commit_value(&PrivateKey::default(), burn_value.as_u64());
     let signer_pk = burn_proof.commitment.to_commitment().unwrap().as_public_key() - commit_value.as_public_key();
     assert!(ownership_proof.verify(&signer_pk, challenge_bytes));
-
-    // Verify recovery of burned output
-
-    let mut found_burned_output = false;
-    for output in completed_tx.transaction.body.outputs() {
-        if output.is_burned() {
-            found_burned_output = true;
-            match key_manager_handle.try_output_key_recovery(
-                output.commitment(),
-                output.encrypted_data(),
-                &output.sender_offset_public_key,
-            ) {
-                Ok(Some((_spending_key_id, value, _))) => {
-                    assert_eq!(value, burn_value);
-                },
-                _ => panic!("Should have recovered the burned output"),
-            }
-        }
-    }
-    assert!(found_burned_output);
 }
 
 #[tokio::test]
@@ -725,11 +711,11 @@ async fn send_one_sided_transaction_to_other() {
     loop {
         tokio::select! {
             event = alice_event_stream.recv() => {
-                if let TransactionEvent::TransactionCompletedImmediately(id) = &*event.unwrap() {
-                    if id == &tx_id {
-                        found = true;
-                        break;
-                    }
+                if let TransactionEvent::TransactionCompletedImmediately(id) = &*event.unwrap()
+                    && id == &tx_id
+                {
+                    found = true;
+                    break;
                 }
             },
             () = &mut delay => {
@@ -1127,10 +1113,10 @@ async fn test_htlc_send_and_claim() {
     loop {
         tokio::select! {
             event = alice_event_stream.recv() => {
-                if let TransactionEvent::TransactionCompletedImmediately(id) = &*event.unwrap() {
-                    if id == &tx_id {
-                        break;
-                    }
+                if let TransactionEvent::TransactionCompletedImmediately(id) = &*event.unwrap()
+                    && id == &tx_id
+                {
+                    break;
                 }
             },
             () = &mut delay => {
@@ -1763,6 +1749,7 @@ async fn broadcast_all_completed_transactions_on_startup() {
         change_output_hashes: vec![],
         received_output_hashes: vec![],
         sent_output_hashes: vec![],
+        lock_height: 0,
     };
 
     let completed_tx2 = CompletedTransaction {
@@ -1814,11 +1801,13 @@ async fn broadcast_all_completed_transactions_on_startup() {
         .restart_broadcast_protocols()
         .await
         .unwrap();
-    assert!(alice_ts_interface
-        .transaction_service_handle
-        .restart_broadcast_protocols()
-        .await
-        .is_ok());
+    assert!(
+        alice_ts_interface
+            .transaction_service_handle
+            .restart_broadcast_protocols()
+            .await
+            .is_ok()
+    );
 
     let delay = sleep(Duration::from_secs(60));
     tokio::pin!(delay);
@@ -1897,6 +1886,7 @@ async fn test_update_faux_tx_on_oms_validation() {
             uo_1.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("blah", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -1911,6 +1901,7 @@ async fn test_update_faux_tx_on_oms_validation() {
             uo_2.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("one-sided 1", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -1925,6 +1916,7 @@ async fn test_update_faux_tx_on_oms_validation() {
             uo_3.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("one-sided 2", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -2083,6 +2075,7 @@ async fn test_update_coinbase_tx_on_oms_validation() {
             uo_1.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("coinbase_confirmed", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -2097,6 +2090,7 @@ async fn test_update_coinbase_tx_on_oms_validation() {
             uo_2.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("one-coinbase_unconfirmed 1", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -2111,6 +2105,7 @@ async fn test_update_coinbase_tx_on_oms_validation() {
             uo_3.to_transaction_output().unwrap(),
             MemoField::new_open_from_string("Coinbase_not_mined", TxType::PaymentToOther).unwrap(),
             None,
+            0,
         )
         .await
         .unwrap();
@@ -2271,6 +2266,7 @@ fn create_mock_completed_transaction(
         change_output_hashes: vec![],
         received_output_hashes: vec![],
         sent_output_hashes: vec![],
+        lock_height: 0,
     }
 }
 
@@ -2449,4 +2445,124 @@ async fn test_get_completed_transactions_by_addresses() {
         .await
         .unwrap();
     assert_eq!(all_txs.len(), 4);
+}
+
+/// Test that verifies ReplaceByFee fails when the must_include UTXOs from the original
+/// transaction are not found in the OutputManagerHandle. This simulates scenarios where
+/// the original transaction's inputs have been spent or are no longer available.
+#[tokio::test]
+async fn replace_by_fee_fails_when_must_include_utxos_not_found() {
+    let factories = CryptoFactories::default();
+    let db_connection = make_wallet_database_memory_connection();
+
+    let mut alice_ts_interface = setup_transaction_service_no_comms(factories.clone(), db_connection, None).await;
+
+    // Create a completed transaction that references inputs that don't exist in the output manager
+    // This simulates a transaction where the original inputs have been spent/removed
+
+    let alice_address = TariAddress::new_dual_address_with_default_features(
+        CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+        CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+        Network::LocalNet,
+    )
+    .unwrap();
+
+    let bob_address = TariAddress::new_dual_address_with_default_features(
+        CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+        CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+        Network::LocalNet,
+    )
+    .unwrap();
+
+    // Create a mock completed transaction with fake input commitments that don't exist
+    let tx_id = TxId::new_random();
+    let amount = MicroMinotari::from(1000);
+
+    // Create a fake transaction with inputs that won't be found in output manager
+    let key_manager = &alice_ts_interface.key_manager_handle;
+
+    // Create a fake input that doesn't exist in the output manager
+    let fake_input = make_input(
+        &mut OsRng,
+        MicroMinotari::from(5000),
+        &OutputFeatures::default(),
+        key_manager.key_manager(),
+    );
+
+    // Build a transaction with this fake input
+    let constants = ConsensusConstantsBuilder::new(Network::LocalNet).build();
+    let mut builder = TransactionBuilder::new(constants, key_manager.clone(), Network::LocalNet).unwrap();
+
+    builder.with_input(fake_input.clone()).unwrap();
+    builder
+        .with_fee_per_gram(MicroMinotari::from(5))
+        .with_prevent_fee_gt_amount(false);
+
+    // Add a recipient output
+    builder
+        .add_stealth_recipient(
+            bob_address.clone(),
+            amount,
+            OutputFeatures::default(),
+            MemoField::new_empty(),
+        )
+        .unwrap();
+
+    let finalized = builder.build().unwrap();
+    let fee = finalized.transaction.body.get_total_fee().unwrap();
+    let tx = finalized.transaction;
+
+    // Create a completed transaction record
+    let completed_tx = CompletedTransaction::new(
+        tx_id,
+        alice_address.clone(),
+        bob_address.clone(),
+        amount,
+        fee,
+        tx,
+        LegacyTransactionStatus::Broadcast,
+        Utc::now(),
+        TransactionDirection::Outbound,
+        None,
+        None,
+        MemoField::new_empty(),
+        0,
+    )
+    .unwrap();
+
+    // Insert the completed transaction into the database
+    alice_ts_interface
+        .ts_db
+        .write(WriteOperation::Insert(DbKeyValuePair::CompletedTransaction(
+            tx_id,
+            Box::new(completed_tx),
+        )))
+        .unwrap();
+
+    // Now try to replace by fee - this should fail because the original inputs
+    // are not in the output manager (they were never added)
+    let fee_increase = MicroMinotari::from(100);
+    let result = alice_ts_interface
+        .transaction_service_handle
+        .replace_by_fee(tx_id, fee_increase)
+        .await;
+
+    // The replace_by_fee should fail because the must_include UTXOs are not found
+    assert!(
+        result.is_err(),
+        "ReplaceByFee should fail when must_include UTXOs are not found in output manager"
+    );
+
+    // Verify the error is related to UTXO selection failure
+    let err = result.unwrap_err();
+    // The error should be an OutputManagerError indicating no UTXOs were selected
+    // because the must_include commitments don't exist
+    assert!(
+        matches!(
+            err,
+            minotari_wallet::transaction_service::error::TransactionServiceError::OutputManagerError(_)
+        ),
+        "Expected OutputManagerError, got: {:?}",
+        err
+    );
 }

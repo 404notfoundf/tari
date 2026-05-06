@@ -48,8 +48,6 @@ pub enum UiError {
     PeerManagerError(#[from] PeerManagerError),
     #[error("Could not parse Tari Address: `{0}`")]
     TariAddressParseError(#[from] TariAddressError),
-    #[error("Specified burn proof file already exists")]
-    BurntProofFileExists,
     #[error("Channel send error: `{0}`")]
     SendError(String),
     #[error("Transaction error: `{0}`")]

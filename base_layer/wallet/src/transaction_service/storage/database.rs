@@ -29,14 +29,15 @@ use std::{
 use chrono::{DateTime, Utc};
 use log::*;
 use tari_common_types::{
-    burn_proof::{BurnClaimProof, EncodedMerkleProof},
+    burn_proof::{EncodedMerkleProof, PartialBurnClaimProof},
+    payment_reference::PaymentReference,
     tari_address::TariAddress,
     transaction::{LegacyTransactionStatus, TransactionDirection, TxId},
     types::{BlockHash, FixedHash, PrivateKey},
 };
 use tari_transaction_components::{
-    transaction_components::{MemoField, Transaction, TransactionKernel, TransactionOutput},
     MicroMinotari,
+    transaction_components::{EncryptedData, MemoField, Transaction, TransactionKernel, TransactionOutput},
 };
 
 use crate::{
@@ -145,6 +146,7 @@ pub trait TransactionBackend: Send + Sync + Clone {
         mined_timestamp: u64,
         must_be_confirmed: bool,
         status: LegacyTransactionStatus,
+        tip_height: u64,
     ) -> Result<(), TransactionStorageError>;
     /// Clears the mined block and height of a transaction
     fn set_transaction_as_unmined(&self, tx_id: TxId) -> Result<(), TransactionStorageError>;
@@ -182,6 +184,14 @@ pub trait TransactionBackend: Send + Sync + Clone {
         &self,
         payref: &FixedHash,
     ) -> Result<Option<CompletedTransaction>, TransactionStorageError>;
+    fn get_transaction_with_historical_payref(
+        &self,
+        payref: &FixedHash,
+    ) -> Result<Vec<CompletedTransaction>, TransactionStorageError>;
+    fn get_payref_history_by_tx_id(
+        &self,
+        tx_id: TxId,
+    ) -> Result<Vec<(FixedHash, PaymentReference)>, TransactionStorageError>;
 
     fn find_completed_transactions_paginated(
         &self,
@@ -194,10 +204,12 @@ pub trait TransactionBackend: Send + Sync + Clone {
     fn insert_burn_proof(
         &self,
         output_hash: FixedHash,
-        proof: &BurnClaimProof,
-
+        proof: &PartialBurnClaimProof,
         kernel: &TransactionKernel,
+        encrypted_data: &EncryptedData,
+        value: MicroMinotari,
     ) -> Result<(), TransactionStorageError>;
+
     fn update_burn_proof_set_merkle_proof(
         &self,
         output_hash: &FixedHash,
@@ -207,6 +219,10 @@ pub trait TransactionBackend: Send + Sync + Clone {
     fn fetch_burn_proof(&self, output_hash: &FixedHash) -> Result<Option<DbBurnProof>, TransactionStorageError>;
 
     fn process_reorg(&self, reorg_height: u64) -> Result<(), TransactionStorageError>;
+
+    /// Check confirmed transactions whose lock_height has not been reached yet and
+    /// transition their status to the locked variant.
+    fn check_lock_height_status(&self, tip_height: u64) -> Result<(), TransactionStorageError>;
 }
 
 #[derive(Clone, PartialEq)]
@@ -813,6 +829,7 @@ where T: TransactionBackend + 'static
         scanned_output: TransactionOutput,
         payment_id: MemoField,
         direction: TransactionDirection,
+        lock_height: u64,
     ) -> Result<(), TransactionStorageError> {
         let hash = scanned_output.hash();
         let fee = payment_id.get_fee().unwrap_or_default();
@@ -839,6 +856,7 @@ where T: TransactionBackend + 'static
             sent_hashes,
             vec![hash],
             vec![],
+            lock_height,
         )?;
 
         self.db
@@ -873,6 +891,7 @@ where T: TransactionBackend + 'static
         mined_timestamp: u64,
         must_be_confirmed: bool,
         status: LegacyTransactionStatus,
+        tip_height: u64,
     ) -> Result<(), TransactionStorageError> {
         self.db.update_mined_height(
             tx_id,
@@ -881,6 +900,7 @@ where T: TransactionBackend + 'static
             mined_timestamp,
             must_be_confirmed,
             status,
+            tip_height,
         )
     }
 
@@ -901,6 +921,20 @@ where T: TransactionBackend + 'static
         self.db.get_transaction_with_payref(payref)
     }
 
+    pub fn get_transaction_with_historical_payref(
+        &self,
+        payref: &FixedHash,
+    ) -> Result<Vec<CompletedTransaction>, TransactionStorageError> {
+        self.db.get_transaction_with_historical_payref(payref)
+    }
+
+    pub fn get_payref_history_by_tx_id(
+        &self,
+        tx_id: TxId,
+    ) -> Result<Vec<(FixedHash, PaymentReference)>, TransactionStorageError> {
+        self.db.get_payref_history_by_tx_id(tx_id)
+    }
+
     pub fn get_completed_transactions_paginated(
         &self,
         offset: u64,
@@ -914,10 +948,13 @@ where T: TransactionBackend + 'static
     pub fn insert_burn_proof(
         &self,
         output_hash: FixedHash,
-        proof: &BurnClaimProof,
+        proof: &PartialBurnClaimProof,
         kernel: &TransactionKernel,
+        encrypt_data: &EncryptedData,
+        value: MicroMinotari,
     ) -> Result<(), TransactionStorageError> {
-        self.db.insert_burn_proof(output_hash, proof, kernel)
+        self.db
+            .insert_burn_proof(output_hash, proof, kernel, encrypt_data, value)
     }
 
     pub fn update_burn_proof_set_merkle_proof(
@@ -934,6 +971,10 @@ where T: TransactionBackend + 'static
 
     pub fn process_reorg(&self, reorg_height: u64) -> Result<(), TransactionStorageError> {
         self.db.process_reorg(reorg_height)
+    }
+
+    pub fn check_lock_height_status(&self, tip_height: u64) -> Result<(), TransactionStorageError> {
+        self.db.check_lock_height_status(tip_height)
     }
 }
 

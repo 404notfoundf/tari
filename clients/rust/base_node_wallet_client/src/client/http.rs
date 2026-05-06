@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::{
+    MicroMinotari,
     rpc::{
         models,
         models::{
@@ -25,10 +26,9 @@ use tari_transaction_components::{
         },
     },
     transaction_components::{Transaction, TransactionOutput},
-    MicroMinotari,
 };
-use tari_utilities::hex::{to_hex, Hex};
-use tokio::sync::{mpsc, RwLock};
+use tari_utilities::hex::{Hex, to_hex};
+use tokio::sync::{RwLock, mpsc};
 use url::Url;
 
 use crate::{BaseNodeWalletClient, JsonRpcResponse};
@@ -351,17 +351,22 @@ impl BaseNodeWalletClient for Client {
         self.last_latency.read().await.map(|(duration, _)| duration)
     }
 
-    async fn get_utxos_mined_info(&self, hashes: Vec<Vec<u8>>) -> Result<GetUtxosMinedInfoResponse, anyhow::Error> {
+    async fn get_utxos_mined_info(
+        &self,
+        hashes: Vec<Vec<u8>>,
+        version: u32,
+    ) -> Result<GetUtxosMinedInfoResponse, anyhow::Error> {
         let server_address = self.http_server_address().await?;
         debug!(
             target: LOG_TARGET,
-            "Requesting matching UTXOs for {} hashes from Base Node wallet service at {}",
-            hashes.len(), server_address
+            "Requesting matching UTXOs (version={}) for {} hashes from Base Node wallet service at {}",
+            version, hashes.len(), server_address
         );
         let mut target_url = server_address.join("/get_utxos_mined_info")?;
         target_url.set_query(Some(&format!(
-            "hashes={}",
-            hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>().join(",")
+            "hashes={}&version={}",
+            hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>().join(","),
+            version
         )));
         let timer = Instant::now();
         let res = self.http_client.get(target_url).send().await?;
@@ -531,13 +536,64 @@ impl BaseNodeWalletClient for Client {
         Ok(response)
     }
 
-    async fn get_mempool_fee_per_gram_stats(&self, _count: u64) -> Result<FeePerGramStat, anyhow::Error> {
-        Ok(FeePerGramStat {
-            order: 1,
-            min_fee_per_gram: MicroMinotari::from(1),
-            avg_fee_per_gram: MicroMinotari::from(1),
-            max_fee_per_gram: MicroMinotari::from(1),
-        }) // Placeholder implementation
+    async fn get_mempool_fee_per_gram_stats(&self, count: u64) -> Result<FeePerGramStat, anyhow::Error> {
+        let server_address = self.http_server_address().await?;
+        debug!(
+            target: LOG_TARGET,
+            "Requesting mempool fee per gram stats with count {} from Base Node wallet service at {}",
+            count, server_address
+        );
+
+        let mut target_url = server_address.join("/get_mempool_fee_per_gram_stats")?;
+        target_url.set_query(Some(format!("count={count}").as_str()));
+
+        let timer = Instant::now();
+        let res = self.http_client.get(target_url).send().await?;
+        self.set_last_latency(timer.elapsed()).await;
+
+        if res.status().is_client_error() || res.status().is_server_error() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_else(|_| "No response body".to_string());
+            warn!(target: LOG_TARGET, "Received error response from Base Node wallet service: {status}. {body}");
+            return Err(anyhow!(
+                "Received error response from Base Node wallet service: {status}. {body}"
+            ));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct FeePerGramStatResponse {
+            order: u64,
+            min_fee_per_gram: u64,
+            avg_fee_per_gram: u64,
+            max_fee_per_gram: u64,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct GetMempoolFeePerGramStatsResponse {
+            stats: Vec<FeePerGramStatResponse>,
+        }
+
+        let response = res.json::<GetMempoolFeePerGramStatsResponse>().await?;
+
+        // Return the first stat or a default if empty
+        let stat = response
+            .stats
+            .into_iter()
+            .next()
+            .map(|s| FeePerGramStat {
+                order: s.order,
+                min_fee_per_gram: MicroMinotari::from(s.min_fee_per_gram),
+                avg_fee_per_gram: MicroMinotari::from(s.avg_fee_per_gram),
+                max_fee_per_gram: MicroMinotari::from(s.max_fee_per_gram),
+            })
+            .unwrap_or_else(|| FeePerGramStat {
+                order: 0,
+                min_fee_per_gram: MicroMinotari::from(1),
+                avg_fee_per_gram: MicroMinotari::from(1),
+                max_fee_per_gram: MicroMinotari::from(1),
+            });
+
+        Ok(stat)
     }
 
     async fn get_kernel_merkle_proof(

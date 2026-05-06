@@ -7,27 +7,27 @@ use std::{env, fs};
 use log::*;
 use minotari_wallet::output_manager_service::UtxoSelectionCriteria;
 use tari_transaction_components::{
-    transaction_components::memo_field::{MemoField, TxType},
     MicroMinotari,
+    transaction_components::memo_field::{MemoField, TxType},
 };
 use tari_utilities::hex::Hex;
 use tokio::{runtime::Handle, sync::watch};
 use tui::{
+    Frame,
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, ListItem, Paragraph, Wrap},
-    Frame,
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::ui::{
-    components::{balance::Balance, Component, KeyHandled},
+    MAX_WIDTH,
+    components::{Component, KeyHandled, balance::Balance},
     state::{AppState, UiTransactionBurnStatus},
     ui_burnt_proof::UiBurnProof,
-    widgets::{draw_dialog, MultiColumnList, WindowedListState},
-    MAX_WIDTH,
+    widgets::{MultiColumnList, WindowedListState, draw_dialog},
 };
 
 const LOG_TARGET: &str = "wallet::console_wallet::burn_tab ";
@@ -35,7 +35,6 @@ const LOG_TARGET: &str = "wallet::console_wallet::burn_tab ";
 pub struct BurnTab {
     balance: Balance,
     burn_input_mode: BurnInputMode,
-    burnt_proof_filepath_field: String,
     claim_public_key_field: String,
     sidechain_key_field: String,
     amount_field: String,
@@ -54,7 +53,6 @@ impl BurnTab {
         Self {
             balance: Balance::new(),
             burn_input_mode: BurnInputMode::None,
-            burnt_proof_filepath_field: String::new(),
             claim_public_key_field: String::new(),
             sidechain_key_field: String::new(),
             amount_field: String::new(),
@@ -88,7 +86,6 @@ impl BurnTab {
                     Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Length(3),
-                    Constraint::Length(3),
                 ]
                 .as_ref(),
             )
@@ -98,10 +95,6 @@ impl BurnTab {
         let instructions = Paragraph::new(vec![
             Spans::from(vec![
                 Span::raw("Press "),
-                Span::styled("V", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" to edit "),
-                Span::styled("Burn Proof Filepath", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(", "),
                 Span::styled("C", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" to edit "),
                 Span::styled("Claim Public Key", Style::default().add_modifier(Modifier::BOLD)),
@@ -113,7 +106,7 @@ impl BurnTab {
                 Span::styled("F", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" to edit "),
                 Span::styled("Fee-Per-Gram", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" and "),
+                Span::raw(", "),
             ]),
             Spans::from(vec![
                 Span::raw("Press "),
@@ -125,25 +118,13 @@ impl BurnTab {
         .block(Block::default());
         f.render_widget(instructions, vert_chunks[0]);
 
-        let burnt_proof_filepath_input = Paragraph::new(self.burnt_proof_filepath_field.as_ref())
-            .style(match self.burn_input_mode {
-                BurnInputMode::BurntProofPath => Style::default().fg(Color::Magenta),
-                _ => Style::default(),
-            })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Sa(v)e burn proof to file path:"),
-            );
-        f.render_widget(burnt_proof_filepath_input, vert_chunks[1]);
-
         let claim_public_key_input = Paragraph::new(self.claim_public_key_field.as_ref())
             .style(match self.burn_input_mode {
                 BurnInputMode::ClaimPublicKey => Style::default().fg(Color::Magenta),
                 _ => Style::default(),
             })
             .block(Block::default().borders(Borders::ALL).title("To (C)laim Public Key:"));
-        f.render_widget(claim_public_key_input, vert_chunks[2]);
+        f.render_widget(claim_public_key_input, vert_chunks[1]);
 
         let sidechain_key_input = Paragraph::new(self.sidechain_key_field.as_ref())
             .style(match self.burn_input_mode {
@@ -151,12 +132,12 @@ impl BurnTab {
                 _ => Style::default(),
             })
             .block(Block::default().borders(Borders::ALL).title("Sidechain Key:"));
-        f.render_widget(sidechain_key_input, vert_chunks[3]);
+        f.render_widget(sidechain_key_input, vert_chunks[2]);
 
         let amount_fee_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-            .split(vert_chunks[4]);
+            .split(vert_chunks[3]);
 
         let amount_input = Paragraph::new(self.amount_field.to_string())
             .style(match self.burn_input_mode {
@@ -180,47 +161,29 @@ impl BurnTab {
                 _ => Style::default(),
             })
             .block(Block::default().borders(Borders::ALL).title("(P)ayment-id:"));
-        f.render_widget(payment_id_input, vert_chunks[5]);
+        f.render_widget(payment_id_input, vert_chunks[4]);
 
         match self.burn_input_mode {
             BurnInputMode::None => (),
-            BurnInputMode::BurntProofPath => f.set_cursor(
-                // Put cursor past the end of the input text
-                vert_chunks[1].x + self.burnt_proof_filepath_field.width() as u16 + 1,
-                // Move one line down, from the border to the input line
+            BurnInputMode::ClaimPublicKey => f.set_cursor(
+                vert_chunks[1].x + self.claim_public_key_field.width() as u16 + 1,
                 vert_chunks[1].y + 1,
             ),
-            BurnInputMode::ClaimPublicKey => f.set_cursor(
-                // Put cursor past the end of the input text
-                vert_chunks[2].x + self.claim_public_key_field.width() as u16 + 1,
-                // Move one line down, from the border to the input line
+            BurnInputMode::SidechainKey => f.set_cursor(
+                vert_chunks[2].x + self.sidechain_key_field.width() as u16 + 1,
                 vert_chunks[2].y + 1,
             ),
-            BurnInputMode::Amount => {
-                f.set_cursor(
-                    // Put cursor past the end of the input text
-                    amount_fee_layout[0].x + self.amount_field.width() as u16 + 1,
-                    // Move one line down, from the border to the input line
-                    amount_fee_layout[0].y + 1,
-                )
-            },
+            BurnInputMode::Amount => f.set_cursor(
+                amount_fee_layout[0].x + self.amount_field.width() as u16 + 1,
+                amount_fee_layout[0].y + 1,
+            ),
             BurnInputMode::Fee => f.set_cursor(
-                // Put cursor past the end of the input text
                 amount_fee_layout[1].x + self.fee_field.width() as u16 + 1,
-                // Move one line down, from the border to the input line
                 amount_fee_layout[1].y + 1,
             ),
-            BurnInputMode::SidechainKey => f.set_cursor(
-                // Put cursor past the end of the input text
-                vert_chunks[3].x + self.sidechain_key_field.width() as u16 + 1,
-                // Move one line down, from the border to the input line
-                vert_chunks[3].y + 1,
-            ),
             BurnInputMode::PaymentId => f.set_cursor(
-                // Put cursor past the end of the input text
-                vert_chunks[5].x + self.payment_id_field.width() as u16 + 1,
-                // Move one line down, from the border to the input line
-                vert_chunks[5].y + 1,
+                vert_chunks[4].x + self.payment_id_field.width() as u16 + 1,
+                vert_chunks[4].y + 1,
             ),
         }
     }
@@ -270,9 +233,7 @@ impl BurnTab {
         let mut column2_items = Vec::new();
 
         for item in windowed_view {
-            column0_items.push(ListItem::new(Span::raw(
-                item.proof.reciprocal_claim_public_key.to_hex(),
-            )));
+            column0_items.push(ListItem::new(Span::raw(item.proof.claim_public_key.to_hex())));
             column1_items.push(ListItem::new(Span::raw(if item.encoded_merkle_proof.is_some() {
                 "✅"
             } else {
@@ -281,7 +242,7 @@ impl BurnTab {
             column2_items.push(ListItem::new(Span::raw(item.burned_at.to_string())));
         }
 
-        let column_list = MultiColumnList::new()
+        MultiColumnList::new()
             .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Magenta))
             .heading_style(Style::default().fg(Color::Magenta))
             .max_width(MAX_WIDTH)
@@ -290,9 +251,7 @@ impl BurnTab {
             .add_column(None, Some(1), Vec::new())
             .add_column(Some("Confirmed?"), Some(12), column1_items)
             .add_column(None, Some(1), Vec::new())
-            .add_column(Some("Burned At"), Some(11), column2_items);
-
-        column_list
+            .add_column(Some("Burned At"), Some(11), column2_items)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -325,12 +284,6 @@ impl BurnTab {
             return KeyHandled::Handled;
         };
 
-        let burn_proof_filepath = if self.burnt_proof_filepath_field.is_empty() {
-            None
-        } else {
-            Some(self.burnt_proof_filepath_field.clone())
-        };
-
         let claim_public_key = if self.claim_public_key_field.is_empty() {
             None
         } else {
@@ -350,7 +303,6 @@ impl BurnTab {
             Some(BurnConfirmationDialogType::Normal) => {
                 match Handle::current().block_on(
                     app_state.send_burn_transaction(
-                        burn_proof_filepath,
                         claim_public_key,
                         amount.into(),
                         UtxoSelectionCriteria::default(),
@@ -397,7 +349,6 @@ impl BurnTab {
         }
 
         if reset_fields {
-            self.burnt_proof_filepath_field = "".to_string();
             self.claim_public_key_field = "".to_string();
             self.amount_field = "".to_string();
             self.fee_field = app_state.get_default_fee_per_gram().as_u64().to_string();
@@ -414,13 +365,6 @@ impl BurnTab {
         if self.burn_input_mode != BurnInputMode::None {
             match self.burn_input_mode {
                 BurnInputMode::None => (),
-                BurnInputMode::BurntProofPath => match c {
-                    '\n' => self.burn_input_mode = BurnInputMode::ClaimPublicKey,
-                    c => {
-                        self.burnt_proof_filepath_field.push(c);
-                        return KeyHandled::Handled;
-                    },
-                },
                 BurnInputMode::ClaimPublicKey => match c {
                     '\n' => self.burn_input_mode = BurnInputMode::SidechainKey,
                     c => {
@@ -558,8 +502,8 @@ impl<B: Backend> Component<B> for BurnTab {
                     return;
                 },
                 UiTransactionBurnStatus::TransactionComplete => {
-                    self.success_message =
-                        Some("Transaction completed successfully!\nPlease press Enter to continue".to_string());
+                    let msg = "Transaction completed successfully!\nPlease press Enter to continue".to_string();
+                    self.success_message = Some(msg);
                     return;
                 },
             };
@@ -671,7 +615,6 @@ impl<B: Backend> Component<B> for BurnTab {
         }
 
         match c {
-            'v' => self.burn_input_mode = BurnInputMode::BurntProofPath,
             'c' => self.burn_input_mode = BurnInputMode::ClaimPublicKey,
             'a' => {
                 self.burn_input_mode = BurnInputMode::Amount;
@@ -717,9 +660,6 @@ impl<B: Backend> Component<B> for BurnTab {
 
     fn on_backspace(&mut self, _app_state: &mut AppState) {
         match self.burn_input_mode {
-            BurnInputMode::BurntProofPath => {
-                let _ = self.burnt_proof_filepath_field.pop();
-            },
             BurnInputMode::ClaimPublicKey => {
                 let _ = self.claim_public_key_field.pop();
             },
@@ -743,7 +683,6 @@ impl<B: Backend> Component<B> for BurnTab {
 #[derive(PartialEq, Debug)]
 pub enum BurnInputMode {
     None,
-    BurntProofPath,
     ClaimPublicKey,
     SidechainKey,
     Amount,

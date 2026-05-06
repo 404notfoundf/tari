@@ -7,10 +7,10 @@ pub mod crypto_factories;
 
 mod coinbase_builder;
 pub use coinbase_builder::{
-    generate_coinbase,
-    generate_coinbase_with_wallet_output,
     CoinbaseBuildError,
     CoinbaseBuilder,
+    generate_coinbase,
+    generate_coinbase_with_wallet_output,
 };
 pub mod consensus;
 pub mod fee;
@@ -25,8 +25,8 @@ pub mod validation;
 pub use transaction_builder::{TransactionBuilder, TransactionBuilderError};
 pub mod multisig;
 pub mod offline_signing;
-
 pub mod rpc;
+pub mod utxo_selection;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;

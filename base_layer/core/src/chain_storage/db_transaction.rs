@@ -27,18 +27,41 @@ use std::{
 };
 
 use primitive_types::U512;
-use tari_common_types::types::{BlockHash, CompressedCommitment, HashOutput};
+use serde::{Deserialize, Serialize};
+use tari_common_types::types::{BlockHash, CompressedCommitment, CompressedPublicKey, FixedHash, HashOutput};
 use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
 use tari_transaction_components::transaction_components::{OutputType, TransactionKernel, TransactionOutput};
 use tari_utilities::hex::Hex;
 
 use crate::{
     blocks::UpdateBlockAccumulatedData,
-    chain_storage::{error::ChainStorageError, HorizonData, Reorg},
+    chain_storage::{HorizonData, Reorg, error::ChainStorageError},
 };
+
+/// Persisted state for an in-progress horizon output sync session.
+/// Couples the last verified tranche position with the sync target so that
+/// a checkpoint is never reused for a different `to_header`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HorizonSyncOutputCheckpoint {
+    /// Height of the last fully-verified and committed output tranche.
+    pub checkpoint_height: u64,
+    /// Block hash at `checkpoint_height`, used to detect chain reorgs between sessions.
+    pub checkpoint_hash: FixedHash,
+    /// Height of the `to_header` this sync session is targeting.
+    pub sync_target_height: u64,
+    /// Block hash of the `to_header` this sync session is targeting.
+    pub sync_target_hash: FixedHash,
+}
+
 #[derive(Debug)]
 pub struct DbTransaction {
     operations: Vec<WriteOperation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HorizonStateTreeUpdate {
+    pub key: FixedHash,
+    pub value: Option<FixedHash>,
 }
 
 impl Display for DbTransaction {
@@ -82,6 +105,13 @@ impl DbTransaction {
     /// Delete a block
     pub fn delete_tip_block(&mut self, block_hash: HashOutput) -> &mut Self {
         self.operations.push(WriteOperation::DeleteTipBlock(block_hash));
+        self
+    }
+
+    /// Delete block accumulated data at the given height. Used during rewind past pruning horizon
+    /// where the full block body has already been pruned and `delete_tip_block` cannot be used.
+    pub fn delete_block_accumulated_data(&mut self, height: u64) -> &mut Self {
+        self.operations.push(WriteOperation::DeleteBlockAccumulatedData(height));
         self
     }
 
@@ -141,6 +171,18 @@ impl DbTransaction {
             output_hash,
             commitment,
             output_type,
+        });
+        self
+    }
+
+    pub fn delete_validator_node(
+        &mut self,
+        sidechain_public_key: Option<CompressedPublicKey>,
+        public_key: CompressedPublicKey,
+    ) -> &mut Self {
+        self.operations.push(WriteOperation::DeleteValidatorNode {
+            sidechain_public_key,
+            public_key,
         });
         self
     }
@@ -264,6 +306,33 @@ impl DbTransaction {
         self
     }
 
+    pub fn set_horizon_sync_output_checkpoint(&mut self, checkpoint: HorizonSyncOutputCheckpoint) -> &mut Self {
+        self.operations.push(WriteOperation::SetHorizonSyncOutputCheckpoint {
+            checkpoint: Some(checkpoint),
+        });
+        self
+    }
+
+    pub fn clear_horizon_sync_output_checkpoint(&mut self) -> &mut Self {
+        self.operations
+            .push(WriteOperation::SetHorizonSyncOutputCheckpoint { checkpoint: None });
+        self
+    }
+
+    pub fn apply_horizon_state_tree_updates(
+        &mut self,
+        previous_version: u64,
+        version: u64,
+        updates: Vec<HorizonStateTreeUpdate>,
+    ) -> &mut Self {
+        self.operations.push(WriteOperation::ApplyHorizonStateTreeUpdates {
+            previous_version,
+            version,
+            updates,
+        });
+        self
+    }
+
     pub(crate) fn operations(&self) -> &[WriteOperation] {
         &self.operations
     }
@@ -316,6 +385,7 @@ pub enum WriteOperation {
     DeleteHeader(u64),
     DeleteOrphan(HashOutput),
     DeleteTipBlock(HashOutput),
+    DeleteBlockAccumulatedData(u64),
     DeleteOrphanChainTip(HashOutput),
     InsertOrphanChainTip(HashOutput, U512),
     InsertMoneroSeedHeight(Vec<u8>, u64),
@@ -355,12 +425,26 @@ pub enum WriteOperation {
     SetHorizonData {
         horizon_data: HorizonData,
     },
+    ApplyHorizonStateTreeUpdates {
+        previous_version: u64,
+        version: u64,
+        updates: Vec<HorizonStateTreeUpdate>,
+    },
     InsertReorg {
         reorg: Reorg,
     },
     ClearAllReorgs,
+    DeleteValidatorNode {
+        sidechain_public_key: Option<CompressedPublicKey>,
+        public_key: CompressedPublicKey,
+    },
+    /// Set or clear the horizon sync output checkpoint. `None` clears the checkpoint.
+    SetHorizonSyncOutputCheckpoint {
+        checkpoint: Option<HorizonSyncOutputCheckpoint>,
+    },
 }
 
+#[allow(clippy::too_many_lines)]
 impl fmt::Display for WriteOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[allow(clippy::enum_glob_use)]
@@ -409,6 +493,7 @@ impl fmt::Display for WriteOperation {
                 write!(f, "InsertOrphanChainTip({hash}, {total_accumulated_difficulty})")
             },
             DeleteTipBlock(hash) => write!(f, "DeleteTipBlock({hash})"),
+            DeleteBlockAccumulatedData(height) => write!(f, "DeleteBlockAccumulatedData({height})"),
             InsertMoneroSeedHeight(data, height) => {
                 write!(f, "Insert Monero seed string {} for height: {}", data.to_hex(), height)
             },
@@ -452,8 +537,31 @@ impl fmt::Display for WriteOperation {
                 write!(f, "Insert bad block #{height} {hash} for {reason}")
             },
             SetHorizonData { .. } => write!(f, "Set horizon data"),
+            ApplyHorizonStateTreeUpdates { version, updates, .. } => {
+                write!(
+                    f,
+                    "Apply horizon state tree updates at version {version} ({} updates)",
+                    updates.len()
+                )
+            },
             InsertReorg { .. } => write!(f, "Insert reorg"),
             ClearAllReorgs => write!(f, "Clear all reorgs"),
+            DeleteValidatorNode { public_key, .. } => {
+                write!(f, "Delete validator node with public key: {public_key}")
+            },
+            SetHorizonSyncOutputCheckpoint { checkpoint: Some(cp) } => {
+                write!(
+                    f,
+                    "Set horizon sync output checkpoint to height {} ({}) targeting height {} ({})",
+                    cp.checkpoint_height,
+                    cp.checkpoint_hash.to_hex(),
+                    cp.sync_target_height,
+                    cp.sync_target_hash.to_hex()
+                )
+            },
+            SetHorizonSyncOutputCheckpoint { checkpoint: None } => {
+                write!(f, "Clear horizon sync output checkpoint")
+            },
         }
     }
 }

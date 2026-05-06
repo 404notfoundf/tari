@@ -25,20 +25,18 @@ use tari_common_types::{
     tari_address::{TariAddress, TariAddressFeatures},
     types::{CompressedCommitment, PrivateKey},
 };
-use tari_script::{push_pubkey_script, ExecutionStack, TariScript};
+use tari_script::{ExecutionStack, TariScript, push_pubkey_script};
 use tari_utilities::ByteArrayError;
 use thiserror::Error;
 
 use crate::{
     consensus::{
-        emission::{Emission, EmissionSchedule},
         ConsensusConstants,
+        emission::{Emission, EmissionSchedule},
     },
-    key_manager::{error::KeyManagerError, TariKeyId, TransactionKeyManagerInterface, TxoStage},
-    tari_amount::{uT, MicroMinotari},
+    key_manager::{TariKeyId, TransactionKeyManagerInterface, TxoStage, error::KeyManagerError},
+    tari_amount::{MicroMinotari, uT},
     transaction_components::{
-        covenants::Covenant,
-        memo_field::{MemoField, TxType},
         CoinBaseExtra,
         CoreTransactionBuilder,
         KernelBuilder,
@@ -52,6 +50,8 @@ use crate::{
         TransactionOutput,
         TransactionOutputVersion,
         WalletOutput,
+        covenants::Covenant,
+        memo_field::{MemoField, TxType},
     },
 };
 
@@ -482,16 +482,16 @@ mod test {
 
     use super::*;
     use crate::{
+        CoinbaseBuilder,
         aggregated_body::AggregateBody,
         coinbase_builder::CoinbaseBuildError,
-        consensus::{emission::Emission, ConsensusManager, ConsensusManagerBuilder},
+        consensus::{ConsensusManager, ConsensusManagerBuilder, emission::Emission},
         crypto_factories::CryptoFactories,
         key_manager::KeyManager,
         tari_amount::uT,
-        test_helpers::{create_consensus_constants, TestParams},
+        test_helpers::{TestParams, create_consensus_constants},
         transaction_components::{KernelFeatures, OutputFeatures, OutputType, TransactionError, TransactionKernel},
         validation::aggregate_body::AggregateBodyInternalConsistencyValidator,
-        CoinbaseBuilder,
     };
 
     fn get_builder() -> (
@@ -507,8 +507,8 @@ mod test {
         (CoinbaseBuilder::new(key_manager.clone()), rules, factories, key_manager)
     }
 
-    #[tokio::test]
-    async fn missing_height() {
+    #[test]
+    fn missing_height() {
         let (builder, rules, _, _) = get_builder();
 
         assert_eq!(
@@ -523,8 +523,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn missing_fees() {
+    #[test]
+    fn missing_fees() {
         let (builder, rules, _, _) = get_builder();
         let builder = builder.with_block_height(42);
         assert_eq!(
@@ -539,9 +539,9 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::erasing_op)]
-    async fn missing_spend_key() {
+    fn missing_spend_key() {
         let (builder, rules, _, _) = get_builder();
         let fees = 0 * uT;
         let builder = builder.with_block_height(42).with_fees(fees);
@@ -557,8 +557,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn valid_coinbase() {
+    #[test]
+    fn valid_coinbase() {
         let (builder, rules, factories, key_manager) = get_builder();
         let p = TestParams::new(&key_manager);
         let wallet_payment_address = TariAddress::default();
@@ -610,8 +610,8 @@ mod test {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn invalid_coinbase_maturity() {
+    #[test]
+    fn invalid_coinbase_maturity() {
         let (builder, rules, factories, key_manager) = get_builder();
         let p = TestParams::new(&key_manager);
         let block_reward = rules.emission_schedule().block_reward(42) + 145 * uT;
@@ -647,9 +647,9 @@ mod test {
         ));
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::identity_op)]
-    async fn invalid_coinbase_value() {
+    fn invalid_coinbase_value() {
         let (builder, rules, factories, key_manager) = get_builder();
         let p = TestParams::new(&key_manager);
         // We just want some small amount here.
@@ -725,22 +725,23 @@ mod test {
                 MemoField::new_empty(),
             )
             .unwrap();
-        assert!(tx3
-            .body
-            .check_coinbase_output(
-                block_reward,
-                rules.consensus_constants(0).coinbase_min_maturity(),
-                &factories,
-                42,
-                1
-            )
-            .is_ok());
+        assert!(
+            tx3.body
+                .check_coinbase_output(
+                    block_reward,
+                    rules.consensus_constants(0).coinbase_min_maturity(),
+                    &factories,
+                    42,
+                    1
+                )
+                .is_ok()
+        );
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::identity_op)]
-    async fn invalid_coinbase_amount() {
+    fn invalid_coinbase_amount() {
         // We construct two txs both valid with a single coinbase. We then add a duplicate coinbase utxo to the one, and
         // a duplicate coinbase kernel to the other one.
         let (builder, rules, factories, key_manager) = get_builder();
@@ -825,10 +826,11 @@ mod test {
             &excess,
             &kernel_message,
         );
-        assert!(sig
-            .to_schnorr_signature()
-            .unwrap()
-            .verify_raw_uniform(&excess.to_public_key().unwrap(), &sig_challenge));
+        assert!(
+            sig.to_schnorr_signature()
+                .unwrap()
+                .verify_raw_uniform(&excess.to_public_key().unwrap(), &sig_challenge)
+        );
 
         // we fix the signature and the excess with the now included offset.
         coinbase_kernel2.excess_sig = sig;
@@ -873,10 +875,10 @@ mod test {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::identity_op)]
-    async fn multi_coinbase_amount() {
+    fn multi_coinbase_amount() {
         // We construct two txs both valid with a single coinbase. We then add a duplicate coinbase utxo to the one, and
         // a duplicate coinbase kernel to the other one.
         let (builder, rules, factories, key_manager) = get_builder();
@@ -1011,10 +1013,10 @@ mod test {
         body2.verify_kernel_signatures().unwrap();
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::identity_op)]
-    async fn too_may_coinbases() {
+    fn too_may_coinbases() {
         let (builder, rules, factories, key_manager) = get_builder();
         let p = TestParams::new(&key_manager);
         // We just want some small amount here.
@@ -1127,8 +1129,8 @@ mod test {
         .unwrap_err();
     }
 
-    #[tokio::test]
-    async fn test_generate_coinbase_with_payment_id_from_address() {
+    #[test]
+    fn test_generate_coinbase_with_payment_id_from_address() {
         let key_manager = KeyManager::new_random().unwrap();
         let wallet_private_spend_key = PrivateKey::random(&mut rand::rngs::OsRng);
         let wallet_private_view_key = PrivateKey::random(&mut rand::rngs::OsRng);

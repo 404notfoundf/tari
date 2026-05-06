@@ -21,8 +21,8 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use futures::StreamExt;
@@ -30,11 +30,11 @@ use tari_service_framework::reply_channel;
 use tokio::{sync::Mutex, task};
 
 use crate::mempool::{
-    service::{MempoolHandle, MempoolRequest, MempoolResponse},
     MempoolServiceError,
     StateResponse,
     StatsResponse,
     TxStorageResponse,
+    service::{MempoolHandle, MempoolRequest, MempoolResponse},
 };
 
 pub fn create_mempool_service_mock() -> (MempoolHandle, MempoolMockState) {
@@ -124,7 +124,14 @@ impl MempoolServiceMock {
     }
 
     async fn handle_request(&self, req: MempoolRequest) -> Result<MempoolResponse, MempoolServiceError> {
-        use MempoolRequest::{GetFeePerGramStats, GetState, GetStats, GetTxStateByExcessSig, SubmitTransaction};
+        use MempoolRequest::{
+            FilterOutputsInMempool,
+            GetFeePerGramStats,
+            GetState,
+            GetStats,
+            GetTxStateByExcessSig,
+            SubmitTransaction,
+        };
 
         self.state.inc_call_count();
         match req {
@@ -139,6 +146,7 @@ impl MempoolServiceMock {
             GetFeePerGramStats { .. } => {
                 unimplemented!()
             },
+            FilterOutputsInMempool(_) => Ok(MempoolResponse::FilteredOutputs(vec![])),
         }
     }
 }

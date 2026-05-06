@@ -24,9 +24,9 @@ use chrono::Utc;
 use futures::channel::mpsc;
 use minotari_app_grpc::tari_rpc::{
     self,
-    readiness_status::{State, Status as ReadinessStatusEnum},
     MigrationProgress,
     ReadinessStatus,
+    readiness_status::{State, Status as ReadinessStatusEnum},
 };
 use tari_core::chain_storage::DatabaseStats;
 use tokio::sync::watch;
@@ -142,6 +142,7 @@ impl tari_rpc::base_node_server::BaseNode for ReadinessGrpcServer {
             metadata: None,
             initial_sync_achieved: false,
             base_node_state: tari_rpc::BaseNodeState::StartUp.into(),
+            network_silence: false,
             failed_checkpoints: false,
             reward: 0,
             sha3x_estimated_hash_rate: 0,

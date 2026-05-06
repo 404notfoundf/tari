@@ -71,7 +71,7 @@ pub type TariBaseNodeState = c_void;
 #[cfg_attr(windows, link(name = "minotari_wallet_ffi.dll"))]
 #[cfg_attr(not(windows), link(name = "minotari_wallet_ffi"))]
 #[allow(dead_code)]
-extern "C" {
+unsafe extern "C" {
     pub fn create_tari_vector(tag: TariTypeTag) -> *mut TariVector;
     pub fn tari_vector_push_string(tv: *mut TariVector, s: *const c_char, error_ptr: *mut i32);
     pub fn destroy_tari_vector(v: *mut TariVector);
@@ -252,7 +252,7 @@ extern "C" {
         error_out: *mut c_int,
     ) -> *mut TariWalletAddress;
     pub fn completed_transaction_get_status(transaction: *mut TariCompletedTransaction, error_out: *mut c_int)
-        -> c_int;
+    -> c_int;
     pub fn completed_transaction_get_amount(
         transaction: *mut TariCompletedTransaction,
         error_out: *mut c_int,
@@ -467,7 +467,6 @@ extern "C" {
         amount: c_ulonglong,
         commitments: *mut TariVector,
         fee_per_gram: c_ulonglong,
-        one_sided: bool,
         payment_id_string: *const c_char,
         error_out: *mut c_int,
     ) -> c_ulonglong;
@@ -484,18 +483,22 @@ extern "C" {
     pub fn wallet_set_num_confirmations_required(wallet: *mut TariWallet, num: c_ulonglong, error_out: *mut c_int);
     pub fn wallet_get_completed_transactions(
         wallet: *mut TariWallet,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariCompletedTransactions;
     pub fn wallet_get_pending_inbound_transactions(
         wallet: *mut TariWallet,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariPendingInboundTransactions;
     pub fn wallet_get_pending_outbound_transactions(
         wallet: *mut TariWallet,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariPendingOutboundTransactions;
     pub fn wallet_get_cancelled_transactions(
         wallet: *mut TariWallet,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariCompletedTransactions;
     pub fn wallet_get_completed_transaction_by_id(
@@ -506,11 +509,13 @@ extern "C" {
     pub fn wallet_get_pending_inbound_transaction_by_id(
         wallet: *mut TariWallet,
         transaction_id: c_ulonglong,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariPendingInboundTransaction;
     pub fn wallet_get_pending_outbound_transaction_by_id(
         wallet: *mut TariWallet,
         transaction_id: c_ulonglong,
+        max_search_limit: c_ulonglong,
         error_out: *mut c_int,
     ) -> *mut TariPendingOutboundTransaction;
     pub fn wallet_get_cancelled_transaction_by_id(
@@ -532,8 +537,6 @@ extern "C" {
     pub fn wallet_start_transaction_validation(wallet: *mut TariWallet, error_out: *mut c_int) -> c_ulonglong;
     pub fn wallet_restart_transaction_broadcast(wallet: *mut TariWallet, error_out: *mut c_int) -> bool;
     pub fn wallet_get_seed_words(wallet: *mut TariWallet, error_out: *mut c_int) -> *mut TariSeedWords;
-    pub fn wallet_set_low_power_mode(wallet: *mut TariWallet, error_out: *mut c_int);
-    pub fn wallet_set_normal_power_mode(wallet: *mut TariWallet, error_out: *mut c_int);
     pub fn wallet_set_key_value(
         wallet: *mut TariWallet,
         key: *const c_char,
@@ -565,7 +568,7 @@ extern "C" {
         error_out: *mut c_int,
     ) -> *mut TariFeePerGramStats;
     pub fn fee_per_gram_stats_get_length(fee_per_gram_stats: *mut TariFeePerGramStats, error_out: *mut c_int)
-        -> c_uint;
+    -> c_uint;
     pub fn fee_per_gram_stats_get_at(
         fee_per_gram_stats: *mut TariFeePerGramStats,
         position: c_uint,

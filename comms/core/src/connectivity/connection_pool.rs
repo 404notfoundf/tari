@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt, time::Duration};
 
 use nom::lib::std::collections::hash_map::Entry;
 
-use crate::{peer_manager::NodeId, Minimized, PeerConnection};
+use crate::{Minimized, PeerConnection, peer_manager::NodeId};
 
 /// Status type for connections
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +169,7 @@ impl ConnectionPool {
 
     pub fn get_inactive_outbound_connections_mut(&mut self, min_age: Duration) -> Vec<&mut PeerConnection> {
         self.filter_connections_mut(|conn| {
-            conn.age() > min_age && conn.handle_count() <= 1 && conn.substream_count() > 2
+            conn.age() > min_age && conn.handle_count() <= 1 && conn.substream_count() < 3
         })
     }
 

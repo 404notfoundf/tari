@@ -24,26 +24,26 @@ use std::{str::FromStr, time::Duration};
 
 use minotari_app_grpc::{
     conversions::transaction_output::grpc_output_with_payref,
-    tari_rpc::{pow_algo::PowAlgos, Block, NewBlockTemplate, NewBlockTemplateRequest, PowAlgo},
+    tari_rpc::{Block, NewBlockTemplate, NewBlockTemplateRequest, PowAlgo, pow_algo::PowAlgos},
 };
 use minotari_app_utilities::common_cli_args::CommonCliArgs;
-use minotari_miner::{run_miner, Cli};
+use minotari_miner::{Cli, run_miner};
 use minotari_node_grpc_client::BaseNodeGrpcClient;
-use minotari_wallet_grpc_client::{grpc, WalletGrpcClient};
+use minotari_wallet_grpc_client::{WalletGrpcClient, grpc};
 use tari_common::{configuration::Network, network_check::set_network_if_choice_valid};
 use tari_common_types::tari_address::TariAddress;
 use tari_core::consensus::BaseNodeConsensusManager;
 use tari_transaction_components::{
+    MicroMinotari,
     generate_coinbase_with_wallet_output,
     key_manager::{KeyManager, TariKeyId},
     tari_proof_of_work::PowAlgorithm,
     transaction_components::{
-        memo_field::{MemoField, TxType},
         CoinBaseExtra,
         RangeProofType,
         WalletOutput,
+        memo_field::{MemoField, TxType},
     },
-    MicroMinotari,
 };
 use tonic::transport::Channel;
 
@@ -94,9 +94,6 @@ impl MinerProcess {
         miner_min_diff: Option<u64>,
         miner_max_diff: Option<u64>,
     ) {
-        unsafe {
-            std::env::set_var("TARI_NETWORK", "localnet");
-        }
         set_network_if_choice_valid(Network::LocalNet).unwrap();
         let pow_algo = match self.pow_algo {
             PowAlgorithm::RandomXM => {

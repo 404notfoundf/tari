@@ -9,18 +9,18 @@ use crossterm::{
     terminal,
 };
 use futures::{FutureExt, StreamExt};
-use rustyline::{config::OutputStreamType, error::ReadlineError, CompletionType, Config, EditMode, Editor};
+use rustyline::{CompletionType, Config, EditMode, Editor, config::OutputStreamType, error::ReadlineError};
 use tari_shutdown::ShutdownSignal;
 use tokio::{signal, time};
 
 use crate::{
+    LOG_TARGET,
     commands::{
         cli,
         command::{Args, CommandContext, WatchCommand},
         parser::Parser,
         reader::CommandReader,
     },
-    LOG_TARGET,
 };
 
 pub struct CliLoop {
@@ -141,10 +141,10 @@ impl CliLoop {
                                 println!("Watched command `{line}` failed: {err}");
                             } else {
                                 let args: Result<Args, _> = line.parse();
-                                if let Ok(command) = args {
-                                    if command.is_quit() {
-                                        self.done = true;
-                                    }
+                                if let Ok(command) = args
+                                    && command.is_quit()
+                                {
+                                    self.done = true;
                                 }
                             }
                             continue;
@@ -198,10 +198,10 @@ impl CliLoop {
                                 println!("Watched command `{line}` failed: {err}");
                             } else {
                                 let args: Result<Args, _> = line.parse();
-                                if let Ok(command) = args {
-                                    if command.is_quit() {
-                                        self.done = true;
-                                    }
+                                if let Ok(command) = args
+                                    && command.is_quit()
+                                {
+                                    self.done = true;
                                 }
                             }
                             continue;
@@ -222,9 +222,26 @@ impl CliLoop {
         // Reset the interruption flag if the command entered.
         self.first_signal = false;
         if !line.is_empty() {
+            // Handle the built-in "help" command before passing to the command parser.
+            if line.trim() == "help" {
+                println!("Available commands:");
+                for cmd in &self.commands {
+                    println!("  {cmd}");
+                }
+                return;
+            }
             match self.context.handle_command_str(&line).await {
                 Err(err) => {
-                    println!("Command `{line}` failed: {err}");
+                    // Check if the entered command is unrecognized (does not match any known command).
+                    let cmd_name = line.split_whitespace().next().unwrap_or("");
+                    if !cmd_name.is_empty() && !self.commands.iter().any(|c| c.as_str() == cmd_name) {
+                        println!(
+                            "Unknown command '{}'. Use Tab for auto-completion or type 'help' to list all commands.",
+                            cmd_name
+                        );
+                    } else {
+                        println!("Command `{line}` failed: {err}");
+                    }
                 },
                 Ok(command) => {
                     self.watch_task = command;

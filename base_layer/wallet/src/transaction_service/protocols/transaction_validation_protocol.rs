@@ -30,9 +30,10 @@ use tari_common_types::{
 };
 use tari_transaction_components::rpc::models::TxLocation;
 use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
-use tari_utilities::{hex::Hex, ByteArray};
+use tari_utilities::{ByteArray, hex::Hex};
 
 use crate::{
+    OperationId,
     connectivity_service::WalletConnectivityInterface,
     output_manager_service::handle::OutputManagerHandle,
     transaction_service::{
@@ -45,7 +46,6 @@ use crate::{
             sqlite_db::UnconfirmedTransactionInfo,
         },
     },
-    OperationId,
 };
 
 const LOG_TARGET: &str = "wallet::transaction_service::protocols::validation_protocol";
@@ -109,8 +109,8 @@ where
         if !confirmed_burnt.is_empty() {
             tokio::spawn(fetch_claim_burn_merkle_proofs::execute(
                 self.db.clone(),
-                self.output_manager.clone(),
                 self.connectivity.clone(),
+                self.event_publisher.clone(),
                 confirmed_burnt,
             ));
         }
@@ -180,6 +180,7 @@ where
                     mined_height,
                     num_confirmations,
                     mined_timestamp,
+                    tip,
                 )?;
                 state_changed = true;
             }
@@ -400,6 +401,7 @@ where
         mined_height: u64,
         num_confirmations: u64,
         mined_timestamp: u64,
+        tip_height: u64,
     ) -> Result<(), TransactionServiceProtocolError<OperationId>> {
         self.db
             .set_transaction_mined_height(
@@ -409,6 +411,7 @@ where
                 mined_timestamp,
                 num_confirmations >= self.config.num_confirmations_required,
                 status,
+                tip_height,
             )
             .for_protocol(self.operation_id)?;
 

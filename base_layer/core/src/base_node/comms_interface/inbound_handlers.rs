@@ -49,15 +49,15 @@ use tokio::sync::RwLock;
 use crate::base_node::metrics;
 use crate::{
     base_node::comms_interface::{
-        comms_response::ValidatorNodeChange,
-        error::CommsInterfaceError,
-        local_interface::BlockEventSender,
         FetchMempoolTransactionsResponse,
         NodeCommsRequest,
         NodeCommsResponse,
         OutboundNodeCommsInterface,
+        comms_response::ValidatorNodeChange,
+        error::CommsInterfaceError,
+        local_interface::BlockEventSender,
     },
-    chain_storage::{async_db::AsyncBlockchainDb, BlockAddResult, BlockchainBackend, ChainStorageError},
+    chain_storage::{BlockAddResult, BlockchainBackend, ChainStorageError, async_db::AsyncBlockchainDb},
     consensus::BaseNodeConsensusManager,
     mempool::Mempool,
     proof_of_work::{
@@ -67,7 +67,7 @@ use crate::{
         sha3x_difficulty,
         tari_randomx_difficulty,
     },
-    validation::{helpers, tari_rx_vm_key_height, ValidationError},
+    validation::{ValidationError, helpers, tari_rx_vm_key_height},
 };
 
 const LOG_TARGET: &str = "c::bn::comms_interface::inbound_handler";
@@ -1051,19 +1051,25 @@ where B: BlockchainBackend + 'static
         }
 
         match block_add_result {
-            BlockAddResult::Ok(ref block) => {
+            BlockAddResult::Ok(block) => {
                 update_target_difficulty(block);
                 self.update_difficulty_indicators(block.height()).await?;
                 #[allow(clippy::cast_possible_wrap)]
                 metrics::tip_height().set(block.height() as i64);
                 let utxo_set_size = self.blockchain_db.utxo_count().await?;
                 metrics::utxo_set_size().set(utxo_set_size.try_into().unwrap_or(i64::MAX));
+                metrics::reorg_blocks_added().set(0);
+                metrics::reorg_blocks_removed().set(0);
             },
             BlockAddResult::ChainReorg { added, removed } => {
                 if let Some(fork_height) = added.last().map(|b| b.height()) {
                     #[allow(clippy::cast_possible_wrap)]
                     metrics::tip_height().set(fork_height as i64);
                     metrics::reorg(fork_height, added.len(), removed.len()).inc();
+                    #[allow(clippy::cast_possible_wrap)]
+                    metrics::reorg_blocks_added().set(added.len() as i64);
+                    #[allow(clippy::cast_possible_wrap)]
+                    metrics::reorg_blocks_removed().set(removed.len() as i64);
 
                     let utxo_set_size = self.blockchain_db.utxo_count().await?;
                     metrics::utxo_set_size().set(utxo_set_size.try_into().unwrap_or(i64::MAX));
@@ -1075,6 +1081,8 @@ where B: BlockchainBackend + 'static
             },
             BlockAddResult::OrphanBlock => {
                 metrics::orphaned_blocks().inc();
+                metrics::reorg_blocks_added().set(0);
+                metrics::reorg_blocks_removed().set(0);
             },
             _ => {},
         }

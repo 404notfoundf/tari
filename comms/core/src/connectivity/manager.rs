@@ -35,9 +35,10 @@ use tokio::{
     time,
     time::MissedTickBehavior,
 };
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use super::{
+    ConnectivityEventTx,
     config::ConnectivityConfig,
     connection_pool::{ConnectionPool, ConnectionStatus},
     connection_stats::PeerConnectionStats,
@@ -45,9 +46,13 @@ use super::{
     proactive_dialer::ProactiveDialer,
     requester::{ConnectivityEvent, ConnectivityRequest},
     selection::ConnectivitySelection,
-    ConnectivityEventTx,
 };
 use crate::{
+    Minimized,
+    NodeIdentity,
+    PeerConnection,
+    PeerConnectionError,
+    PeerManager,
     connection_manager::{
         ConnectionDirection,
         ConnectionManagerError,
@@ -56,11 +61,6 @@ use crate::{
     },
     peer_manager::NodeId,
     utils::datetime::format_duration,
-    Minimized,
-    NodeIdentity,
-    PeerConnection,
-    PeerConnectionError,
-    PeerManager,
 };
 
 const LOG_TARGET: &str = "comms::connectivity::manager";
@@ -93,12 +93,8 @@ pub struct ConnectivityManager {
 
 impl ConnectivityManager {
     pub fn spawn(self) -> JoinHandle<()> {
-        let proactive_dialer = ProactiveDialer::new(
-            self.config,
-            self.connection_manager.clone(),
-            self.peer_manager.clone(),
-            self.node_identity.clone(),
-        );
+        let proactive_dialer =
+            ProactiveDialer::new(self.config, self.connection_manager.clone(), self.peer_manager.clone());
 
         ConnectivityManagerActor {
             config: self.config,
@@ -114,6 +110,7 @@ impl ConnectivityManager {
             #[cfg(feature = "metrics")]
             uptime: Some(Instant::now()),
             allow_list: vec![],
+            sync_peers: vec![],
             proactive_dialer,
             seeds: vec![],
         }
@@ -173,6 +170,15 @@ struct ConnectivityManagerActor {
     #[cfg(feature = "metrics")]
     uptime: Option<Instant>,
     allow_list: Vec<NodeId>,
+    /// Peers currently being used for a sync operation.
+    ///
+    /// Each entry is an `Arc<NodeId>`; when a caller registers a peer via `AddPeerToSyncList`
+    /// they receive an `Arc<NodeId>` clone and this list keeps its own. When the caller drops
+    /// their handle the list entry's strong-count drops to 1, and the manager prunes such
+    /// entries on the next access (see `sweep_sync_peers`). While an entry has strong-count >= 2
+    /// it signals "in use by sync" and other subsystems should not proactively disconnect the
+    /// peer (see DhtConnectivity::handle_new_peer_connected).
+    sync_peers: Vec<Arc<NodeId>>,
     proactive_dialer: ProactiveDialer,
     seeds: Vec<NodeId>,
 }
@@ -267,6 +273,7 @@ impl ConnectivityManagerActor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_request(&mut self, req: ConnectivityRequest) {
         #[allow(clippy::enum_glob_use)]
         use ConnectivityRequest::*;
@@ -339,6 +346,15 @@ impl ConnectivityManagerActor {
             GetAllowList(reply) => {
                 let allow_list = self.allow_list.clone();
                 let _result = reply.send(allow_list);
+            },
+            AddPeerToSyncList(node_id, reply) => {
+                let handle = self.acquire_sync_peer_handle(node_id);
+                let _result = reply.send(handle);
+            },
+            GetSyncPeerList(reply) => {
+                self.sweep_sync_peers();
+                let list = self.sync_peers.iter().map(|p| (**p).clone()).collect();
+                let _result = reply.send(list);
             },
             GetSeeds(reply) => {
                 let seeds = self.peer_manager.get_seed_peers().await.unwrap_or_else(|e| {
@@ -468,6 +484,8 @@ impl ConnectivityManagerActor {
         );
 
         self.clean_connection_pool();
+        self.disconnect_seed_peers(task_id).await;
+
         if self.config.is_connection_reaping_enabled {
             self.reap_inactive_connections(task_id).await;
         }
@@ -511,25 +529,25 @@ impl ConnectivityManagerActor {
     async fn maintain_n_closest_peer_connections_only(&mut self, threshold: usize, task_id: u64) {
         let start = Instant::now();
         // Select all active peer connections (that are communication nodes) with health-aware selection
-        let selection = ConnectivitySelection::healthy_closest_to(
-            self.node_identity.node_id().clone(),
-            self.pool.count_connected_nodes(),
-            vec![],
-        );
+        let selection = ConnectivitySelection::random_nodes(self.pool.count_connected_nodes(), vec![]);
         let mut connections = match self.select_connections_with_health(selection) {
             Ok(peers) => peers,
             Err(e) => {
                 warn!(
                     target: LOG_TARGET,
-                    "Connectivity error trying to maintain {threshold} closest peers ({task_id}) ({e:?})",
+                    "Connectivity error trying to maintain {threshold} peer connections ({task_id}) ({e:?})",
                 );
                 return;
             },
         };
         let num_connections = connections.len();
 
-        // Remove peers that are on the allow list
-        connections.retain(|conn| !self.allow_list.contains(conn.peer_node_id()));
+        // Remove peers that are on the allow list or are currently in use for sync
+        self.sweep_sync_peers();
+        connections.retain(|conn| {
+            !self.allow_list.contains(conn.peer_node_id()) &&
+                !self.sync_peers.iter().any(|p| **p == *conn.peer_node_id())
+        });
         debug!(
             target: LOG_TARGET,
             "minimize_connections: ({}) Filtered peers: {}, Handles: {}",
@@ -543,7 +561,7 @@ impl ConnectivityManagerActor {
         for conn in connections.iter_mut().skip(threshold) {
             debug!(
                 target: LOG_TARGET,
-                "minimize_connections: ({}) Disconnecting '{}' because the node is not among the {} closest peers",
+                "minimize_connections: ({}) Disconnecting '{}' because the node exceeds the {} connection threshold",
                 task_id,
                 conn.peer_node_id(),
                 threshold
@@ -552,7 +570,7 @@ impl ConnectivityManagerActor {
                 conn,
                 Minimized::Yes,
                 Some(task_id),
-                "ConnectivityManagerActor maintain closest",
+                "ConnectivityManagerActor maintain connections",
             )
             .await
             {
@@ -640,6 +658,88 @@ impl ConnectivityManagerActor {
                 len,
                 start.elapsed()
             );
+        }
+    }
+
+    async fn refresh_seeds_list(&mut self) {
+        match self.peer_manager.get_seed_peers().await {
+            Ok(seeds) => {
+                self.seeds = seeds.into_iter().map(|p| p.node_id).collect();
+            },
+            Err(err) => {
+                error!(target: LOG_TARGET, "Failed to fetch seed peers: {}", err);
+            },
+        }
+    }
+
+    async fn disconnect_seed_peers(&mut self, task_id: u64) {
+        self.refresh_seeds_list().await;
+
+        if self.seeds.is_empty() {
+            return;
+        }
+
+        // Identify seeds that are too old
+        let mut seeds_to_disconnect = Vec::new();
+        for seed_node_id in &self.seeds {
+            if let Some(conn) = self.pool.get_connection(seed_node_id) &&
+                conn.is_connected() &&
+                conn.age() > self.config.max_seed_peer_age
+            {
+                seeds_to_disconnect.push(conn.clone());
+            }
+        }
+
+        if seeds_to_disconnect.is_empty() {
+            return;
+        }
+
+        debug!(
+            target: LOG_TARGET,
+            "({}) Found {} seed peer(s) eligible for cleanup", task_id, seeds_to_disconnect.len()
+        );
+
+        for mut conn in seeds_to_disconnect {
+            if self.pool.count_connected_nodes() <= self.config.min_connectivity {
+                debug!(
+                    target: LOG_TARGET,
+                    "({}) SKIPPING seed disconnect for '{}'. Connected Nodes ({}) <= Min ({})",
+                    task_id,
+                    conn.peer_node_id().short_str(),
+                    self.pool.count_connected_nodes(),
+                    self.config.min_connectivity
+                );
+                break;
+            }
+
+            debug!(
+                target: LOG_TARGET,
+                "({}) Disconnecting seed peer '{}' ...",
+                task_id,
+                conn.peer_node_id().short_str()
+            );
+
+            match disconnect_with_timeout(
+                &mut conn,
+                Minimized::Yes,
+                Some(task_id),
+                "ConnectivityManagerActor disconnect seed",
+            )
+            .await
+            {
+                Ok(_) => {
+                    self.pool.remove(conn.peer_node_id());
+                },
+                Err(err) => {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Seed peer '{}' already disconnected ({:?}). Error: {:?}",
+                        conn.peer_node_id().short_str(),
+                        task_id,
+                        err
+                    );
+                },
+            }
         }
     }
 
@@ -741,26 +841,26 @@ impl ConnectivityManagerActor {
                 num_failed
             );
 
-            if let Some(peer) = self.peer_manager.find_by_node_id(node_id).await? {
-                if !peer.is_banned() &&
+            if let Some(peer) = self.peer_manager.find_by_node_id(node_id).await? &&
+                !peer.is_banned() &&
+                peer
+                    .last_seen_since()
+                    // Haven't seen them in expire_peer_last_seen_duration
+                    .map(|t| t > self.config.expire_peer_last_seen_duration)
+                    // Or don't delete if never seen
+                    .unwrap_or(false)
+            {
+                debug!(
+                    target: LOG_TARGET,
+                    "Peer `{}` was marked as offline after {} attempts (last seen: {}). Removing peer from peer \
+                     list",
+                    node_id,
+                    num_failed,
                     peer.last_seen_since()
-                        // Haven't seen them in expire_peer_last_seen_duration
-                        .map(|t| t > self.config.expire_peer_last_seen_duration)
-                        // Or don't delete if never seen
-                        .unwrap_or(false)
-                {
-                    debug!(
-                        target: LOG_TARGET,
-                        "Peer `{}` was marked as offline after {} attempts (last seen: {}). Removing peer from peer \
-                         list",
-                        node_id,
-                        num_failed,
-                        peer.last_seen_since()
-                            .map(|d| format!("{}s ago", d.as_secs()))
-                            .unwrap_or_else(|| "Never".to_string()),
-                    );
-                    self.peer_manager.soft_delete_peer(node_id).await?;
-                }
+                        .map(|d| format!("{}s ago", d.as_secs()))
+                        .unwrap_or_else(|| "Never".to_string()),
+                );
+                self.peer_manager.soft_delete_peer(node_id).await?;
             }
         }
 
@@ -799,15 +899,15 @@ impl ConnectivityManagerActor {
                 }
             },
             PeerDisconnected(id, node_id, _minimized) => {
-                if let Some(conn) = self.pool.get_connection(node_id) {
-                    if conn.id() != *id {
-                        debug!(
-                            target: LOG_TARGET,
-                            "Ignoring peer disconnected event for stale peer connection (id: {id}) for peer '{node_id}'"
+                if let Some(conn) = self.pool.get_connection(node_id) &&
+                    conn.id() != *id
+                {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Ignoring peer disconnected event for stale peer connection (id: {id}) for peer '{node_id}'"
 
-                        );
-                        return Ok(());
-                    }
+                    );
+                    return Ok(());
                 }
             },
             PeerViolation { peer_node_id, details } => {
@@ -851,15 +951,16 @@ impl ConnectivityManagerActor {
                 (node_id, ConnectionStatus::Failed, None)
             },
             PeerConnectFailed(node_id, ConnectionManagerError::DialCancelled) => {
-                if let Some(conn) = self.pool.get_connection(node_id) {
-                    if conn.is_connected() && conn.direction().is_inbound() {
-                        debug!(
-                            target: LOG_TARGET,
-                            "Ignoring DialCancelled({node_id}) event because an inbound connection already exists"
-                        );
+                if let Some(conn) = self.pool.get_connection(node_id) &&
+                    conn.is_connected() &&
+                    conn.direction().is_inbound()
+                {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Ignoring DialCancelled({node_id}) event because an inbound connection already exists"
+                    );
 
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
                 debug!(
                     target: LOG_TARGET,
@@ -1155,6 +1256,32 @@ impl ConnectivityManagerActor {
         let _result = self.event_tx.send(event);
     }
 
+    /// Drop sync-peer entries whose caller-side handles have all been released.
+    ///
+    /// An entry with `Arc::strong_count == 1` means only this manager still holds a reference,
+    /// so no active sync is using the peer. Pruning is run lazily on every sync-list access to
+    /// avoid keeping a timer purely for this list.
+    fn sweep_sync_peers(&mut self) {
+        self.sync_peers.retain(|p| Arc::strong_count(p) > 1);
+    }
+
+    /// Register `node_id` on the sync-peer list and return a shared `Arc<NodeId>` handle.
+    ///
+    /// If the peer is already registered, the existing `Arc` is cloned and returned (so all
+    /// callers interested in the same peer share the same handle). Otherwise a fresh `Arc` is
+    /// created, one clone is retained by the manager and another is returned. The caller must
+    /// keep the returned handle alive for as long as the peer should remain protected; dropping
+    /// it signals to the manager that the peer is no longer in use for sync.
+    fn acquire_sync_peer_handle(&mut self, node_id: NodeId) -> Arc<NodeId> {
+        self.sweep_sync_peers();
+        if let Some(existing) = self.sync_peers.iter().find(|p| ***p == node_id) {
+            return existing.clone();
+        }
+        let handle = Arc::new(node_id);
+        self.sync_peers.push(handle.clone());
+        handle
+    }
+
     async fn ban_peer(
         &mut self,
         node_id: &NodeId,
@@ -1204,27 +1331,24 @@ impl ConnectivityManagerActor {
         // Update circuit breaker metrics
         self.update_circuit_breaker_metrics();
 
+        self.refresh_seeds_list().await;
+
+        // Determine if we should exclude seeds.
+        let excluded_peers = if self.pool.count_connected_nodes() < self.config.min_connectivity {
+            debug!(target: LOG_TARGET, "({}) Critical connectivity level ({} < {}). Allowing proactive dialer to retry Seed Nodes.",
+                task_id,
+                self.pool.count_connected_nodes(),
+                self.config.min_connectivity
+            );
+            vec![]
+        } else {
+            self.seeds.clone()
+        };
+
         // Execute proactive dialing logic
-        if self.seeds.is_empty() {
-            self.seeds = self
-                .peer_manager
-                .get_seed_peers()
-                .await
-                .inspect_err(|err| {
-                    warn!(
-                        target: LOG_TARGET,
-                        "Failed to get seed peers from PeerManager, using empty list for proactive dialing, seed peers \
-                        will not be excluded as a first pass. ({})", err
-                    );
-                })
-                .unwrap_or(vec![])
-                .iter()
-                .map(|s| s.node_id.clone())
-                .collect();
-        }
         match self
             .proactive_dialer
-            .execute_proactive_dialing(&self.pool, &self.connection_stats, &self.seeds, task_id)
+            .execute_proactive_dialing(&self.pool, &self.connection_stats, &excluded_peers, task_id)
             .await
         {
             Ok(dialed_count) => {

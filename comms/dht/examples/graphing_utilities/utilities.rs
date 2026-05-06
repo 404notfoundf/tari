@@ -32,8 +32,8 @@ use tari_comms::{connectivity::ConnectivitySelection, peer_manager::NodeId};
 use tari_test_utils::streams::convert_unbounded_mpsc_to_stream;
 
 use crate::memory_net::{
-    utilities::{get_short_name, NodeEventRx, TestNode},
     DrainBurst,
+    utilities::{NodeEventRx, TestNode, get_short_name},
 };
 
 const TEMP_GRAPH_OUTPUT_DIR: &str = "/tmp/memorynet_temp";
@@ -94,35 +94,25 @@ pub async fn network_graph_snapshot(
 
         let node_index = node_indices.get(&node_id).expect("Can't find Node Index 1");
         for peer in &connected_peers {
-            let distance = node_id.distance(peer.peer_node_id());
             let peer_node_index = node_indices.get(peer.peer_node_id()).expect("Can't find Node Index 2");
 
-            graph.add_edge(
-                node_index.to_owned(),
-                peer_node_index.to_owned(),
-                distance.as_u128().to_string(),
-            );
+            graph.add_edge(node_index.to_owned(), peer_node_index.to_owned(), String::new());
         }
         if let Some(n) = num_neighbours {
             let connected_neighbours = node
                 .comms
                 .connectivity()
-                .select_connections(ConnectivitySelection::closest_to(node_id.clone(), n, vec![]))
+                .select_connections(ConnectivitySelection::random_nodes(n, vec![]))
                 .await
                 .expect("Can't get connections");
 
             let node_index = node_indices.get(&node_id).expect("Can't find Node Index 1");
             for neighbour in &connected_neighbours {
-                let distance = node_id.distance(neighbour.peer_node_id());
                 let peer_node_index = node_indices
                     .get(neighbour.peer_node_id())
                     .expect("Can't find Node Index 2");
 
-                neighbour_graph.add_edge(
-                    node_index.to_owned(),
-                    peer_node_index.to_owned(),
-                    distance.as_u128().to_string(),
-                );
+                neighbour_graph.add_edge(node_index.to_owned(), peer_node_index.to_owned(), String::new());
             }
         }
     }
@@ -244,11 +234,7 @@ pub async fn create_message_propagation_graphs(
                 .node_references()
                 .find_map(
                     |(index, weight)| {
-                        if weight == &message_tree[n] {
-                            Some(index)
-                        } else {
-                            None
-                        }
+                        if weight == &message_tree[n] { Some(index) } else { None }
                     },
                 )
                 .expect("Should be able to find node2");

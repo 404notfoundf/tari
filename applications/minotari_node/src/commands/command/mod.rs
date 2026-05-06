@@ -47,10 +47,12 @@ mod list_reorgs;
 mod list_validator_nodes;
 mod period_stats;
 mod ping_peer;
+mod print_env;
 mod quit;
 mod reset_offline_peers;
 mod rewind_blockchain;
 mod search_kernel;
+mod search_output;
 mod search_payref;
 mod search_utxo;
 mod status;
@@ -66,20 +68,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use async_trait::async_trait;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use strum::{EnumVariantNames, VariantNames};
 use tari_comms::{
-    peer_manager::{Peer, PeerManagerError},
-    protocol::rpc::RpcServerHandle,
     CommsNode,
     NodeIdentity,
+    peer_manager::{Peer, PeerManagerError},
+    protocol::rpc::RpcServerHandle,
 };
 use tari_comms_dht::{DhtDiscoveryRequester, MetricsCollectorHandle};
 use tari_core::{
-    base_node::{state_machine_service::states::StatusInfo, LocalNodeCommsInterface},
-    chain_storage::{async_db::AsyncBlockchainDb, LMDBDatabase},
+    base_node::{LocalNodeCommsInterface, state_machine_service::states::StatusInfo},
+    chain_storage::{LMDBDatabase, async_db::AsyncBlockchainDb},
     consensus::BaseNodeConsensusManager,
     mempool::service::LocalMempoolService,
 };
@@ -90,9 +92,9 @@ use tokio::{sync::watch, time};
 pub use watch_command::WatchCommand;
 
 use crate::{
+    ApplicationConfig,
     builder::BaseNodeContext,
     commands::{nom_parser::ParsedCommand, parser::FromHex},
-    ApplicationConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -139,6 +141,7 @@ pub enum Command {
     DiscoverPeer(discover_peer::Args),
     GetBlock(get_block::Args),
     SearchUtxo(search_utxo::Args),
+    SearchOutput(search_output::Args),
     SearchPayref(search_payref::Args),
     SearchKernel(search_kernel::Args),
     GetMempoolStats(get_mempool_stats::Args),
@@ -152,6 +155,7 @@ pub enum Command {
     Quit(quit::Args),
     Exit(quit::Args),
     Watch(watch_command::Args),
+    PrintEnv(print_env::Args),
 }
 
 impl Command {
@@ -181,10 +185,12 @@ pub struct CommandContext {
     pub software_updater: SoftwareUpdaterHandle,
     last_time_full: Instant,
     pub shutdown: Shutdown,
+    /// Config property overrides provided via `-p` args on the command line.
+    pub config_property_overrides: Vec<(String, String)>,
 }
 
 impl CommandContext {
-    pub fn new(ctx: &BaseNodeContext, shutdown: Shutdown) -> Self {
+    pub fn new(ctx: &BaseNodeContext, shutdown: Shutdown, config_property_overrides: Vec<(String, String)>) -> Self {
         Self {
             config: ctx.config(),
             consensus_rules: ctx.consensus_rules().clone(),
@@ -201,6 +207,7 @@ impl CommandContext {
             software_updater: ctx.software_updater(),
             last_time_full: Instant::now(),
             shutdown,
+            config_property_overrides,
         }
     }
 
@@ -238,7 +245,6 @@ impl CommandContext {
                 Command::GetBlock(_) |
                 Command::ListHeaders(_) |
                 Command::HeaderStats(_) |
-                Command::SearchUtxo(_) |
                 Command::SearchPayref(_) |
                 Command::SearchKernel(_) |
                 Command::GetMempoolStats(_) |
@@ -248,12 +254,15 @@ impl CommandContext {
                 Command::Watch(_) |
                 Command::ListValidatorNodes(_) |
                 Command::CreateTlsCerts(_) |
+                Command::PrintEnv(_) |
                 Command::Quit(_) |
+                Command::SearchOutput(_) |
                 Command::Exit(_) => 30,
                 // This test can potentially take a longer time and should be allowed to run longer
                 Command::TestPeerLiveness(_) => 240,
                 // These commands involve intense blockchain db operations and needs a lot of time to complete
                 Command::CheckDb(_) | Command::PeriodStats(_) | Command::RewindBlockchain(_) => 600,
+                Command::SearchUtxo(_) => 1200,
             };
             let fut = self.handle_command(args.command);
             if let Err(e) = time::timeout(Duration::from_secs(time_out), fut).await? {
@@ -308,6 +317,7 @@ impl HandleCommand<Command> for CommandContext {
             Command::DiscoverPeer(args) => self.handle_command(args).await,
             Command::GetBlock(args) => self.handle_command(args).await,
             Command::SearchUtxo(args) => self.handle_command(args).await,
+            Command::SearchOutput(args) => self.handle_command(args).await,
             Command::SearchPayref(args) => self.handle_command(args).await,
             Command::SearchKernel(args) => self.handle_command(args).await,
             Command::ListConnections(args) => self.handle_command(args).await,
@@ -320,6 +330,7 @@ impl HandleCommand<Command> for CommandContext {
             Command::Watch(args) => self.handle_command(args).await,
             Command::ListValidatorNodes(args) => self.handle_command(args).await,
             Command::CreateTlsCerts(args) => self.handle_command(args).await,
+            Command::PrintEnv(args) => self.handle_command(args).await,
         }
     }
 }
@@ -349,7 +360,7 @@ impl CommandContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypeOrHex<T> {
     Type(T),
     Hex(FromHex<Vec<u8>>),

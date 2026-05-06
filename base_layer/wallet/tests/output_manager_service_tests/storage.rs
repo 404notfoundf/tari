@@ -24,30 +24,30 @@
 use std::convert::TryFrom;
 
 use minotari_wallet::output_manager_service::{
+    RangeLimit,
+    UtxoSelectionCriteria,
     error::OutputManagerStorageError,
     service::Balance,
     storage::{
+        OutputSource,
+        OutputStatus,
         database::{OutputManagerBackend, OutputManagerDatabase},
         models::DbWalletOutput,
         sqlite_db::{OutputManagerSqliteDatabase, ReceivedOutputInfoForBatch, SpentOutputInfoForBatch},
-        OutputSource,
-        OutputStatus,
     },
-    RangeLimit,
-    UtxoSelectionCriteria,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use tari_common_types::{
     transaction::TxId,
     types::{FixedHash, HashOutput, PrivateKey},
 };
 use tari_crypto::keys::SecretKey;
-use tari_transaction_components::{transaction_components::OutputFeatures, MicroMinotari};
+use tari_transaction_components::{MicroMinotari, transaction_components::OutputFeatures};
 use tari_transaction_key_manager::legacy_key_manager::{
-    create_new_random_key_manager,
     LegacyTransactionKeyManagerInterface,
+    create_new_random_key_manager,
 };
-use tari_utilities::{hex::Hex, ByteArray};
+use tari_utilities::{ByteArray, hex::Hex};
 
 use crate::support::{data::get_temp_sqlite_database_connection, utils::make_input};
 
@@ -74,18 +74,33 @@ pub async fn test_db_backend<T: OutputManagerBackend + 'static>(backend: T) {
         unspent.push((kmo.hash, true));
         unspent_outputs.push(kmo);
     }
+    let uo = make_input(
+        &mut OsRng,
+        MicroMinotari::from(100 + OsRng.next_u64() % 1000),
+        &OutputFeatures::default(),
+        key_manager.key_manager(),
+    );
+    let tip_value = uo.value();
+    let mut kmo = DbWalletOutput::from_wallet_output(uo, None, OutputSource::Standard, None, None);
+    let mut features = kmo.wallet_output.features().clone();
+    features.maturity = u64::MAX;
+    kmo.wallet_output.set_features(features);
+    db.add_unspent_output(kmo.clone(), &key_manager).unwrap();
+    unspent.push((kmo.hash, true));
+    unspent_outputs.push(kmo);
+
     db.mark_outputs_as_unspent(unspent).unwrap();
 
     let time_locked_outputs = db.get_timelocked_outputs(3, &key_manager).unwrap();
-    assert_eq!(time_locked_outputs.len(), 1);
+    assert_eq!(time_locked_outputs.len(), 2);
     assert_eq!(unspent_outputs[4], time_locked_outputs[0]);
     let time_locked_outputs = db.get_timelocked_outputs(4, &key_manager).unwrap();
-    assert_eq!(time_locked_outputs.len(), 0);
-    let time_locked_balance = unspent_outputs[4].wallet_output.value();
+    assert_eq!(time_locked_outputs.len(), 1);
+    let time_locked_balance = unspent_outputs[4].wallet_output.value() + tip_value;
 
     for i in 0..4usize {
         let balance = db.get_balance(Some(i as u64)).unwrap();
-        let mut sum = MicroMinotari::from(0);
+        let mut sum = tip_value;
         for output in unspent_outputs.iter().take(5).skip(i + 1) {
             sum += output.wallet_output.value();
         }
@@ -312,7 +327,7 @@ pub async fn test_db_backend<T: OutputManagerBackend + 'static>(backend: T) {
     assert_eq!(spent_outputs.len(), 4);
 
     let unconfirmed_outputs = db.fetch_unconfirmed_outputs(&key_manager).unwrap();
-    assert_eq!(unconfirmed_outputs.len(), 22);
+    assert_eq!(unconfirmed_outputs.len(), 23);
 
     let mined_unspent_outputs = db.fetch_mined_unspent_outputs(&key_manager).unwrap();
     assert_eq!(mined_unspent_outputs.len(), 4);
@@ -330,13 +345,15 @@ pub async fn test_db_backend<T: OutputManagerBackend + 'static>(backend: T) {
     assert_eq!(mined_unspent_outputs.len(), 3);
 
     let unspent_outputs = db.fetch_sorted_unspent_outputs(&key_manager).unwrap();
-    assert_eq!(unspent_outputs.len(), 6);
+    assert_eq!(unspent_outputs.len(), 7);
 
     let last_mined_output = db.get_last_mined_output(&key_manager).unwrap().unwrap();
-    assert!(pending_txs[1]
-        .outputs_to_be_received
-        .iter()
-        .any(|o| o.commitment == last_mined_output.commitment));
+    assert!(
+        pending_txs[1]
+            .outputs_to_be_received
+            .iter()
+            .any(|o| o.commitment == last_mined_output.commitment)
+    );
 
     let last_spent_output = db.get_last_spent_output(&key_manager).unwrap().unwrap();
     assert_eq!(
@@ -356,7 +373,7 @@ pub async fn test_db_backend<T: OutputManagerBackend + 'static>(backend: T) {
     db.cancel_pending_transaction_outputs(pending_txs[2].tx_id).unwrap();
 
     let unspent_outputs = db.fetch_sorted_unspent_outputs(&key_manager).unwrap();
-    assert_eq!(unspent_outputs.len(), 10);
+    assert_eq!(unspent_outputs.len(), 11);
 }
 
 #[tokio::test]
@@ -717,9 +734,10 @@ pub async fn test_raw_custom_queries_regression() {
         confirmed: true,
         mined_timestamp: 0,
     });
-    assert!(db
-        .set_received_outputs_mined_height_and_statuses(updates_info_with_unknown)
-        .is_err());
+    assert!(
+        db.set_received_outputs_mined_height_and_statuses(updates_info_with_unknown)
+            .is_err()
+    );
 
     db.set_received_outputs_mined_height_and_statuses(updates_info).unwrap();
 

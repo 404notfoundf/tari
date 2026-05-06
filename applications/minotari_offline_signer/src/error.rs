@@ -1,4 +1,4 @@
-// Copyright 2023. The Tari Project
+// Copyright 2025. The Tari Project
 //
 // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
 // following conditions are met:
@@ -19,9 +19,35 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-use tari_comms::{multiaddr::Multiaddr, transports::MemoryTransport};
 
-pub fn get_next_memory_address() -> Multiaddr {
-    let port = MemoryTransport::acquire_next_memsocket_port();
-    format!("/memory/{port}").parse().unwrap()
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum OfflineSignerError {
+    #[error("Invalid key: {0}")]
+    InvalidKey(String),
+
+    #[error("Failed to parse transaction: {0}")]
+    ParseError(String),
+
+    #[error("Key manager error: {0}")]
+    KeyManagerError(String),
+
+    #[error("Signing error: {0}")]
+    SigningError(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("Keystore error: {0}")]
+    KeystoreError(String),
+
+    #[error("Encryption error: {0}")]
+    EncryptionError(String),
+
+    #[error("Decryption error: {0}")]
+    DecryptionError(String),
+
+    #[error("Not initialized: {0}")]
+    NotInitialized(String),
 }

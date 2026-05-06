@@ -22,18 +22,20 @@
 
 use std::{collections::HashSet, convert::TryInto};
 
-use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use log::*;
 use tari_comms::{
+    Minimized,
+    PeerConnection,
     connectivity::ConnectivityError,
-    peer_manager::{NodeDistance, NodeId, Peer, PeerFeatures, PeerId},
+    peer_manager::{NodeId, Peer, PeerId},
     protocol::rpc::{ClientStreaming, RpcStatus},
     types::CommsPublicKey,
-    PeerConnection,
 };
 use tari_utilities::hex::Hex;
 
 use super::{
+    NetworkDiscoveryError,
     state_machine::{
         DhtNetworkDiscoveryRoundInfo,
         DiscoveryParams,
@@ -41,15 +43,14 @@ use super::{
         NetworkDiscoveryContext,
         StateEvent,
     },
-    NetworkDiscoveryError,
 };
 use crate::{
+    DhtConfig,
     actor::OffenceSeverity,
     peer_validator::PeerValidator,
     proto::rpc::{GetPeersRequest, GetPeersResponse},
     rpc,
     rpc::{DhtClient, UnvalidatedPeerInfo},
-    DhtConfig,
 };
 
 const LOG_TARGET: &str = "comms::dht::network_discovery";
@@ -59,7 +60,6 @@ pub(super) struct Discovering {
     params: DiscoveryParams,
     context: NetworkDiscoveryContext,
     stats: DhtNetworkDiscoveryRoundInfo,
-    neighbourhood_threshold: NodeDistance,
 }
 
 impl Discovering {
@@ -68,7 +68,6 @@ impl Discovering {
             params,
             context,
             stats: Default::default(),
-            neighbourhood_threshold: NodeDistance::max_distance(),
         }
     }
 
@@ -77,30 +76,10 @@ impl Discovering {
             return Err(NetworkDiscoveryError::NoSyncPeers);
         }
 
-        // The neighbourhood threshold is used to determine how many new neighbours we're receiving from a peer or
-        // peers. When "bootstrapping" from a seed node, receiving many new neighbours is expected and acceptable.
-        // However during a normal non-bootstrap sync receiving all new neighbours is a bit "fishy" and should be
-        // treated as suspicious.
-        self.neighbourhood_threshold = self
-            .calc_region_threshold(self.config().num_neighbouring_nodes, PeerFeatures::COMMUNICATION_NODE)
-            .await?;
-
         // Set discovery phase and rounds information
         self.stats.phase = DiscoveryPhase::General;
 
         Ok(())
-    }
-
-    async fn calc_region_threshold(
-        &self,
-        num_neighbouring_nodes: usize,
-        peer_features: PeerFeatures,
-    ) -> Result<NodeDistance, NetworkDiscoveryError> {
-        Ok(self
-            .context
-            .peer_manager
-            .calc_region_threshold(num_neighbouring_nodes, peer_features)
-            .await?)
     }
 
     async fn find_by_public_key(&self, public_key: CommsPublicKey) -> Result<Option<Peer>, NetworkDiscoveryError> {
@@ -144,29 +123,34 @@ impl Discovering {
 
     async fn request_from_peers(&mut self, mut conn: PeerConnection) -> Result<(), NetworkDiscoveryError> {
         let rpc_connect_timeout = self.config().network_discovery.bootstrap_rpc_connect_timeout;
-        let client = tokio::time::timeout(rpc_connect_timeout, conn.connect_rpc::<DhtClient>())
-            .await
-            .map_err(|_| {
-                error!(
-                    target: LOG_TARGET,
-                    "Discovering: RPC connect_rpc to sync peer '{}' timed out after {:?}",
-                    conn.peer_node_id(),
-                    rpc_connect_timeout,
-                );
-                NetworkDiscoveryError::Timeout {
-                    operation: "connect_rpc".to_string(),
-                    peer: conn.peer_node_id().to_hex(),
-                    duration: format!("{rpc_connect_timeout:.2?}"),
-                }
-            })?
-            .inspect_err(|e| {
+        let client = match tokio::time::timeout(rpc_connect_timeout, conn.connect_rpc::<DhtClient>()).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
                 error!(
                     target: LOG_TARGET,
                     "Discovering: Failed to connect RPC client to sync peer {}: {}",
                     conn.peer_node_id(),
                     e
                 );
-            })?;
+                let _unused = conn.disconnect(Minimized::Yes, "Discovering RPC connect failed").await;
+                return Err(e.into());
+            },
+            Err(_) => {
+                // the peer most likely is not online or has an old address.
+                debug!(
+                    target: LOG_TARGET,
+                    "Discovering: RPC connect_rpc to sync peer '{}' timed out after {:?}",
+                    conn.peer_node_id(),
+                    rpc_connect_timeout,
+                );
+                let _unused = conn.disconnect(Minimized::Yes, "Discovering RPC connect timeout").await;
+                return Err(NetworkDiscoveryError::Timeout {
+                    operation: "connect_rpc".to_string(),
+                    peer: conn.peer_node_id().to_hex(),
+                    duration: format!("{rpc_connect_timeout:.2?}"),
+                });
+            },
+        };
 
         trace!(
             target: LOG_TARGET,
@@ -182,6 +166,7 @@ impl Discovering {
         );
         let result = self.request_peers(peer_node_id, client).await;
         self.ban_on_offence(peer_node_id.clone(), result).await?;
+        let _unused = conn.disconnect(Minimized::Yes, "Discovering sync complete").await;
 
         Ok(())
     }

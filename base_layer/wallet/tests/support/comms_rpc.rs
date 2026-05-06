@@ -33,8 +33,8 @@ use std::{
 
 use tari_common_types::types::{CompressedSignature, FixedHash, HashOutput};
 use tari_comms::{
-    protocol::rpc::{NamedProtocolService, Request, Response, RpcClient, RpcStatus, Streaming},
     PeerConnection,
+    protocol::rpc::{NamedProtocolService, Request, Response, RpcClient, RpcStatus, Streaming},
 };
 use tari_core::{
     base_node::{
@@ -747,7 +747,7 @@ impl BaseNodeWalletService for BaseNodeWalletRpcMockService {
         let block_lock = acquire_lock!(self.state.blocks);
 
         let mut headers = (*block_lock).values().cloned().collect::<Vec<BlockHeader>>();
-        headers.sort_by(|a, b| b.height.cmp(&a.height));
+        headers.sort_by_key(|b| std::cmp::Reverse(b.height));
 
         let mut found_height = 0;
         for h in &headers {
@@ -779,7 +779,7 @@ impl BaseNodeWalletService for BaseNodeWalletRpcMockService {
 
         let block_lock = acquire_lock!(self.state.utxos_by_block);
         let mut blocks = (*block_lock).clone();
-        blocks.sort_by(|a, b| a.height.cmp(&b.height));
+        blocks.sort_by_key(|a| a.height);
 
         let start_index = blocks.iter().position(|b| b.header_hash == start_header_hash);
         let end_index = blocks.iter().position(|b| b.header_hash == end_header_hash);
@@ -870,7 +870,7 @@ mod test {
     use tari_common_types::types::PrivateKey;
     use tari_comms::{
         peer_manager::PeerFeatures,
-        protocol::rpc::{mock::MockRpcServer, NamedProtocolService},
+        protocol::rpc::{NamedProtocolService, mock::MockRpcServer},
         test_utils::node_identity::build_node_identity,
     };
     use tari_core::{
@@ -910,10 +910,12 @@ mod test {
             .await
             .unwrap();
 
-        assert!(service_state
-            .wait_pop_submit_transaction_calls(1, Duration::from_millis(300))
-            .await
-            .is_err());
+        assert!(
+            service_state
+                .wait_pop_submit_transaction_calls(1, Duration::from_millis(300))
+                .await
+                .is_err()
+        );
 
         service_state.set_submit_transaction_response(TxSubmissionResponse {
             accepted: false,

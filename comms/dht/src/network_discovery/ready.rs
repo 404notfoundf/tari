@@ -21,13 +21,13 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use log::*;
-use tari_comms::peer_manager::{Peer, PeerFeatures, PeerFlags, STALE_PEER_THRESHOLD_DURATION};
+use tari_comms::peer_manager::{Peer, PeerFlags};
 
 use super::{
-    state_machine::{DiscoveryParams, NetworkDiscoveryContext, StateEvent},
     NetworkDiscoveryError,
+    state_machine::{DiscoveryParams, NetworkDiscoveryContext, StateEvent},
 };
-use crate::{network_discovery::DhtNetworkDiscoveryRoundInfo, DhtConfig};
+use crate::{DhtConfig, network_discovery::DhtNetworkDiscoveryRoundInfo};
 
 const LOG_TARGET: &str = "comms::dht::network_discovery::ready";
 
@@ -40,50 +40,25 @@ pub(super) struct DiscoveryReady {
 // Helper function to select peers for discovery
 async fn select_peers_for_discovery_round(
     context: &NetworkDiscoveryContext,
-    last_round_info: Option<&DhtNetworkDiscoveryRoundInfo>,
+    _last_round_info: Option<&DhtNetworkDiscoveryRoundInfo>,
     excluded_peers: &[tari_comms::peer_manager::NodeId],
     config: &DhtConfig,
 ) -> Result<Vec<tari_comms::peer_manager::NodeId>, NetworkDiscoveryError> {
-    let peers_to_request_from: Vec<Peer> = match last_round_info {
-        Some(stats) if stats.has_new_peers() => {
-            debug!(
-                target: LOG_TARGET,
-                "Last peer sync round found {} new peer(s). Selecting peers for discovery based on a 'closest' strategy.",
-                stats.num_new_peers,
-            );
-            context
-                .peer_manager
-                .closest_n_active_peers(
-                    context.node_identity.node_id(),
-                    config.network_discovery.max_sync_peers,
-                    excluded_peers,
-                    Some(PeerFeatures::COMMUNICATION_NODE),
-                    Some(PeerFlags::NONE),
-                    Some(STALE_PEER_THRESHOLD_DURATION),
-                    true,
-                    None,
-                    true,
-                )
-                .await?
-        },
-        _ => {
-            // Default to random peers if no new peers from last round, or no last round info
-            debug!(
-                target: LOG_TARGET,
-                "Selecting {} random peers for discovery (last round info available: {}, new peers in last round: {}).",
+    let peers_to_request_from: Vec<Peer> = {
+        debug!(
+            target: LOG_TARGET,
+            "Selecting {} random peers for discovery.",
+            config.network_discovery.max_sync_peers,
+        );
+        context
+            .peer_manager
+            .random_peers(
                 config.network_discovery.max_sync_peers,
-                last_round_info.is_some(),
-                last_round_info.map(|s| s.has_new_peers()).unwrap_or(false),
-            );
-            context
-                .peer_manager
-                .random_peers(
-                    config.network_discovery.max_sync_peers,
-                    excluded_peers,
-                    Some(PeerFlags::NONE),
-                )
-                .await?
-        },
+                excluded_peers,
+                Some(PeerFlags::NONE),
+                true,
+            )
+            .await?
     };
     Ok(peers_to_request_from.into_iter().map(|p| p.node_id).collect::<Vec<_>>())
 }

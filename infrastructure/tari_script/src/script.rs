@@ -20,7 +20,7 @@ use std::{cmp::Ordering, collections::HashSet, fmt, io, ops::Deref};
 
 use blake2::Blake2b;
 use borsh::{BorshDeserialize, BorshSerialize};
-use digest::{consts::U32, Digest};
+use digest::{Digest, consts::U32};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use sha2::Sha256;
 use sha3::Sha3_256;
@@ -31,13 +31,11 @@ use tari_crypto::{
 };
 use tari_max_size::MaxSizeVec;
 use tari_utilities::{
-    hex::{from_hex, to_hex, Hex, HexError},
     ByteArray,
+    hex::{Hex, HexError, from_hex, to_hex},
 };
 
 use crate::{
-    op_codes::Message,
-    slice_to_hash,
     CompressedCheckSigSchnorrSignature,
     ExecutionStack,
     HashValue,
@@ -45,6 +43,8 @@ use crate::{
     ScriptContext,
     ScriptError,
     StackItem,
+    op_codes::Message,
+    slice_to_hash,
 };
 
 #[macro_export]
@@ -103,6 +103,10 @@ impl TariScript {
     pub fn new(script: Vec<Opcode>) -> Result<Self, ScriptError> {
         let script = ScriptOpcodes::try_from(script)?;
         Ok(TariScript { script })
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Opcode> {
+        self.script.iter()
     }
 
     /// This pattern matches two scripts ensure they have the same instructions in the opcodes, but not the same values
@@ -353,7 +357,7 @@ impl TariScript {
             None => {
                 return Err(ScriptError::CompareFailed(
                     "Subtraction of given height from current block height failed".to_string(),
-                ))
+                ));
             },
         };
 
@@ -381,7 +385,7 @@ impl TariScript {
             None => {
                 return Err(ScriptError::CompareFailed(
                     "Couldn't subtract the target height from the current block height".to_string(),
-                ))
+                ));
             },
         };
 
@@ -695,12 +699,19 @@ impl TariScript {
 }
 
 impl Iterator for TariScript {
-    // Define the type of item returned by the iterator
     type Item = Opcode;
 
-    // Implement the next method
     fn next(&mut self) -> Option<Self::Item> {
-        self.script.iter().next().cloned()
+        self.script.next()
+    }
+}
+
+impl<'a> IntoIterator for &'a TariScript {
+    type IntoIter = std::slice::Iter<'a, Opcode>;
+    type Item = &'a Opcode;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.script.iter()
     }
 }
 
@@ -763,21 +774,18 @@ mod test {
     #![allow(clippy::indexing_slicing)]
     use blake2::Blake2b;
     use borsh::{BorshDeserialize, BorshSerialize};
-    use digest::{consts::U32, Digest};
+    use digest::{Digest, consts::U32};
     use sha2::Sha256;
     use sha3::Sha3_256 as Sha3;
     use tari_crypto::{
         compressed_commitment::CompressedCommitment,
         compressed_key::CompressedKey,
         keys::SecretKey,
-        ristretto::{pedersen::CompressedPedersenCommitment, RistrettoPublicKey, RistrettoSecretKey},
+        ristretto::{RistrettoPublicKey, RistrettoSecretKey, pedersen::CompressedPedersenCommitment},
     };
-    use tari_utilities::{hex::Hex, ByteArray};
+    use tari_utilities::{ByteArray, hex::Hex};
 
     use crate::{
-        error::ScriptError,
-        inputs,
-        op_codes::{slice_to_boxed_hash, slice_to_boxed_message, HashValue, Message},
         CheckSigSchnorrSignature,
         CompressedCheckSigSchnorrSignature,
         ExecutionStack,
@@ -786,6 +794,9 @@ mod test {
         StackItem,
         StackItem::{Commitment, Hash, Number},
         TariScript,
+        error::ScriptError,
+        inputs,
+        op_codes::{HashValue, Message, slice_to_boxed_hash, slice_to_boxed_message},
     };
 
     fn context_with_height(height: u64) -> ScriptContext {
@@ -1201,7 +1212,7 @@ mod test {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn check_multisig() {
-        use crate::{op_codes::Opcode::CheckMultiSig, StackItem::Number};
+        use crate::{StackItem::Number, op_codes::Opcode::CheckMultiSig};
         let mut rng = rand::thread_rng();
         let (k_alice, p_alice) = CompressedKey::<RistrettoPublicKey>::random_keypair(&mut rng);
         let (k_bob, p_bob) = CompressedKey::<RistrettoPublicKey>::random_keypair(&mut rng);
@@ -1409,7 +1420,7 @@ mod test {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn check_multisig_verify() {
-        use crate::{op_codes::Opcode::CheckMultiSigVerify, StackItem::Number};
+        use crate::{StackItem::Number, op_codes::Opcode::CheckMultiSigVerify};
         let mut rng = rand::thread_rng();
         let (k_alice, p_alice) = CompressedKey::<RistrettoPublicKey>::random_keypair(&mut rng);
         let (k_bob, p_bob) = CompressedKey::<RistrettoPublicKey>::random_keypair(&mut rng);

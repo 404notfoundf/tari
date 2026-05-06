@@ -24,6 +24,8 @@ use std::str::FromStr;
 // DAMAGE.
 use std::sync::{Arc, RwLock};
 
+use log::error;
+use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use tari_common_types::{
     seeds::cipher_seed::CipherSeed,
     tari_address::TariAddress,
@@ -40,23 +42,18 @@ use tari_common_types::{
 use tari_crypto::{hashing::DomainSeparatedHasher, keys::SecretKey};
 use tari_hashing::KeyManagerDomain;
 use tari_script::{CompressedCheckSigSchnorrSignature, TariScript};
-use tari_utilities::ByteArrayError;
-
-use crate::legacy_key_manager::wallet_types::LegacyWalletType;
-
-pub const LEDGER_NOT_SUPPORTED: &str = "Ledger is not supported in this build, please enable the \"ledger\" feature.";
-use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use tari_transaction_components::{
+    MicroMinotari,
     crypto_factories::CryptoFactories,
     key_manager::{
-        error::KeyManagerError,
-        wallet_types::{KeyDigest, WalletType, HASHER_LABEL_DERIVE_KEY, SPEND_KEY_BRANCH, VIEW_KEY_BRANCH},
         KeyManager,
         SecretTransactionKeyManagerInterface,
         TariKeyAndId,
         TariKeyId,
         TransactionKeyManagerInterface,
         TxoStage,
+        error::KeyManagerError,
+        wallet_types::{HASHER_LABEL_DERIVE_KEY, KeyDigest, SPEND_KEY_BRANCH, VIEW_KEY_BRANCH, WalletType},
     },
     transaction_components::{
         EncryptedData,
@@ -67,10 +64,18 @@ use tari_transaction_components::{
         TransactionKernelVersion,
         TransactionOutputVersion,
     },
-    MicroMinotari,
+};
+use tari_utilities::ByteArrayError;
+
+use crate::legacy_key_manager::{
+    LegacySerializedKeyString,
+    LegacyTariKeyId,
+    interface::TransactionKeyManagerBackend,
+    wallet_types::LegacyWalletType,
 };
 
-use crate::legacy_key_manager::{interface::TransactionKeyManagerBackend, LegacyTariKeyId};
+pub const LEDGER_NOT_SUPPORTED: &str = "Ledger is not supported in this build, please enable the \"ledger\" feature.";
+const LOG_TARGET: &str = "tari::legacy_key_manager";
 
 #[derive(Clone)]
 pub struct TransactionKeyManagerInner<TBackend> {
@@ -125,6 +130,17 @@ where TBackend: TransactionKeyManagerBackend + 'static
         Ok(s)
     }
 
+    fn convert_legacy_serialized_key_id_to_current(
+        &self,
+        key_id: &LegacySerializedKeyString,
+    ) -> Result<TariKeyId, KeyManagerError> {
+        let legacy_key = LegacyTariKeyId::from_str(key_id.as_str())
+            .inspect_err(|e| error!(target: LOG_TARGET, "Could not parse legacy key id string: {}", e))
+            .map_err(|_| KeyManagerError::InvalidKeyId(format!("Could not convert '{}'", key_id)))?;
+        self.convert_legacy_tari_key_id_to_current(&legacy_key)
+            .inspect_err(|e| error!(target: LOG_TARGET, "Could not convert legacy key id: {}", e))
+    }
+
     pub fn convert_legacy_tari_key_id_to_current(
         &self,
         key_id: &LegacyTariKeyId,
@@ -139,17 +155,12 @@ where TBackend: TransactionKeyManagerBackend + 'static
                 },
             },
             LegacyTariKeyId::Derived { key } => {
-                if let Ok(inner) = LegacyTariKeyId::from_str(key.as_str()) {
-                    if let Ok(val) = self.convert_legacy_tari_key_id_to_current(&inner) {
-                        return Ok(TariKeyId::Derived {
-                            key: val.to_string().into(),
-                        });
-                    }
-                }
-                Err(KeyManagerError::InvalidKeyId(format!(
-                    "Could not convert '{}' to TariKeyId::Derived",
-                    key
-                )))
+                let key_id = self.convert_legacy_serialized_key_id_to_current(key).map_err(|_| {
+                    KeyManagerError::InvalidKeyId(format!("Could not convert '{}' to TariKeyId::Derived", key))
+                })?;
+                Ok(TariKeyId::Derived {
+                    key: key_id.to_string().into(),
+                })
             },
             LegacyTariKeyId::Imported { .. } => {
                 let private_key = self.get_legacy_private_key(key_id)?;
@@ -161,49 +172,44 @@ where TBackend: TransactionKeyManagerBackend + 'static
                 public_key,
                 private_key,
             } => {
-                if let Ok(inner) = LegacyTariKeyId::from_str(private_key.as_str()) {
-                    if let Ok(val) = self.convert_legacy_tari_key_id_to_current(&inner) {
-                        return Ok(TariKeyId::DHCommitmentMask {
-                            public_key: public_key.clone(),
-                            private_key: val.to_string().into(),
-                        });
-                    }
-                }
-                Err(KeyManagerError::InvalidKeyId(format!(
-                    "Could not convert '{}' to TariKeyId::DHCommitmentMask",
-                    private_key
-                )))
+                let key_id = self
+                    .convert_legacy_serialized_key_id_to_current(private_key)
+                    .map_err(|_| {
+                        KeyManagerError::InvalidKeyId(format!(
+                            "Could not convert '{}' to TariKeyId::DHCommitmentMask",
+                            private_key
+                        ))
+                    })?;
+                Ok(TariKeyId::DHCommitmentMask {
+                    public_key: public_key.clone(),
+                    private_key: key_id.to_string().into(),
+                })
             },
             LegacyTariKeyId::DHEncryptedData {
                 public_key,
                 private_key,
             } => {
-                if let Ok(inner) = LegacyTariKeyId::from_str(private_key.as_str()) {
-                    if let Ok(val) = self.convert_legacy_tari_key_id_to_current(&inner) {
-                        return Ok(TariKeyId::DHEncryptedData {
-                            public_key: public_key.clone(),
-                            private_key: val.to_string().into(),
-                        });
-                    }
-                }
-                Err(KeyManagerError::InvalidKeyId(format!(
-                    "Could not convert '{}' to TariKeyId::DHEncryptedData",
-                    private_key
-                )))
+                let key_id = self
+                    .convert_legacy_serialized_key_id_to_current(private_key)
+                    .map_err(|_| {
+                        KeyManagerError::InvalidKeyId(format!(
+                            "Could not convert '{}' to TariKeyId::DHEncryptedData",
+                            private_key
+                        ))
+                    })?;
+                Ok(TariKeyId::DHEncryptedData {
+                    public_key: public_key.clone(),
+                    private_key: key_id.to_string().into(),
+                })
             },
             LegacyTariKeyId::Encrypted { encrypted, key } => {
-                if let Ok(inner) = LegacyTariKeyId::from_str(key.as_str()) {
-                    if let Ok(val) = self.convert_legacy_tari_key_id_to_current(&inner) {
-                        return Ok(TariKeyId::Encrypted {
-                            encrypted: encrypted.clone(),
-                            key: val.to_string().into(),
-                        });
-                    }
-                }
-                Err(KeyManagerError::InvalidKeyId(format!(
-                    "Could not convert '{}' to TariKeyId::Encrypted",
-                    key
-                )))
+                let key_id = self.convert_legacy_serialized_key_id_to_current(key).map_err(|_| {
+                    KeyManagerError::InvalidKeyId(format!("Could not convert '{}' to TariKeyId::Encrypted", key))
+                })?;
+                Ok(TariKeyId::Encrypted {
+                    encrypted: encrypted.clone(),
+                    key: key_id.to_string().into(),
+                })
             },
         }
     }

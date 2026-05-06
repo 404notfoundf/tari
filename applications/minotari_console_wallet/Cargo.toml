@@ -18,11 +18,11 @@ tari_transaction_components = { workspace = true }
 tari_comms = { workspace = true }
 tari_core = { workspace = true }
 tari_crypto = { workspace = true }
-tari_libtor = { workspace = true, optional = true }
 tari_p2p = { workspace = true, features = ["auto-update"] }
 tari_script = { workspace = true }
 tari_shutdown = { workspace = true }
 tari_transaction_key_manager = { workspace = true }
+tari_sidechain = { workspace = true }
 tari_utilities = { workspace = true }
 minotari_wallet = { workspace = true, features = ["bundled_sqlite"] }
 minotari_node_wallet_client = { workspace = true }
@@ -35,7 +35,7 @@ console-subscriber = "0.4"
 tokio = { workspace = true, features = ["signal"] }
 anyhow = { workspace = true }
 chrono = { version = "0.4", default-features = false }
-clap = { version = "3.2", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
 config = "0.14.0"
 crossterm = { version = "0.28" }
 dhat = "0.3.3"
@@ -74,6 +74,9 @@ zxcvbn = "2"
 tui = { version = "^0.19", default-features = false, features = ["crossterm"] }
 
 
+[dev-dependencies]
+tempfile = "3.1.0"
+
 [build-dependencies]
 tari_features = { workspace = true }
 
@@ -81,7 +84,7 @@ tari_features = { workspace = true }
 default = ["libtor", "ledger", "grpc"]
 grpc = []
 ledger = ["minotari_ledger_wallet_comms", "minotari_wallet/ledger", "tari_transaction_components/ledger"]
-libtor = ["tari_libtor"]
+libtor = []
 # If you are doing heap profiling, use 'dhat-heap' and enable debug symbols:
 #   CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --bin minotari_console_wallet --features=dhat-heap            ...(Linux)
 #   $env:CARGO_PROFILE_RELEASE_DEBUG = "true"; cargo build --release --bin minotari_console_wallet --features=dhat-heap  ...(PowerShell)

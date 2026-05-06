@@ -85,7 +85,7 @@ jobs:
         # Without restore keys, we lose the ability to get partial matches on caches, and end
         # up with too many cache misses.
         # This job runs on self-hosted, so use local-cache instead.
-        uses: maxnowack/local-cache@v2
+        uses: maxnowack/local-cache@v3
         with:
           path: |
             ~/.cargo/registry/index
@@ -125,7 +125,7 @@ jobs:
           fi
 
       - name: upload artifact
-        uses: actions/upload-artifact@v6 # upload test results as artifact
+        uses: actions/upload-artifact@v7 # upload test results as artifact
         if: always()
         with:
           name: junit-cucumber
@@ -175,7 +175,7 @@ jobs:
         if: ${{ env.CI_FFI == 'true' }}
         # Don't use rust-cache.
         # This job runs on self-hosted, so use local-cache instead.
-        uses: maxnowack/local-cache@v2
+        uses: maxnowack/local-cache@v3
         with:
           path: |
             ~/.cargo/registry/index
@@ -216,7 +216,7 @@ jobs:
           fi
 
       - name: upload artifact
-        uses: actions/upload-artifact@v6 # upload test results as artifact
+        uses: actions/upload-artifact@v7 # upload test results as artifact
         if: always()
         with:
           name: junit-ffi-cucumber
@@ -228,7 +228,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Upload
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Event File
           path: ${{ github.event_path }}

@@ -30,7 +30,7 @@ use borsh::BorshDeserialize;
 use chrono::NaiveDateTime;
 use derivative::Derivative;
 use diesel::{
-    dsl::{count_star, sql},
+    dsl::{count_star, not, sql},
     prelude::*,
     sql_query,
     sql_types::{BigInt, Nullable},
@@ -52,6 +52,7 @@ use tari_common_types::{
 use tari_crypto::tari_utilities::ByteArray;
 use tari_script::{ExecutionStack, TariScript};
 use tari_transaction_components::{
+    MicroMinotari,
     key_manager::TariKeyId,
     transaction_components::{
         EncryptedData,
@@ -61,26 +62,25 @@ use tari_transaction_components::{
         TransactionOutputVersion,
         WalletOutput,
     },
-    MicroMinotari,
 };
 use tari_transaction_key_manager::legacy_key_manager::{LegacyTariKeyId, LegacyTransactionKeyManagerInterface};
 use tari_utilities::hex::Hex;
 
 use crate::{
     output_manager_service::{
+        TRANSACTION_INPUTS_LIMIT,
+        UtxoSelectionFilter,
+        UtxoSelectionOrdering,
         error::OutputManagerStorageError,
         input_selection::{UtxoSelectionCriteria, UtxoSelectionMode},
         service::Balance,
         storage::{
+            OutputSource,
+            OutputStatus,
             database::{OutputBackendQuery, SortDirection},
             models::{DbWalletOutput, SpendingPriority},
             sqlite_db::{CoinBucket, UpdateOutput, UpdateOutputSql},
-            OutputSource,
-            OutputStatus,
         },
-        UtxoSelectionFilter,
-        UtxoSelectionOrdering,
-        TRANSACTION_INPUTS_LIMIT,
     },
     schema::outputs,
 };
@@ -153,7 +153,10 @@ impl OutputSql {
         let mut query = outputs::table
             .into_boxed()
             .filter(outputs::script_lock_height.le(q.tip_height))
-            .filter(outputs::maturity.le(q.tip_height));
+            .filter(outputs::maturity.le(q.tip_height))
+            // make sure we account for i64 wrap around to neg
+            .filter(outputs::script_lock_height.ge(0))
+            .filter(outputs::maturity.ge(0));
 
         if let Some((offset, limit)) = q.pagination {
             query = query.offset(offset).limit(limit);
@@ -233,7 +236,10 @@ impl OutputSql {
         if selection_criteria.mode == UtxoSelectionMode::Safe {
             query = query
                 .filter(outputs::script_lock_height.le(i64_tip_height))
-                .filter(outputs::maturity.le(i64_tip_height));
+                .filter(outputs::maturity.le(i64_tip_height))
+                // make sure we account for i64 wrap around to neg
+                .filter(outputs::script_lock_height.ge(0))
+                .filter(outputs::maturity.ge(0));
         };
 
         match &selection_criteria.filter {
@@ -282,6 +288,9 @@ impl OutputSql {
                     .filter(outputs::status.eq(OutputStatus::Unspent as i32))
                     .filter(outputs::script_lock_height.le(i64_tip_height))
                     .filter(outputs::maturity.le(i64_tip_height))
+                    // make sure we account for i64 wrap around to neg
+                    .filter(outputs::script_lock_height.ge(0))
+                    .filter(outputs::maturity.ge(0))
                     .order(outputs::value.desc())
                     .select(outputs::value)
                     .first(conn)
@@ -328,7 +337,10 @@ impl OutputSql {
         if selection_criteria.mode == UtxoSelectionMode::Safe {
             query = query
                 .filter(outputs::script_lock_height.le(i64_tip_height))
-                .filter(outputs::maturity.le(i64_tip_height));
+                .filter(outputs::maturity.le(i64_tip_height))
+                // make sure we account for i64 wrap around to neg
+                .filter(outputs::script_lock_height.ge(0))
+                .filter(outputs::maturity.ge(0));
         };
 
         for exclude in &selection_criteria.excluding {
@@ -379,7 +391,10 @@ impl OutputSql {
             if selection_criteria.mode == UtxoSelectionMode::Safe {
                 query = query
                     .filter(outputs::script_lock_height.le(i64_tip_height))
-                    .filter(outputs::maturity.le(i64_tip_height));
+                    .filter(outputs::maturity.le(i64_tip_height))
+                    // make sure we account for i64 wrap around to neg
+                    .filter(outputs::script_lock_height.ge(0))
+                    .filter(outputs::maturity.ge(0));
             }
 
             // Rust
@@ -426,7 +441,10 @@ impl OutputSql {
         if selection_criteria.mode == UtxoSelectionMode::Safe {
             query = query
                 .filter(outputs::script_lock_height.le(i64_tip_height))
-                .filter(outputs::maturity.le(i64_tip_height));
+                .filter(outputs::maturity.le(i64_tip_height))
+                // make sure we account for i64 wrap around to neg
+                .filter(outputs::script_lock_height.ge(0))
+                .filter(outputs::maturity.ge(0));
         }
 
         query = query.filter(
@@ -460,6 +478,9 @@ impl OutputSql {
                     .filter(outputs::status.eq(OutputStatus::Unspent as i32))
                     .filter(outputs::script_lock_height.le(i64_tip_height))
                     .filter(outputs::maturity.le(i64_tip_height))
+                    // make sure we account for i64 wrap around to neg
+                    .filter(outputs::script_lock_height.ge(0))
+                    .filter(outputs::maturity.ge(0))
                     .order(outputs::value.desc())
                     .select(outputs::value)
                     .first(conn)
@@ -475,7 +496,6 @@ impl OutputSql {
         // First, get the must-include outputs
         let mut must_include_query = outputs::table
             .into_boxed()
-            .filter(outputs::status.eq(OutputStatus::Unspent as i32))
             .filter(outputs::value.gt(i64_value))
             .order_by(outputs::spending_priority.desc());
 
@@ -483,7 +503,10 @@ impl OutputSql {
         if selection_criteria.mode == UtxoSelectionMode::Safe {
             must_include_query = must_include_query
                 .filter(outputs::script_lock_height.le(i64_tip_height))
-                .filter(outputs::maturity.le(i64_tip_height));
+                .filter(outputs::maturity.le(i64_tip_height))
+                // make sure we account for i64 wrap around to neg
+                .filter(outputs::script_lock_height.ge(0))
+                .filter(outputs::maturity.ge(0));
         }
 
         // Filter for the specific commitments
@@ -501,8 +524,9 @@ impl OutputSql {
         let must_include_total: i64 = must_include_outputs.iter().map(|o| o.value).sum();
         let i64_amount = i64::try_from(amount).unwrap_or(i64::MAX);
 
-        // If must-include outputs are sufficient, return only them
-        if must_include_total >= i64_amount {
+        // We cannot do an exact amount, we need more than required because if we do an exact amount, we won't have
+        // enough left for fees.
+        if must_include_total > i64_amount {
             return Ok(must_include_outputs);
         }
 
@@ -526,7 +550,13 @@ impl OutputSql {
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq(OutputStatus::Unspent as i32))
-            .filter(outputs::maturity.gt(tip as i64))
+            .filter(
+                outputs::script_lock_height.gt(tip as i64)
+            .or(outputs::maturity.gt(tip as i64))
+            // make sure we account for i64 wrap around to neg
+            .or(outputs::script_lock_height.lt(0))
+            .or(outputs::maturity.lt(0)),
+            )
             .load(conn)?)
     }
 
@@ -681,10 +711,10 @@ impl OutputSql {
         let balance_query_result = if let Some(current_tip) = current_tip_for_time_lock_calculation {
             sql_query(
                 "SELECT coalesce(sum(value), 0) as amount, 'available_balance' as category \
-                 FROM outputs WHERE status = ? AND maturity <= ? AND script_lock_height <= ? AND output_type != ? \
+                 FROM outputs WHERE status = ? AND maturity <= ? AND maturity >= 0 AND script_lock_height <= ? AND script_lock_height >= 0 AND output_type != ? \
                  UNION ALL \
                  SELECT coalesce(sum(value), 0) as amount, 'time_locked_balance' as category \
-                 FROM outputs WHERE status = ? AND (maturity > ? OR script_lock_height > ?) AND output_type != ? \
+                 FROM outputs WHERE status = ? AND (maturity > ? OR maturity < 0 OR script_lock_height > ? OR script_lock_height < 0) AND output_type != ? \
                  UNION ALL \
                  SELECT coalesce(sum(value), 0) as amount, 'pending_incoming_balance' as category \
                  FROM outputs WHERE (source != ? AND status = ? OR status = ? OR status = ?) AND output_type != ? \
@@ -756,7 +786,7 @@ impl OutputSql {
                 _ => {
                     return Err(OutputManagerStorageError::UnexpectedResult(
                         "Unexpected category in balance query".to_string(),
-                    ))
+                    ));
                 },
             }
         }
@@ -799,10 +829,10 @@ impl OutputSql {
         let balance_query_result = if let Some(current_tip) = current_tip_for_time_lock_calculation {
             let balance_query = sql_query(
                 "SELECT coalesce(sum(value), 0) as amount, 'available_balance' as category \
-                 FROM outputs WHERE status = ? AND maturity <= ? AND script_lock_height <= ? AND user_payment_id = ? \
+                 FROM outputs WHERE status = ? AND maturity <= ? AND maturity >= 0 AND script_lock_height <= ? AND script_lock_height >= 0 AND user_payment_id = ? \
                  UNION ALL \
                  SELECT coalesce(sum(value), 0) as amount, 'time_locked_balance' as category \
-                 FROM outputs WHERE status = ? AND ((maturity > ? OR script_lock_height > ?) AND user_payment_id = ?) \
+                 FROM outputs WHERE status = ? AND ((maturity > ? OR maturity < 0 OR script_lock_height > ? OR script_lock_height < 0) AND user_payment_id = ?) \
                  UNION ALL \
                  SELECT coalesce(sum(value), 0) as amount, 'pending_incoming_balance' as category \
                  FROM outputs WHERE source != ? AND (status = ? OR status = ? OR status = ?) AND user_payment_id = ? \
@@ -876,7 +906,7 @@ impl OutputSql {
                 _ => {
                     return Err(OutputManagerStorageError::UnexpectedResult(
                         "Unexpected category in balance query".to_string(),
-                    ))
+                    ));
                 },
             }
         }
@@ -910,14 +940,15 @@ impl OutputSql {
             .first::<OutputSql>(conn)?)
     }
 
-    pub fn find_by_commitments_excluding_status(
+    pub fn find_by_commitments_excluding_statuses(
         commitments: Vec<&[u8]>,
-        status: OutputStatus,
+        statuses: &[OutputStatus],
         conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+        let status_values: Vec<i32> = statuses.iter().map(|s| *s as i32).collect();
         Ok(outputs::table
             .filter(outputs::commitment.eq_any(commitments))
-            .filter(outputs::status.ne(status as i32))
+            .filter(not(outputs::status.eq_any(status_values)))
             .load(conn)?)
     }
 

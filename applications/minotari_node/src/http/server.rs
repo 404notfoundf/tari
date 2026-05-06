@@ -7,10 +7,10 @@ use std::{
 };
 
 use axum::{
-    extract::DefaultBodyLimit,
-    routing::{get, post},
     Extension,
     Router,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
 };
 use log::{error, info};
 use tari_core::{
@@ -26,6 +26,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
+    HttpCacheConfig,
     http::{
         handler,
         handler::{
@@ -35,7 +36,6 @@ use crate::{
             __path_sync_utxos_by_block,
         },
     },
-    HttpCacheConfig,
 };
 
 const LOG_TARGET: &str = "c::bn::rpc::http::server";
@@ -110,6 +110,10 @@ impl<S: BaseNodeWalletQueryService> Server<S> {
             .route(
                 "/generate_kernel_merkle_proof",
                 get(handler::generate_kernel_merkle_proof::handle::<B>),
+            )
+            .route(
+                "/get_mempool_fee_per_gram_stats",
+                get(handler::get_mempool_fee_per_gram_stats::handle::<B>),
             )
             // A large transaction with 2_316 inputs, 154 outputs and byte size 2_109_809 translated to 4_853_330 JSON
             // object bytes, ~ 2.3 times larger. So we set the limit here to 2.5 times 4 MB.

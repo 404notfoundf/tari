@@ -29,16 +29,16 @@ use std::{
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use either::Either;
-use futures::{channel::mpsc, SinkExt};
+use futures::{SinkExt, channel::mpsc};
 use log::*;
 use minotari_app_grpc::{
     conversions::transaction_output::grpc_output_with_payref,
     tari_rpc::{
         self,
-        readiness_status::{State as ReadinessState, Status as ReadinessStatusEnum},
         CalcType,
         ReadinessStatus,
         Sorting,
+        readiness_status::{State as ReadinessState, Status as ReadinessStatusEnum},
     },
 };
 use tari_common_types::{
@@ -58,16 +58,16 @@ use tari_common_types::{
 use tari_comms::{Bytes, CommsNode};
 use tari_core::{
     base_node::{
+        LocalNodeCommsInterface,
+        StateMachineHandle,
         comms_interface::CommsInterfaceError,
         state_machine_service::states::StateInfo,
         tari_pulse_service::TariPulseHandle,
-        LocalNodeCommsInterface,
-        StateMachineHandle,
     },
     chain_storage::{ChainStorageError, ValidatorNodeRegistrationInfo},
     consensus::BaseNodeConsensusManager,
     iterators::NonOverlappingIntegerPairIter,
-    mempool::{service::LocalMempoolService, TxStorageResponse},
+    mempool::{TxStorageResponse, service::LocalMempoolService},
     validation::tari_rx_vm_key_height,
     proof_of_work::{monero_rx, monero_rx::FixedByteArray},
     AuxChainHashes,
@@ -80,29 +80,29 @@ use tari_transaction_components::{
     key_manager::{KeyManager, TariKeyId, TransactionKeyManagerInterface, TxoStage},
     tari_proof_of_work::{Difficulty, PowAlgorithm, PowData},
     transaction_components::{
-        memo_field::{MemoField, TxType},
         CoinBaseExtra,
         KernelBuilder,
         RangeProofType,
         Transaction,
         TransactionKernel,
         TransactionKernelVersion,
+        memo_field::{MemoField, TxType},
     },
 };
-use tari_utilities::{hex::Hex, message_format::MessageFormat, ByteArray};
+use tari_utilities::{ByteArray, hex::Hex, message_format::MessageFormat};
 use tokio::task;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    BaseNodeConfig,
     builder::BaseNodeContext,
     grpc::{
-        blocks::{block_fees, block_heights, block_size, GET_BLOCKS_MAX_HEIGHTS, GET_BLOCKS_PAGE_SIZE},
+        blocks::{GET_BLOCKS_MAX_HEIGHTS, GET_BLOCKS_PAGE_SIZE, block_fees, block_heights, block_size},
         data_cache::DataCache,
-        hash_rate::{display_u_decimal_value, HashRateMovingAverage, NANOS_PER_UNIT},
+        hash_rate::{HashRateMovingAverage, NANOS_PER_UNIT, display_u_decimal_value},
         helpers::{mean, median},
     },
     grpc_method::GrpcMethod,
-    BaseNodeConfig,
 };
 
 const LOG_TARGET: &str = "minotari::base_node::grpc";
@@ -569,7 +569,12 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let failed_checkpoints = *self.tari_pulse.get_failed_checkpoints_notifier();
         let status_watch = self.state_machine_handle.get_status_info_watch();
-        let state: tari_rpc::BaseNodeState = (&status_watch.borrow().state_info).into();
+        let (state, network_silence, initial_sync_achieved) = {
+            let status = status_watch.borrow();
+            let state: tari_rpc::BaseNodeState = (&status.state_info).into();
+            let network_silence = matches!(&status.state_info, StateInfo::Listening(info) if info.is_network_silence());
+            (state, network_silence, status.bootstrapped)
+        };
 
         let mut connectivity = self.comms.connectivity();
         let connected_peers = connectivity
@@ -605,8 +610,9 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         );
         let response = tari_rpc::GetNetworkStateResponse {
             metadata: Some(metadata.into()),
-            initial_sync_achieved: status_watch.borrow().bootstrapped,
+            initial_sync_achieved,
             base_node_state: state.into(),
+            network_silence,
             failed_checkpoints,
             reward,
             sha3x_estimated_hash_rate,
@@ -1060,7 +1066,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 return Err(obscure_error_if_true(
                     report_error_flag,
                     Status::internal(e.to_string()),
-                ))
+                ));
             },
         };
 
@@ -1377,7 +1383,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 return Err(obscure_error_if_true(
                     report_error_flag,
                     Status::internal(e.to_string()),
-                ))
+                ));
             },
         };
         let gen_hash = handler
@@ -1617,7 +1623,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 return Err(obscure_error_if_true(
                     report_error_flag,
                     Status::internal(e.to_string()),
-                ))
+                ));
             },
         };
         let fees = new_block.body.get_total_fee().map_err(|_| {
@@ -1739,7 +1745,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 return Err(obscure_error_if_true(
                     report_error_flag,
                     Status::internal(e.to_string()),
-                ))
+                ));
             },
         };
         // construct response
@@ -3789,13 +3795,13 @@ async fn get_block_group(
             return Err(obscure_error_if_true(
                 report_error_flag,
                 Status::unimplemented("Quantile has not been implemented"),
-            ))
+            ));
         },
         CalcType::Quartile => {
             return Err(obscure_error_if_true(
                 report_error_flag,
                 Status::unimplemented("Quartile has not been implemented"),
-            ))
+            ));
         },
     }
     .unwrap_or_default();

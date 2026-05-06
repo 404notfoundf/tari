@@ -10,6 +10,10 @@ diesel::table! {
         kernel_merkle_proof -> Nullable<Binary>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+        encrypted_data -> Nullable<Binary>,
+        value -> Nullable<BigInt>,
+        kernel_excess -> Nullable<Binary>,
+        kernel_excess_sig -> Nullable<Binary>,
     }
 }
 
@@ -45,6 +49,7 @@ diesel::table! {
         received_output_hashes -> Nullable<Binary>,
         change_output_hashes -> Nullable<Binary>,
         user_payment_id -> Nullable<Binary>,
+        lock_height -> Nullable<BigInt>,
     }
 }
 
@@ -143,6 +148,16 @@ diesel::table! {
 }
 
 diesel::table! {
+    payref_history (id) {
+        id -> Integer,
+        output_hash -> Binary,
+        payref -> Binary,
+        tx_id -> BigInt,
+        superseded_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     scanned_blocks (header_hash) {
         header_hash -> Binary,
         height -> BigInt,
@@ -167,6 +182,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     known_one_sided_payment_scripts,
     outbound_transactions,
     outputs,
+    payref_history,
     payrefs,
     scanned_blocks,
     wallet_settings,

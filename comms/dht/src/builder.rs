@@ -25,11 +25,11 @@
 use std::{sync::Arc, time::Duration};
 
 use tari_common_sqlite::connection::DbConnectionUrl;
-use tari_comms::{connectivity::ConnectivityRequester, NodeIdentity, PeerManager};
+use tari_comms::{NodeIdentity, PeerManager, connectivity::ConnectivityRequester};
 use tari_shutdown::ShutdownSignal;
 use tokio::sync::mpsc;
 
-use crate::{dht::DhtInitializationError, outbound::DhtOutboundRequest, version::DhtProtocolVersion, Dht, DhtConfig};
+use crate::{Dht, DhtConfig, dht::DhtInitializationError, outbound::DhtOutboundRequest, version::DhtProtocolVersion};
 
 /// Builder for the DHT.
 ///
@@ -106,7 +106,7 @@ impl DhtBuilder {
         self
     }
 
-    /// The number of neighbouring peers that the DHT should try maintain connections to.
+    /// The number of peers in the primary managed peer pool.
     pub fn with_num_neighbouring_nodes(&mut self, n: usize) -> &mut Self {
         self.config.num_neighbouring_nodes = n;
         self

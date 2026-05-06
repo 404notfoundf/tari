@@ -22,11 +22,11 @@
 use std::{collections::HashMap, fmt, fmt::Display, ops::Range, sync::Arc};
 
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use log::*;
 use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use minotari_node_wallet_client::BaseNodeWalletClient;
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use tari_common::configuration::Network;
 use tari_common_types::{
     tari_address::{TariAddress, TariAddressFeatures},
@@ -44,27 +44,27 @@ use tari_common_types::{
 };
 use tari_crypto::commitment::HomomorphicCommitmentFactory;
 use tari_script::{
-    inputs,
-    push_pubkey_script,
-    script,
     CompressedCheckSigSchnorrSignature,
     ExecutionStack,
     Opcode,
     StackItem,
     TariScript,
+    inputs,
+    push_pubkey_script,
+    script,
 };
 use tari_service_framework::reply_channel;
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::{
+    MicroMinotari,
+    TransactionBuilder,
+    TransactionBuilderError,
     consensus::ConsensusConstants,
     crypto_factories::CryptoFactories,
     fee::Fee,
     helpers::borsh::SerializedSize,
     key_manager::{SerializedKeyString, TariKeyAndId, TariKeyId},
     transaction_components::{
-        covenants::Covenant,
-        memo_field::{MemoField, TxType},
-        one_sided::{public_key_to_output_encryption_key, public_key_to_output_spending_key},
         EncryptedData,
         KernelFeatures,
         OutputFeatures,
@@ -75,19 +75,28 @@ use tari_transaction_components::{
         TransactionOutputVersion,
         WalletOutput,
         WalletOutputBuilder,
+        covenants::Covenant,
+        memo_field::{MemoField, TxType},
+        one_sided::{public_key_to_output_encryption_key, public_key_to_output_spending_key},
     },
     tx_outputs_to_tx_id,
-    MicroMinotari,
-    TransactionBuilder,
+    utxo_selection::branch_and_bound::{
+        branch_and_bound_selector::SelectionResult,
+        branch_bound_builder::BranchAndBoundUtxoSelectionBuilder,
+    },
 };
-use tari_transaction_key_manager::legacy_key_manager::{wallet_types::FeeType, LegacyTransactionKeyManagerInterface};
-use tari_utilities::{hex::Hex, ByteArray};
+use tari_transaction_key_manager::legacy_key_manager::{LegacyTransactionKeyManagerInterface, wallet_types::FeeType};
+use tari_utilities::{ByteArray, hex::Hex};
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
     base_node_service::handle::{BaseNodeEvent, BaseNodeServiceHandle},
     connectivity_service::WalletConnectivityInterface,
     output_manager_service::{
+        RangeLimit,
+        TRANSACTION_INPUTS_LIMIT,
+        TRANSACTION_OUTPUTS_LIMIT,
+        UtxoSelectionFilter,
         config::OutputManagerServiceConfig,
         error::{OutputManagerError, OutputManagerProtocolError, OutputManagerStorageError},
         handle::{
@@ -101,16 +110,13 @@ use crate::{
         recovery::StandardUtxoRecoverer,
         resources::OutputManagerResources,
         storage::{
+            OutputSource,
+            OutputStatus,
             database::{OutputBackendQuery, OutputManagerBackend, OutputManagerDatabase},
             models::{DbWalletOutput, KnownOneSidedPaymentScript, SpendingPriority},
             sqlite_db::CoinBucket,
-            OutputSource,
-            OutputStatus,
         },
         tasks::TxoValidationTask,
-        RangeLimit,
-        TRANSACTION_INPUTS_LIMIT,
-        TRANSACTION_OUTPUTS_LIMIT,
     },
     utxo_scanner_service::handle::{UtxoScannerEvent, UtxoScannerHandle},
 };
@@ -337,6 +343,7 @@ where
                 fee_per_gram,
                 script,
                 covenant,
+                memo,
             } => self
                 .prepare_transaction_to_send(
                     tx_id,
@@ -346,6 +353,7 @@ where
                     *output_features,
                     script,
                     covenant,
+                    memo,
                 )
                 .map(|tx_builder| OutputManagerResponse::TransactionBuilderToSend(Box::new(tx_builder))),
             OutputManagerRequest::GetTransactionBuilderRangeLimitedCoinJoin {
@@ -434,12 +442,34 @@ where
                 Ok(OutputManagerResponse::InvalidOutputs(outputs))
             },
             OutputManagerRequest::GetManyOutputs { outputs } => {
-                let outputs = self
-                    .fetch_many_outputs(&outputs)?
-                    .into_iter()
-                    .map(|v| (v.clone(), v.into()))
-                    .collect();
+                let outputs = self.fetch_many_outputs(&outputs)?;
                 Ok(OutputManagerResponse::Outputs(outputs))
+            },
+            OutputManagerRequest::GetOutputsByCommitments(commitments) => {
+                let outputs = self.fetch_outputs_by_commitments(&commitments)?;
+                Ok(OutputManagerResponse::Outputs(outputs))
+            },
+            OutputManagerRequest::UpdateOutputValidationState {
+                mined_updates,
+                spent_updates,
+                unmined_invalid,
+                unspent_updates,
+            } => {
+                if !mined_updates.is_empty() {
+                    self.resources
+                        .db
+                        .set_received_outputs_mined_height_and_statuses(mined_updates)?;
+                }
+                if !spent_updates.is_empty() {
+                    self.resources.db.mark_outputs_as_spent(spent_updates)?;
+                }
+                if !unmined_invalid.is_empty() {
+                    self.resources.db.set_outputs_to_unmined_and_invalid(unmined_invalid)?;
+                }
+                if !unspent_updates.is_empty() {
+                    self.resources.db.mark_outputs_as_unspent(unspent_updates)?;
+                }
+                Ok(OutputManagerResponse::OutputValidationStateUpdated)
             },
             OutputManagerRequest::PreviewCoinJoin((commitments, fee_per_gram)) => {
                 Ok(OutputManagerResponse::CoinPreview(
@@ -523,6 +553,13 @@ where
                 let output_statuses_by_tx_id = self.get_output_info_by_tx_id(tx_id)?;
                 Ok(OutputManagerResponse::OutputInfoByTxId(output_statuses_by_tx_id))
             },
+            OutputManagerRequest::FetchOutputsByTxId(tx_id) => {
+                let outputs = self
+                    .resources
+                    .db
+                    .fetch_outputs_by_tx_id(tx_id, &self.resources.key_manager)?;
+                Ok(OutputManagerResponse::Outputs(outputs))
+            },
 
             OutputManagerRequest::FetchUnspentOutputs(hashes) => {
                 let mut outputs = Vec::new();
@@ -549,12 +586,12 @@ where
         // mined heights)
         let (mut last_height, mut max_mined_height, mut block_hash) = (0u64, None, None);
         for uo in outputs {
-            if let Some(height) = uo.mined_height {
-                if last_height < height {
-                    last_height = height;
-                    max_mined_height = uo.mined_height;
-                    block_hash = uo.mined_in_block;
-                }
+            if let Some(height) = uo.mined_height &&
+                last_height < height
+            {
+                last_height = height;
+                max_mined_height = uo.mined_height;
+                block_hash = uo.mined_in_block;
             }
         }
         Ok(OutputInfoByTxId {
@@ -837,6 +874,14 @@ where
             target: LOG_TARGET,
             "Getting fee estimate. Amount: {amount}. Fee per gram: {fee_per_gram}. Num kernels: {num_kernels}. Num outputs: {num_outputs}"
         );
+        let recipient_memo = MemoField::new_address_and_data(
+            TariAddress::default(),
+            0.into(),
+            true,
+            TxType::PaymentToOther,
+            Vec::new(),
+        )
+        .map_err(|e| OutputManagerError::ServiceError(format!("Failed to create MemoField: {}", e)))?;
         // We assume that default OutputFeatures and PushPubKey TariScript is used
         let features_and_scripts_byte_size = self
             .resources
@@ -851,7 +896,8 @@ where
                         .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
                     Covenant::new()
                         .get_serialized_size()
-                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
+                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+                    recipient_memo.get_size(),
             );
 
         let utxo_selection = match self.select_utxos(
@@ -860,6 +906,7 @@ where
             fee_per_gram,
             num_outputs,
             features_and_scripts_byte_size * num_outputs,
+            Vec::new(),
         ) {
             Ok(v) => Ok(v),
             Err(OutputManagerError::FundsPending | OutputManagerError::NotEnoughFunds) => {
@@ -908,6 +955,7 @@ where
         recipient_output_features: OutputFeatures,
         recipient_script: TariScript,
         recipient_covenant: Covenant,
+        recipient_memo_field: MemoField,
     ) -> Result<TransactionBuilder<TKeyManagerInterface>, OutputManagerError> {
         debug!(
             target: LOG_TARGET,
@@ -926,7 +974,8 @@ where
                         .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
                     recipient_covenant
                         .get_serialized_size()
-                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
+                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+                    recipient_memo_field.get_size(),
             );
 
         let input_selection = self.select_utxos(
@@ -935,6 +984,7 @@ where
             fee_per_gram,
             1,
             features_and_scripts_byte_size,
+            recipient_memo_field.get_payment_id(),
         )?;
 
         let mut builder = TransactionBuilder::new(
@@ -1588,6 +1638,14 @@ where
         }
         let covenant = Covenant::default();
 
+        let own_memo = MemoField::new_address_and_data(
+            TariAddress::default(),
+            0.into(),
+            true,
+            TxType::PaymentToOther,
+            Vec::new(),
+        )
+        .map_err(|e| OutputManagerError::ServiceError(format!("Failed to create MemoField: {}", e)))?;
         let features_and_scripts_byte_size = self
             .resources
             .consensus_constants
@@ -1601,7 +1659,8 @@ where
                         .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
                     covenant
                         .get_serialized_size()
-                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
+                        .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+                    own_memo.get_size(),
             );
 
         let input_selection = self.select_utxos(
@@ -1610,6 +1669,7 @@ where
             fee_per_gram,
             1,
             features_and_scripts_byte_size,
+            Vec::new(),
         )?;
 
         // Create builder with no recipients (other than ourselves)
@@ -1724,36 +1784,34 @@ where
     fn select_utxos(
         &mut self,
         amount: MicroMinotari,
-        mut selection_criteria: UtxoSelectionCriteria,
+        selection_criteria: UtxoSelectionCriteria,
         fee_per_gram: MicroMinotari,
         num_outputs: usize,
         total_output_features_and_scripts_byte_size: usize,
+        recipient_payment_id: Vec<u8>,
     ) -> Result<UtxoSelection, OutputManagerError> {
-        let start = Instant::now();
         debug!(
             target: LOG_TARGET,
             "select_utxos amount: {amount}, fee_per_gram: {fee_per_gram}, num_outputs: {num_outputs}, output_features_and_scripts_byte_size: {total_output_features_and_scripts_byte_size}, \
              selection_criteria: {selection_criteria:?}"
         );
-        let mut utxos = Vec::new();
 
         let fee_calc = self.get_fee_calc();
 
         // Attempt to get the chain tip height
         let tip_height = self.resources.db.get_last_scanned_height()?;
 
-        // Respecting the setting to not choose outputs that reveal the address
-        if self.resources.config.autoignore_onesided_utxos {
-            selection_criteria.excluding_onesided = self.resources.config.autoignore_onesided_utxos;
+        let balance = self.get_balance(tip_height)?;
+        let potential_balance = balance.available_balance + balance.pending_incoming_balance;
+        if balance.available_balance < amount && potential_balance >= amount {
+            return Err(OutputManagerError::FundsPending);
         }
-
-        selection_criteria.excluding_multisig = true;
 
         debug!(
             target: LOG_TARGET,
             "select_utxos selection criteria: {selection_criteria}"
         );
-        let start_new = Instant::now();
+        let start = Instant::now();
         let uo: Vec<DbWalletOutput> = self.resources.db.fetch_unspent_outputs_for_spending(
             &selection_criteria,
             amount,
@@ -1761,26 +1819,47 @@ where
             &self.resources.key_manager,
         )?;
 
-        // OutputSource
+        // build up the list of outputs we must include in the selection
+        let mut must_select = Vec::new();
+        if let UtxoSelectionFilter::SpecificOutputs { commitments } = &selection_criteria.filter {
+            for co in commitments {
+                if let Some(u) = uo.iter().find(|u| u.wallet_output.commitment() == co) {
+                    must_select.push(u.clone());
+                }
+            }
+        }
+
+        if let UtxoSelectionFilter::MustInclude { commitments } = &selection_criteria.filter {
+            for co in commitments {
+                if let Some(u) = uo.iter().find(|u| u.wallet_output.commitment() == co) {
+                    must_select.push(u.clone());
+                }
+            }
+        }
 
         let uo_len = uo.len();
         trace!(
             target: LOG_TARGET,
-            "select_utxos profile - fetch_unspent_outputs_for_spending: {} outputs, {} ms (at {} ms)",
+            "select_utxos profile - fetch_unspent_outputs_for_spending: {} outputs, {} ms",
             uo_len,
-            start_new.elapsed().as_millis(),
             start.elapsed().as_millis(),
         );
-        let start_new = Instant::now();
-
         // For non-standard queries, we want to ensure that the intended UTXOs are selected
         if !selection_criteria.filter.is_standard() && uo.is_empty() {
             return Err(OutputManagerError::NoUtxosSelected {
                 criteria: selection_criteria,
             });
-        }
-
-        // Assumes that default Outputfeatures are used for change utxo
+        } // Assumes that default Outputfeatures are used for change utxo
+        let change_memo = MemoField::new_transaction_info(
+            TariAddress::default(),
+            MicroMinotari::default(),
+            amount,
+            true,
+            TxType::PaymentToOther,
+            vec![FixedHash::default()],
+            recipient_payment_id,
+        )
+        .map_err(TransactionBuilderError::InvalidMemo)?;
         let output_features_estimate = OutputFeatures::default();
         let default_features_and_scripts_size = fee_calc.weighting().round_up_features_and_scripts_size(
             output_features_estimate
@@ -1791,77 +1870,92 @@ where
                     .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
                 TariScript::default()
                     .get_serialized_size()
-                    .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
+                    .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+                change_memo.get_size(),
         );
 
-        trace!(target: LOG_TARGET, "We found {uo_len} UTXOs to select from");
+        let kernel_fee = fee_calc.calculate(fee_per_gram, 1, 0, 0, 0);
+        let default_output_fee = fee_calc.calculate(fee_per_gram, 0, 0, 1, default_features_and_scripts_size);
+        let output_fee = fee_calc.calculate(
+            fee_per_gram,
+            0,
+            0,
+            num_outputs,
+            total_output_features_and_scripts_byte_size,
+        );
+        let input_fee = fee_calc.calculate(fee_per_gram, 0, 1, 0, 0);
+        let bnb = BranchAndBoundUtxoSelectionBuilder::new(uo)
+            .with_target_amount(amount + kernel_fee)
+            .with_fee_per_input(input_fee)
+            .with_total_output_fee(output_fee)
+            .with_change_fee(default_output_fee)
+            .build()
+            .map_err(|e| OutputManagerError::ServiceError(e.to_string()))?;
 
-        let mut requires_change_output = false;
-        let mut utxos_total_value = MicroMinotari::from(0);
-        let mut fee_without_change = MicroMinotari::from(0);
-        let mut fee_with_change = MicroMinotari::from(0);
-        for o in uo {
-            utxos_total_value += o.wallet_output.value();
+        let selection_result = bnb
+            .search_with_must_select(must_select)
+            .map_err(|e| OutputManagerError::ServiceError(e.to_string()))?;
 
-            trace!(target: LOG_TARGET, "-- utxos_total_value = {utxos_total_value}");
-            utxos.push(o);
-            // The assumption here is that the only output will be the payment output and change if required
-            fee_without_change = fee_calc.calculate(
-                fee_per_gram,
-                1,
-                utxos.len(),
-                num_outputs,
-                total_output_features_and_scripts_byte_size,
-            );
-            if utxos_total_value == amount + fee_without_change {
-                break;
-            }
-            fee_with_change = fee_calc.calculate(
-                fee_per_gram,
-                1,
-                utxos.len(),
-                num_outputs + 1,
-                total_output_features_and_scripts_byte_size + default_features_and_scripts_size,
-            );
+        if selection_result.is_none() {
+            return Err(OutputManagerError::NotEnoughFunds);
+        }
+        let selection = selection_result.expect("Selection should be valid here");
 
-            trace!(target: LOG_TARGET, "-- amt+fee = {amount} + {fee_with_change}");
-            if utxos_total_value > amount + fee_with_change {
-                requires_change_output = true;
-                break;
+        // lets ensure we have a valid solution
+        if let UtxoSelectionFilter::SpecificOutputs { commitments } = &selection_criteria.filter {
+            for co in commitments {
+                if !selection
+                    .selected_utxos
+                    .iter()
+                    .any(|u| u.wallet_output.commitment() == co)
+                {
+                    return Err(OutputManagerError::NoUtxosSelected {
+                        criteria: selection_criteria,
+                    });
+                }
             }
         }
 
-        let perfect_utxo_selection = utxos_total_value == amount + fee_without_change;
-        let enough_spendable = utxos_total_value > amount + fee_with_change;
+        if let UtxoSelectionFilter::MustInclude { commitments } = &selection_criteria.filter {
+            for co in commitments {
+                if !selection
+                    .selected_utxos
+                    .iter()
+                    .any(|u| u.wallet_output.commitment() == co)
+                {
+                    return Err(OutputManagerError::NoUtxosSelected {
+                        criteria: selection_criteria,
+                    });
+                }
+            }
+        }
+        let SelectionResult {
+            selected_utxos: utxos,
+            final_fee,
+            current_value: total_value,
+            waste,
+            final_target: _,
+            has_change,
+        } = selection;
         trace!(
             target: LOG_TARGET,
-            "select_utxos profile - final_selection: {} outputs from {}, {} ms (at {} ms)",
+            "select_utxos profile - got solution with {} outputs, {} ms (waste: {})",
             utxos.len(),
-            uo_len,
-            start_new.elapsed().as_millis(),
             start.elapsed().as_millis(),
+            waste,
         );
+        // branch and bound does not cound the kernel fee, so we need to include it here
+        let final_fee = final_fee + kernel_fee;
 
-        if !perfect_utxo_selection && !enough_spendable {
-            if uo_len == TRANSACTION_INPUTS_LIMIT as usize {
-                return Err(OutputManagerError::TooManyInputsToFulfillTransaction(format!(
-                    "Input limit '{TRANSACTION_INPUTS_LIMIT}' reached"
-                )));
-            }
-            let current_tip_for_time_lock_calculation = tip_height;
-            let balance = self.get_balance(current_tip_for_time_lock_calculation)?;
-            let pending_incoming = balance.pending_incoming_balance;
-            if utxos_total_value + pending_incoming >= amount + fee_with_change {
-                return Err(OutputManagerError::FundsPending);
-            } else {
-                return Err(OutputManagerError::NotEnoughFunds);
-            }
-        }
-
+        let (fee_with_change, fee_without_change) = if has_change {
+            (final_fee, final_fee - default_output_fee)
+        } else {
+            (final_fee + default_output_fee, final_fee)
+        };
         Ok(UtxoSelection {
             utxos,
-            requires_change_output,
-            total_value: utxos_total_value,
+            requires_change_output: has_change,
+            total_value,
             fee_without_change,
             fee_with_change,
         })
@@ -2067,6 +2161,25 @@ where
             .fetch_many_outputs(outputs, &self.resources.key_manager)?)
     }
 
+    pub fn fetch_outputs_by_commitments(
+        &self,
+        commitments: &[CompressedCommitment],
+    ) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
+        let mut results = Vec::new();
+        for commitment in commitments {
+            match self
+                .resources
+                .db
+                .fetch_by_commitment(commitment.clone(), &self.resources.key_manager)
+            {
+                Ok(output) => results.push(output),
+                Err(OutputManagerStorageError::ValueNotFound) => {},
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(results)
+    }
+
     fn default_features_and_scripts_size(&self) -> Result<usize, OutputManagerError> {
         Ok(self
             .resources
@@ -2080,6 +2193,33 @@ where
                         .get_serialized_size()
                         .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
             ))
+    }
+
+    /// Returns the rounded-up features-and-scripts size for a self-spend output that will include a payment_id in its
+    /// encrypted data. This accounts for the payment_id size as stored by `output_to_self`, so the fee estimate
+    /// matches what the transaction builder will compute when the output is finalized.
+    fn output_to_self_features_and_scripts_size(&self, payment_id: &MemoField) -> Result<usize, OutputManagerError> {
+        let address_and_data = payment_id
+            .clone()
+            .add_sender_address(
+                self.resources.one_sided_tari_address.clone(),
+                false,
+                MicroMinotari::zero(),
+                Some(TxType::PaymentToSelf),
+            )
+            .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+        let base_size = TariScript::default()
+            .get_serialized_size()
+            .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+            OutputFeatures::default()
+                .get_serialized_size()
+                .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? +
+            address_and_data.get_size();
+        Ok(self
+            .resources
+            .consensus_constants
+            .transaction_weight_params()
+            .round_up_features_and_scripts_size(base_size))
     }
 
     pub async fn preview_coin_join_with_commitments(
@@ -2098,14 +2238,14 @@ where
             .iter()
             .fold(MicroMinotari::zero(), |acc, x| acc + x.wallet_output.value());
 
-        let fee = self.get_fee_calc().calculate(
-            fee_per_gram,
-            1,
-            src_outputs.len(),
-            1,
-            self.default_features_and_scripts_size()
-                .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?,
-        );
+        let payment_id =
+            MemoField::new_open_from_string(&format!("Coin join {} outputs", src_outputs.len()), TxType::CoinJoin)
+                .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+        let output_features_and_scripts_size = self.output_to_self_features_and_scripts_size(&payment_id)?;
+
+        let fee =
+            self.get_fee_calc()
+                .calculate(fee_per_gram, 1, src_outputs.len(), 1, output_features_and_scripts_size);
 
         Ok((vec![accumulated_amount.saturating_sub(fee)], fee))
     }
@@ -2133,14 +2273,17 @@ where
             &self.resources.key_manager,
         )?;
 
+        let output_payment_id =
+            MemoField::new_open_from_string(&format!("{number_of_splits} even coin splits"), TxType::CoinSplit)
+                .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+        let output_features_and_scripts_size = self.output_to_self_features_and_scripts_size(&output_payment_id)?;
+
         let fee = self.get_fee_calc().calculate(
             fee_per_gram,
             1,
             src_outputs.len(),
             number_of_splits,
-            self.default_features_and_scripts_size()
-                .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? *
-                number_of_splits,
+            output_features_and_scripts_size * number_of_splits,
         );
 
         let accumulated_amount = src_outputs
@@ -2208,6 +2351,7 @@ where
                     self.default_features_and_scripts_size()
                         .map_err(|e| OutputManagerError::ConversionError(e.to_string()))? *
                         number_of_splits,
+                    Vec::new(),
                 )?;
 
                 self.create_coin_split(selection.utxos, amount_per_split, number_of_splits, fee_per_gram)
@@ -2228,7 +2372,10 @@ where
             ));
         }
 
-        let default_features_and_scripts_size = self.default_features_and_scripts_size();
+        let output_payment_id =
+            MemoField::new_open_from_string(&format!("{number_of_splits} even coin splits"), TxType::CoinSplit)
+                .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+        let output_features_and_scripts_size = self.output_to_self_features_and_scripts_size(&output_payment_id)?;
         let mut dest_outputs = Vec::with_capacity(number_of_splits + 1);
 
         // accumulated value amount from given source outputs
@@ -2241,8 +2388,7 @@ where
             1,
             src_outputs.len(),
             number_of_splits,
-            default_features_and_scripts_size.map_err(|e| OutputManagerError::ConversionError(e.to_string()))? *
-                number_of_splits,
+            output_features_and_scripts_size * number_of_splits,
         );
 
         let accumulated_amount = accumulated_amount_with_fee.saturating_sub(fee);
@@ -2295,8 +2441,7 @@ where
                 OutputFeatures::default(),
                 amount_per_split,
                 Covenant::default(),
-                MemoField::new_open_from_string(&format!("{number_of_splits} even coin splits"), TxType::CoinSplit)
-                    .map_err(OutputManagerError::InvalidPaymentIdFormat)?,
+                output_payment_id.clone(),
                 fee,
                 MicroMinotari::zero(),
             )?;
@@ -2356,9 +2501,6 @@ where
             ));
         }
 
-        let default_features_and_scripts_size = self
-            .default_features_and_scripts_size()
-            .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?;
         let mut dest_outputs = Vec::with_capacity(number_of_splits + 1);
         let total_split_amount = MicroMinotari::from(amount_per_split.as_u64() * number_of_splits as u64);
 
@@ -2371,12 +2513,19 @@ where
             return Err(OutputManagerError::NotEnoughFunds);
         }
 
+        let payment_id = MemoField::new_open_from_string(
+            &format!("Coin split, {accumulated_amount} into {number_of_splits} outputs"),
+            TxType::CoinSplit,
+        )
+        .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+        let output_features_and_scripts_size = self.output_to_self_features_and_scripts_size(&payment_id)?;
+
         let fee_without_change = self.get_fee_calc().calculate(
             fee_per_gram,
             1,
             src_outputs.len(),
             number_of_splits,
-            default_features_and_scripts_size * number_of_splits,
+            output_features_and_scripts_size * number_of_splits,
         );
 
         // checking whether a total output value is enough
@@ -2398,7 +2547,7 @@ where
                 1,
                 src_outputs.len(),
                 number_of_splits + 1,
-                default_features_and_scripts_size * (number_of_splits + 1),
+                output_features_and_scripts_size * (number_of_splits + 1),
             ),
         };
 
@@ -2601,9 +2750,7 @@ where
         fee_per_gram: MicroMinotari,
         payment_id: MemoField,
     ) -> Result<(TxId, Transaction, MicroMinotari), OutputManagerError> {
-        let default_features_and_scripts_size = self
-            .default_features_and_scripts_size()
-            .map_err(|e| OutputManagerError::ConversionError(e.to_string()))?;
+        let output_features_and_scripts_size = self.output_to_self_features_and_scripts_size(&payment_id)?;
 
         let src_outputs = self.resources.db.fetch_unspent_outputs_for_spending(
             &UtxoSelectionCriteria::specific(commitments),
@@ -2618,7 +2765,7 @@ where
 
         let fee =
             self.get_fee_calc()
-                .calculate(fee_per_gram, 1, src_outputs.len(), 1, default_features_and_scripts_size);
+                .calculate(fee_per_gram, 1, src_outputs.len(), 1, output_features_and_scripts_size);
 
         let accumulated_amount = accumulated_amount_with_fee.saturating_sub(fee);
 
@@ -2938,27 +3085,26 @@ where
                     let script_private_key = matched_key.clone().1;
 
                     if let Ok((committed_value, spending_key, payment_id)) =
-                        EncryptedData::decrypt_data(&encryption_key, &output.commitment, &output.encrypted_data)
-                    {
-                        if output.verify_mask(
+                        EncryptedData::decrypt_data(&encryption_key, &output.commitment, &output.encrypted_data) &&
+                        output.verify_mask(
                             &self.resources.factories.range_proof,
                             &spending_key,
                             committed_value.into(),
-                        )? {
-                            let commitment_mask_key_id =
-                                self.resources.key_manager.create_encrypted_key(spending_key, None)?;
+                        )?
+                    {
+                        let commitment_mask_key_id =
+                            self.resources.key_manager.create_encrypted_key(spending_key, None)?;
 
-                            let rewound_output = WalletOutput::new_from_transaction_output(
-                                committed_value,
-                                commitment_mask_key_id,
-                                payment_id,
-                                output,
-                                ExecutionStack::new(vec![]),
-                                script_private_key,
-                            );
+                        let rewound_output = WalletOutput::new_from_transaction_output(
+                            committed_value,
+                            commitment_mask_key_id,
+                            payment_id,
+                            output,
+                            ExecutionStack::new(vec![]),
+                            script_private_key,
+                        );
 
-                            scanned_outputs.push((rewound_output, OutputSource::OneSided));
-                        }
+                        scanned_outputs.push((rewound_output, OutputSource::OneSided));
                     }
                 }
                 // it is not some known key, so lets try and see if this is a stealth tx for us
@@ -3027,8 +3173,10 @@ where
         for output in outputs {
             // 2. Check if the script is a multisig script
 
-            if let [Opcode::CheckMultiSigVerify(_m, _n, pubkeys, _msg), Opcode::PushPubKey(scanned_pk)] =
-                output.script.as_slice()
+            if let [
+                Opcode::CheckMultiSigVerify(_m, _n, pubkeys, _msg),
+                Opcode::PushPubKey(scanned_pk),
+            ] = output.script.as_slice()
             {
                 debug!(
                     target: LOG_TARGET,
@@ -3232,8 +3380,8 @@ impl UtxoSelection {
 #[derive(Debug, Clone)]
 pub struct OutputInfoByTxId {
     pub statuses: Vec<OutputStatus>,
-    pub(crate) mined_height: Option<u64>,
-    pub(crate) block_hash: Option<BlockHash>,
+    pub mined_height: Option<u64>,
+    pub block_hash: Option<BlockHash>,
 }
 
 impl Display for OutputInfoByTxId {

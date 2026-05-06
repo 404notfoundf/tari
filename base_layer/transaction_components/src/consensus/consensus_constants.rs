@@ -34,7 +34,7 @@ use tari_utilities::epoch_time::EpochTime;
 
 use crate::{
     consensus::network::NetworkConsensus,
-    tari_amount::{uT, MicroMinotari},
+    tari_amount::{MicroMinotari, uT},
     tari_proof_of_work::{Difficulty, PowAlgorithm},
     transaction_components::{
         OutputFeaturesVersion,
@@ -643,7 +643,7 @@ impl ConsensusConstants {
             permitted_output_types: Self::current_permitted_output_types(),
             permitted_range_proof_types: Self::current_permitted_range_proof_types(),
             max_covenant_length: 0,
-            vn_epoch_length: 60,
+            vn_epoch_length: 80, // 15s per block * 80 ±= 20 mins
             vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
@@ -756,7 +756,7 @@ impl ConsensusConstants {
             permitted_output_types: Self::current_permitted_output_types(),
             permitted_range_proof_types: Self::current_permitted_range_proof_types(),
             max_covenant_length: 0,
-            vn_epoch_length: 60,
+            vn_epoch_length: 10,
             vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
@@ -812,7 +812,7 @@ impl ConsensusConstants {
             permitted_output_types: Self::current_permitted_output_types(),
             permitted_range_proof_types: Self::current_permitted_range_proof_types(),
             max_covenant_length: 0,
-            vn_epoch_length: 60,
+            vn_epoch_length: 10,
             vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
@@ -1146,10 +1146,10 @@ mod test {
 
     use crate::{
         consensus::{
-            emission::{Emission, EmissionSchedule},
             ConsensusConstants,
+            emission::{Emission, EmissionSchedule},
         },
-        tari_amount::{uT, MicroMinotari},
+        tari_amount::{MicroMinotari, uT},
         transaction_components::{OutputType, RangeProofType},
     };
 

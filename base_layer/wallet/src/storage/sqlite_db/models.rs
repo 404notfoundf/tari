@@ -3,23 +3,29 @@
 
 use chacha20poly1305::XChaCha20Poly1305;
 use tari_common_types::{
-    burn_proof::{BurnClaimProof, EncodedMerkleProof},
-    encryption::{decrypt_bytes_integral_nonce, encrypt_bytes_integral_nonce, Encryptable},
+    burn_proof::{EncodedMerkleProof, PartialBurnClaimProof},
+    encryption::{Encryptable, decrypt_bytes_integral_nonce, encrypt_bytes_integral_nonce},
     types::FixedHash,
 };
-use tari_transaction_components::transaction_components::TransactionKernel;
+use tari_transaction_components::{
+    MicroMinotari,
+    transaction_components::{EncryptedData, TransactionKernel},
+};
 use tari_utilities::Hidden;
 
 use crate::{error::WalletStorageError, schema, storage::serializers};
 
+#[derive(Debug)]
 pub struct DbBurnProof {
     pub id: i32,
     pub output_hash: FixedHash,
-    pub burn_proof: BurnClaimProof,
+    pub burn_proof: PartialBurnClaimProof,
     pub kernel: TransactionKernel,
     pub kernel_merkle_proof: Option<EncodedMerkleProof>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
+    pub encrypted_data: Option<EncryptedData>,
+    pub value: Option<MicroMinotari>,
 }
 
 impl TryFrom<BurntProofSql> for DbBurnProof {
@@ -35,6 +41,19 @@ impl TryFrom<BurntProofSql> for DbBurnProof {
             .transpose()?;
         let output_hash = FixedHash::try_from(value.output_hash.as_slice())
             .map_err(|e| WalletStorageError::ConversionError(format!("Invalid output hash length in DB: {}", e)))?;
+        let encrypted_data = match value.encrypted_data {
+            Some(data) => Some(EncryptedData::from_bytes(data.as_slice()).map_err(|e| {
+                WalletStorageError::ConversionError(format!("Invalid encrypted data length in DB: {}", e))
+            })?),
+            None => None,
+        };
+        let v = match value.value {
+            Some(v) => Some(MicroMinotari(u64::try_from(v).map_err(|e| {
+                WalletStorageError::ConversionError(format!("Invalid value in DB: {}", e))
+            })?)),
+            None => None,
+        };
+
         Ok(Self {
             id: value.id,
             output_hash,
@@ -43,6 +62,8 @@ impl TryFrom<BurntProofSql> for DbBurnProof {
             kernel_merkle_proof,
             created_at: value.created_at,
             updated_at: value.updated_at,
+            encrypted_data,
+            value: v,
         })
     }
 }
@@ -58,6 +79,14 @@ pub(crate) struct BurntProofSql {
     pub kernel_merkle_proof: Option<Vec<u8>>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
+    pub encrypted_data: Option<Vec<u8>>,
+    pub value: Option<i64>,
+    // These fields are here to match the schema. They are not
+    // read at present but may be used in future.
+    #[allow(dead_code)]
+    pub kernel_excess: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    pub kernel_excess_sig: Option<Vec<u8>>,
 }
 
 fn get_encryption_domain(commitment: &[u8], field_name: &'static str) -> Vec<u8> {
@@ -90,6 +119,10 @@ pub(crate) struct NewBurntProofSql<'a> {
     pub burn_proof: Vec<u8>,
     pub kernel: Vec<u8>,
     pub kernel_merkle_proof: Option<&'a [u8]>,
+    pub encrypted_data: Option<&'a [u8]>,
+    pub value: Option<i64>,
+    pub kernel_excess: Option<&'a [u8]>,
+    pub kernel_excess_sig: Option<&'a [u8]>,
 }
 
 impl<'a> NewBurntProofSql<'a> {
@@ -100,6 +133,10 @@ impl<'a> NewBurntProofSql<'a> {
         kernel: Vec<u8>,
         kernel_merkle_proof: Option<&'a [u8]>,
         cipher: &XChaCha20Poly1305,
+        encrypted_data: Option<&'a [u8]>,
+        value: Option<i64>,
+        kernel_excess: Option<&'a [u8]>,
+        kernel_excess_sig: Option<&'a [u8]>,
     ) -> Result<Self, WalletStorageError> {
         let burn_proof = encrypt_bytes_integral_nonce(
             cipher,
@@ -113,6 +150,10 @@ impl<'a> NewBurntProofSql<'a> {
             burn_proof,
             kernel,
             kernel_merkle_proof,
+            encrypted_data,
+            value,
+            kernel_excess,
+            kernel_excess_sig,
         };
         Ok(entry)
     }

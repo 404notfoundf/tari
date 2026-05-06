@@ -36,21 +36,23 @@ use digest::Digest;
 use log::*;
 use minotari_app_grpc::tls::certs::{generate_self_signed_certs, print_warning, write_cert_to_disk};
 use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
+use minotari_node_wallet_client::BaseNodeWalletClient;
 use minotari_wallet::{
-    output_manager_service::{
-        handle::{OutputManagerEvent, OutputManagerHandle},
-        service::UseOutput,
-        UtxoSelectionCriteria,
-    },
-    transaction_service::{
-        handle::{TransactionEvent, TransactionServiceHandle},
-        storage::models::WalletTransaction,
-    },
-    utxo_scanner_service::handle::UtxoScannerEvent,
     TransactionStage,
     WalletConfig,
     WalletKeyManager,
     WalletSqlite,
+    connectivity_service::WalletConnectivityInterface,
+    output_manager_service::{
+        UtxoSelectionCriteria,
+        handle::{OutputManagerEvent, OutputManagerHandle},
+        service::UseOutput,
+    },
+    transaction_service::{
+        handle::{TransactionEvent, TransactionServiceHandle},
+        storage::models::{CompletedTransaction, WalletTransaction},
+    },
+    utxo_scanner_service::handle::UtxoScannerEvent,
 };
 use serde::Serialize;
 use sha2::Sha256;
@@ -73,11 +75,11 @@ use tari_common_types::{
 };
 use tari_core::blocks::pre_mine::get_pre_mine_items;
 use tari_crypto::ristretto::RistrettoSecretKey;
-use tari_p2p::{auto_update::AutoUpdateConfig, PeerSeedsConfig};
-use tari_script::{push_pubkey_script, CompressedCheckSigSchnorrSignature};
+use tari_p2p::{PeerSeedsConfig, auto_update::AutoUpdateConfig};
+use tari_script::{CompressedCheckSigSchnorrSignature, push_pubkey_script};
 use tari_shutdown::Shutdown;
 use tari_transaction_components::{
-    key_manager::{wallet_types::WalletType, TariKeyId, TransactionKeyManagerInterface},
+    key_manager::{TariKeyId, TransactionKeyManagerInterface, wallet_types::WalletType},
     multisig::script::is_multisig_utxo,
     offline_signing::models::{
         PrepareDepositMultisigTransactionResult,
@@ -86,11 +88,9 @@ use tari_transaction_components::{
         SignedOneSidedTransactionResult,
         TransactionResult,
     },
-    tari_amount::{uT, MicroMinotari, Minotari},
+    rpc::models::TxLocation,
+    tari_amount::{MicroMinotari, Minotari, uT},
     transaction_components::{
-        covenants::Covenant,
-        memo_field::{MemoField, TxType},
-        one_sided::public_key_to_output_encryption_key,
         EncryptedData,
         OutputFeatures,
         Transaction,
@@ -101,10 +101,13 @@ use tari_transaction_components::{
         TransactionOutputVersion,
         UnblindedOutput,
         WalletOutput,
+        covenants::Covenant,
+        memo_field::{MemoField, TxType},
+        one_sided::public_key_to_output_encryption_key,
     },
 };
 use tari_transaction_key_manager::legacy_key_manager::wallet_types::LegacyWalletType;
-use tari_utilities::{encoding::MBase58, hex::Hex, ByteArray, SafePassword};
+use tari_utilities::{ByteArray, SafePassword, encoding::MBase58, hex::Hex};
 use tokio::{
     sync::{broadcast, mpsc},
     time::{sleep, timeout},
@@ -113,17 +116,6 @@ use tokio::{
 use super::error::CommandError;
 use crate::{
     automation::{
-        utils::{
-            create_pre_mine_output_dir,
-            get_file_name,
-            move_session_file_to_session_dir,
-            out_dir,
-            read_and_verify,
-            read_session_info,
-            read_verify_session_info,
-            write_json_object_to_file_as_line,
-            write_to_json_file,
-        },
         PreMineSpendStep1SessionInfo,
         PreMineSpendStep2OutputsForLeader,
         PreMineSpendStep2OutputsForSelf,
@@ -136,6 +128,17 @@ use crate::{
         Step3OutputsForParties,
         Step3OutputsForSelf,
         Step4OutputsForLeader,
+        utils::{
+            create_pre_mine_output_dir,
+            get_file_name,
+            move_session_file_to_session_dir,
+            out_dir,
+            read_and_verify,
+            read_session_info,
+            read_verify_session_info,
+            write_json_object_to_file_as_line,
+            write_to_json_file,
+        },
     },
     cli::{CliCommands, CliRecipientInfo, MakeItRainTransactionType},
     init::init_wallet,
@@ -2229,7 +2232,7 @@ pub async fn command_runner(
                         (_, _) => {
                             return Err(CommandError::General(
                                 "Either seed words or cipher seed must be provided".to_string(),
-                            ))
+                            ));
                         },
                     };
 
@@ -2238,7 +2241,12 @@ pub async fn command_runner(
                     let shutdown = Shutdown::new();
                     let shutdown_signal = shutdown.to_signal();
                     let mut new_config = config.clone();
-                    new_config.set_base_path(temp_path.clone());
+                    // Directly set paths to temp_path. We cannot use set_base_path here because
+                    // config paths may already be absolute (set during wallet initialization), and
+                    // set_base_path only modifies relative paths.
+                    new_config.data_dir = temp_path.clone();
+                    new_config.config_dir = temp_path.join("config");
+                    new_config.db_file = temp_path.join("console_wallet.db");
 
                     let peer_config = PeerSeedsConfig::default();
                     let new_wallet = init_wallet(
@@ -2729,13 +2737,13 @@ pub async fn command_runner(
                     .await
                     .map_err(CommandError::TransactionServiceError);
                 match result {
-                    Ok(tx_id) => {
+                    Ok(mut ids) => {
                         debug!(
                             target: LOG_TARGET,
-                            "broadcast-signed-one-sided-transaction concluded with tx_id {tx_id}"
+                            "broadcast-signed-one-sided-transaction concluded with tx_id {:?}", ids
                         );
-                        println!("Transaction ID: {tx_id}");
-                        tx_ids.push(tx_id);
+                        println!("Transaction ID: {:?}", ids);
+                        tx_ids.append(&mut ids);
                     },
                     Err(e) => eprintln!("BroadcastSignedOneSidedTransaction error! {e}"),
                 }
@@ -2803,6 +2811,426 @@ pub async fn command_runner(
                         .db
                         .clear_scanned_blocks_from_and_higher(args.from_height)
                         .map_err(|e| CommandError::General(format!("{e}")))?;
+                }
+            },
+            ExportAudit(args) => {
+                match transaction_service
+                    .get_completed_transactions(None, None, None, 0)
+                    .await
+                {
+                    Ok(txs) => {
+                        let filtered: Vec<_> = txs
+                            .into_iter()
+                            .filter(|tx| {
+                                let ts = tx.mined_timestamp.unwrap_or(tx.timestamp);
+                                if let Some(start) = args.start_date &&
+                                    ts < start
+                                {
+                                    return false;
+                                }
+                                if let Some(end) = args.end_date &&
+                                    ts > end
+                                {
+                                    return false;
+                                }
+                                true
+                            })
+                            .collect();
+                        println!("Exporting {} transaction(s) to audit CSV...", filtered.len());
+                        match write_audit_to_csv_file(filtered, args.output_file, args.conversion_rate, &args.currency)
+                        {
+                            Ok(()) => println!("Audit export complete."),
+                            Err(e) => eprintln!("ExportAudit error! {e}"),
+                        }
+                    },
+                    Err(e) => eprintln!("ExportAudit error! {e}"),
+                }
+            },
+            DebugTransaction(args) => match transaction_service.get_completed_transaction(args.tx_id.into()).await {
+                Ok(completed_tx) => {
+                    println!("--- Completed Transaction ---");
+                    println!("{:#?}", completed_tx);
+
+                    match output_service.fetch_outputs_by_tx_id(args.tx_id.into()).await {
+                        Ok(db_outputs) => {
+                            let (input_outputs, received_outputs): (Vec<_>, Vec<_>) = db_outputs
+                                .into_iter()
+                                .partition(|o| o.spent_in_tx_id == Some(args.tx_id.into()));
+
+                            println!(
+                                "\n--- Inputs ({} DbWalletOutputs spent in this tx) ---",
+                                input_outputs.len()
+                            );
+                            for (i, output) in input_outputs.iter().enumerate() {
+                                println!("\nInput #{}", i + 1);
+                                println!("{:#?}", output);
+                            }
+
+                            println!(
+                                "\n--- Outputs ({} DbWalletOutputs received in this tx) ---",
+                                received_outputs.len()
+                            );
+                            for (i, output) in received_outputs.iter().enumerate() {
+                                println!("\nOutput #{}", i + 1);
+                                println!("{:#?}", output);
+                            }
+                        },
+                        Err(e) => eprintln!("DebugTransaction error fetching outputs: {e}"),
+                    }
+                },
+                Err(e) => eprintln!("DebugTransaction error! Could not find completed transaction: {e}"),
+            },
+            ValidateTransaction(args) => {
+                let tx_id: TxId = args.tx_id.into();
+                match transaction_service.get_completed_transaction(tx_id).await {
+                    Ok(completed_tx) => {
+                        let has_signature = completed_tx.transaction_signature != CompressedSignature::default();
+                        println!("--- Validate Transaction {} ---", tx_id);
+                        if has_signature {
+                            println!("Transaction has a signature, validating via base node query...");
+                            let client = wallet.wallet_connectivity.obtain_base_node_wallet_rpc_client().await;
+                            match client.get_tip_info().await {
+                                Ok(tip_info) => {
+                                    let tip = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+                                    println!("Current chain tip height: {}", tip);
+                                    let sig = &completed_tx.transaction_signature;
+                                    match client
+                                        .transaction_query(
+                                            sig.get_compressed_public_nonce().as_bytes().to_vec(),
+                                            sig.get_signature().as_bytes().to_vec(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => {
+                                            if response.location == TxLocation::Mined {
+                                                if let Some(mined_height) = response.mined_height {
+                                                    let num_confirmations = tip.saturating_sub(mined_height);
+                                                    println!("Transaction is MINED at height {}", mined_height);
+                                                    println!("Confirmations: {}", num_confirmations);
+                                                    if let Some(hash) = response.mined_header_hash {
+                                                        println!("Mined in block: {}", hash.to_hex());
+                                                    }
+                                                    if let Some(ts) = response.mined_timestamp {
+                                                        println!("Mined timestamp: {}", ts);
+                                                    }
+                                                } else {
+                                                    println!("Transaction is reported as mined but has no height");
+                                                }
+                                            } else {
+                                                println!("Transaction is UNMINED (not found on chain)");
+                                            }
+                                        },
+                                        Err(e) => eprintln!("Error querying base node: {e}"),
+                                    }
+                                },
+                                Err(e) => eprintln!("Error getting tip info: {e}"),
+                            }
+                        } else {
+                            println!(
+                                "Transaction has no signature (detected/imported), validating via output manager..."
+                            );
+                            match output_service.get_output_info_for_tx_id(tx_id).await {
+                                Ok(output_info) => {
+                                    println!("Output info: {:?}", output_info);
+                                    if let (Some(mined_height), Some(block_hash)) =
+                                        (output_info.mined_height, output_info.block_hash)
+                                    {
+                                        let client =
+                                            wallet.wallet_connectivity.obtain_base_node_wallet_rpc_client().await;
+                                        let tip = match client.get_tip_info().await {
+                                            Ok(tip_info) => {
+                                                tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0)
+                                            },
+                                            Err(e) => {
+                                                eprintln!("Error getting tip info: {e}");
+                                                0
+                                            },
+                                        };
+                                        let num_confirmations = tip.saturating_sub(mined_height);
+                                        println!("Transaction outputs MINED at height {}", mined_height);
+                                        println!("Mined in block: {}", block_hash.to_hex());
+                                        println!("Confirmations: {}", num_confirmations);
+                                        println!("Current tip: {}", tip);
+                                        let is_confirmed = num_confirmations >= 3;
+                                        println!("Confirmed: {}", is_confirmed);
+                                    } else {
+                                        println!("Transaction outputs are NOT mined (not detected on chain)");
+                                    }
+                                },
+                                Err(e) => eprintln!("Error getting output info: {e}"),
+                            }
+                        }
+                    },
+                    Err(e) => eprintln!("ValidateTransaction error! Could not find completed transaction: {e}"),
+                }
+            },
+            ValidateOutputs(args) => {
+                use minotari_wallet::output_manager_service::storage::sqlite_db::{
+                    ReceivedOutputInfoForBatch,
+                    SpentOutputInfoForBatch,
+                };
+
+                println!("--- Validate and Fix Outputs ---");
+                let client = wallet.wallet_connectivity.obtain_base_node_wallet_rpc_client().await;
+
+                let tip_info = match client.get_tip_info().await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        eprintln!("Error getting tip info: {e}");
+                        continue;
+                    },
+                };
+                let tip_height = tip_info.metadata.map(|m| m.best_block_height()).unwrap_or(0);
+                println!("Chain tip height: {}", tip_height);
+
+                let num_confirmations_required = config.transaction_service_config.num_confirmations_required;
+
+                let mut mined_updates = Vec::new();
+                let mut spent_updates = Vec::new();
+                let mut unmined_invalid = Vec::new();
+                let mut unspent_updates = Vec::new();
+
+                for hex in &args.commitments {
+                    println!("\n--- Commitment: {} ---", hex);
+
+                    let commitment = match CompressedCommitment::from_hex(hex) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Invalid commitment hex format: {}", e);
+                            continue;
+                        },
+                    };
+
+                    let db_output = match output_service
+                        .get_outputs_by_commitments(vec![commitment.clone()])
+                        .await
+                    {
+                        Ok(outputs) if !outputs.is_empty() => {
+                            let output = outputs.into_iter().next().expect("checked not empty");
+                            println!(
+                                "Found in wallet DB - status: {}, hash: {}",
+                                output.status,
+                                output.hash.to_hex()
+                            );
+                            output
+                        },
+                        Ok(_) => {
+                            println!("Output not found in wallet DB");
+                            continue;
+                        },
+                        Err(e) => {
+                            eprintln!("Error querying wallet DB: {}", e);
+                            continue;
+                        },
+                    };
+
+                    // Report wallet state
+                    if let Some(mined_height) = db_output.mined_height {
+                        println!("Wallet: mined at height {}", mined_height);
+                        if let Some(block_hash) = db_output.mined_in_block {
+                            println!("Wallet: mined in block {}", block_hash.to_hex());
+                        }
+                    } else {
+                        println!("Wallet: unmined");
+                    }
+
+                    if let Some(height) = db_output.marked_deleted_at_height {
+                        println!("Wallet: marked deleted at height {}", height);
+                    }
+
+                    if let Some(tx_id) = db_output.received_in_tx_id {
+                        println!("Wallet: received in tx_id {}", tx_id);
+                    }
+                    if let Some(tx_id) = db_output.spent_in_tx_id {
+                        println!("Wallet: spent in tx_id {}", tx_id);
+                    }
+
+                    // Validate against base node - mined info
+                    let output_hash = db_output.hash.to_vec();
+                    match client.get_utxos_mined_info(vec![output_hash.clone()], 2).await {
+                        Ok(response) => {
+                            let found_in_utxos = response.utxos.iter().find(|u| u.utxo_hash == output_hash);
+                            let found_in_mempool = response.mempool_utxos.contains(&output_hash);
+
+                            if let Some(mined_info) = found_in_utxos {
+                                let mined_height = mined_info.mined_in_height;
+                                let confirmations = tip_height.saturating_sub(mined_height);
+                                let confirmed = confirmations >= num_confirmations_required;
+                                println!(
+                                    "Chain: MINED at height {} (confirmations: {}, confirmed: {})",
+                                    mined_height, confirmations, confirmed
+                                );
+                                println!("Chain: mined in block {}", mined_info.mined_in_hash.to_hex());
+
+                                match db_output.mined_height {
+                                    Some(wallet_height) if wallet_height != mined_height => {
+                                        let block_hash = FixedHash::try_from(mined_info.mined_in_hash.as_slice())
+                                            .unwrap_or_default();
+                                        mined_updates.push(ReceivedOutputInfoForBatch {
+                                            commitment: commitment.clone(),
+                                            mined_height,
+                                            mined_in_block: block_hash,
+                                            confirmed,
+                                            mined_timestamp: mined_info.mined_in_timestamp,
+                                        });
+                                        println!(
+                                            "FIX: wallet mined_height ({}) differs from chain ({}), updating",
+                                            wallet_height, mined_height
+                                        );
+                                    },
+                                    None => {
+                                        let block_hash = FixedHash::try_from(mined_info.mined_in_hash.as_slice())
+                                            .unwrap_or_default();
+                                        mined_updates.push(ReceivedOutputInfoForBatch {
+                                            commitment: commitment.clone(),
+                                            mined_height,
+                                            mined_in_block: block_hash,
+                                            confirmed,
+                                            mined_timestamp: mined_info.mined_in_timestamp,
+                                        });
+                                        println!(
+                                            "FIX: wallet reports unmined but chain says mined at {}, updating",
+                                            mined_height
+                                        );
+                                    },
+                                    _ => {
+                                        println!("OK: wallet mined_height matches chain");
+                                    },
+                                }
+                            } else if found_in_mempool {
+                                println!("Chain: IN MEMPOOL (not yet mined)");
+                            } else {
+                                println!("Chain: NOT FOUND in UTXO set or mempool");
+                                if db_output.mined_height.is_some() {
+                                    unmined_invalid.push(db_output.hash);
+                                    println!(
+                                        "FIX: wallet reports mined but chain says not found, marking as unmined and \
+                                         invalid"
+                                    );
+                                }
+                            }
+                        },
+                        Err(e) => eprintln!("Error querying base node for mined info: {e}"),
+                    }
+
+                    // Check if spent
+                    match client.query_deleted_utxos(vec![output_hash], vec![]).await {
+                        Ok(response) => {
+                            if let Some(deleted_info) = response.utxos.first() {
+                                match (&deleted_info.found_in_header, &deleted_info.spent_in_header) {
+                                    (Some((found_height, _)), Some((spent_height, spent_hash))) => {
+                                        let confirmations = tip_height.saturating_sub(*spent_height);
+                                        let confirmed = confirmations >= num_confirmations_required;
+                                        println!("Chain: output found at height {}", found_height);
+                                        println!(
+                                            "Chain: SPENT at height {} in block {} (confirmations: {}, confirmed: {})",
+                                            spent_height,
+                                            spent_hash.to_hex(),
+                                            confirmations,
+                                            confirmed
+                                        );
+
+                                        match db_output.marked_deleted_at_height {
+                                            Some(wallet_height) if wallet_height != *spent_height => {
+                                                let block_hash =
+                                                    FixedHash::try_from(spent_hash.as_slice()).unwrap_or_default();
+                                                spent_updates.push(SpentOutputInfoForBatch {
+                                                    commitment: commitment.clone(),
+                                                    confirmed,
+                                                    mark_deleted_at_height: *spent_height,
+                                                    mark_deleted_in_block: block_hash,
+                                                });
+                                                println!(
+                                                    "FIX: wallet deleted_at_height ({}) differs from chain ({}), \
+                                                     updating",
+                                                    wallet_height, spent_height
+                                                );
+                                            },
+                                            None => {
+                                                let block_hash =
+                                                    FixedHash::try_from(spent_hash.as_slice()).unwrap_or_default();
+                                                spent_updates.push(SpentOutputInfoForBatch {
+                                                    commitment: commitment.clone(),
+                                                    confirmed,
+                                                    mark_deleted_at_height: *spent_height,
+                                                    mark_deleted_in_block: block_hash,
+                                                });
+                                                println!(
+                                                    "FIX: wallet reports not deleted but chain says spent at {}, \
+                                                     updating",
+                                                    spent_height
+                                                );
+                                            },
+                                            _ => {
+                                                println!("OK: wallet spent state matches chain");
+                                            },
+                                        }
+                                    },
+                                    (Some((found_height, _)), None) => {
+                                        println!("Chain: output found at height {} and NOT spent", found_height);
+                                        if db_output.marked_deleted_at_height.is_some() {
+                                            let confirmed = db_output
+                                                .mined_height
+                                                .map(|h| tip_height.saturating_sub(h) >= num_confirmations_required)
+                                                .unwrap_or(false);
+                                            unspent_updates.push((db_output.hash, confirmed));
+                                            println!(
+                                                "FIX: wallet reports deleted but chain says not spent, marking as \
+                                                 unspent"
+                                            );
+                                        }
+                                    },
+                                    (None, _) => {
+                                        println!("Chain: output NOT FOUND in deleted UTXO query");
+                                    },
+                                }
+                            }
+                        },
+                        Err(e) => eprintln!("Error querying base node for deleted info: {e}"),
+                    }
+                }
+
+                // Apply collected fixes
+                if !mined_updates.is_empty() ||
+                    !spent_updates.is_empty() ||
+                    !unmined_invalid.is_empty() ||
+                    !unspent_updates.is_empty()
+                {
+                    println!(
+                        "\nApplying fixes: mined={}, spent={}, unmined_invalid={}, unspent={}",
+                        mined_updates.len(),
+                        spent_updates.len(),
+                        unmined_invalid.len(),
+                        unspent_updates.len()
+                    );
+                    match output_service
+                        .update_output_validation_state(mined_updates, spent_updates, unmined_invalid, unspent_updates)
+                        .await
+                    {
+                        Ok(()) => println!("Fixes applied successfully"),
+                        Err(e) => eprintln!("Error applying fixes: {e}"),
+                    }
+                } else {
+                    println!("\nNo fixes needed - all outputs match chain state");
+                }
+            },
+            RevalidateAllTransactions => {
+                println!("--- Revalidate All Transactions ---");
+                match transaction_service.revalidate_all_transactions().await {
+                    Ok(()) => println!("Transaction revalidation started successfully"),
+                    Err(e) => eprintln!("RevalidateAllTransactions error: {e}"),
+                }
+            },
+            RevalidateAllOutputs => {
+                println!("--- Revalidate All Outputs ---");
+                match output_service.revalidate_all_outputs().await {
+                    Ok(request_key) => {
+                        println!(
+                            "Output revalidation started successfully (request key: {})",
+                            request_key
+                        )
+                    },
+                    Err(e) => eprintln!("RevalidateAllOutputs error: {e}"),
                 }
             },
         }
@@ -2934,7 +3362,7 @@ fn verify_no_duplicate_indexes(recipient_info: &[CliRecipientInfo]) -> Result<()
 
 fn sort_args_recipient_info(recipient_info: Vec<CliRecipientInfo>) -> Vec<CliRecipientInfo> {
     let mut args_recipient_info = recipient_info;
-    args_recipient_info.sort_by(|a, b| a.recipient_address.to_hex().cmp(&b.recipient_address.to_hex()));
+    args_recipient_info.sort_by_key(|a| a.recipient_address.to_hex());
     args_recipient_info.iter_mut().for_each(|v| v.output_indexes.sort());
     args_recipient_info
 }
@@ -2984,9 +3412,8 @@ fn get_all_embedded_pre_mine_outputs() -> Result<Vec<TransactionOutput>, Command
         },
     };
     let mut utxos = Vec::new();
-    let mut counter = 1;
     let lines_count = pre_mine_contents.lines().count();
-    for line in pre_mine_contents.lines() {
+    for (counter, line) in (1..).zip(pre_mine_contents.lines()) {
         if counter < lines_count {
             let utxo: Option<TransactionOutput> = serde_json::from_str(line).ok();
             if let Some(utxo) = utxo {
@@ -2995,7 +3422,6 @@ fn get_all_embedded_pre_mine_outputs() -> Result<Vec<TransactionOutput>, Command
         } else {
             break;
         }
-        counter += 1;
     }
 
     Ok(utxos)
@@ -3076,4 +3502,82 @@ fn load_tx_from_csv_file(file_path: PathBuf) -> Result<Vec<WalletTransaction>, C
         }
     }
     Ok(results)
+}
+
+fn write_audit_to_csv_file(
+    transactions: Vec<CompletedTransaction>,
+    file_path: PathBuf,
+    conversion_rate: Option<f64>,
+    currency: &str,
+) -> Result<(), CommandError> {
+    use tari_common_types::transaction::TransactionDirection;
+
+    let file = File::create(file_path).map_err(|e| CommandError::CSVFile(e.to_string()))?;
+    let mut csv_file = LineWriter::new(file);
+
+    // Write header
+    writeln!(
+        csv_file,
+        r#""ID","Transaction Hash","Status","Transaction Type","DateTime (UTC)","From Address","To Address","Amount","AmountTicker","Amount ({currency})","Txn Fee","FeeTicker","Fee ({currency})""#,
+        currency = currency,
+    )
+    .map_err(|e| CommandError::CSVFile(e.to_string()))?;
+
+    for tx in &transactions {
+        // Determine transaction type: Deposit = inbound/coinbase, Withdraw = outbound
+        let tx_type = if tx.direction == TransactionDirection::Inbound || tx.status.is_coinbase() {
+            "Deposit"
+        } else {
+            "Withdraw"
+        };
+
+        // Human-readable status
+        let status = format!("{}", tx.status);
+
+        // Transaction hash: use the excess signature nonce as the hash (first kernel)
+        let tx_hash = tx
+            .transaction
+            .body
+            .kernels()
+            .first()
+            .map(|k| format!("0x{}", k.hash().to_hex()))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        // DateTime: prefer mined timestamp, fall back to creation timestamp
+        let datetime = tx.mined_timestamp.unwrap_or(tx.timestamp);
+        let datetime_str = datetime.format("%-m/%-d/%y %-H:%M").to_string();
+
+        // Amount in base units (MicroMinotari) → display as Minotari
+        let amount_minotari = tx.amount.as_u64() as f64 / 1_000_000.0;
+        let fee_minotari = tx.fee.as_u64() as f64 / 1_000_000.0;
+
+        // Fiat conversion
+        let (amount_fiat, fee_fiat) = if let Some(rate) = conversion_rate {
+            (
+                format!("{}{:.2}", currency, amount_minotari * rate),
+                format!("{}{:.2}", currency, fee_minotari * rate),
+            )
+        } else {
+            ("N/A".to_string(), "N/A".to_string())
+        };
+
+        writeln!(
+            csv_file,
+            r#""{tx_id}","{tx_hash}","{status}","{tx_type}","{datetime}","{from_addr}","{to_addr}","{amount:.8}","XTM","{amount_fiat}","{fee:.8}","XTM","{fee_fiat}""#,
+            tx_id = tx.tx_id,
+            tx_hash = tx_hash,
+            status = status,
+            tx_type = tx_type,
+            datetime = datetime_str,
+            from_addr = tx.source_address,
+            to_addr = tx.destination_address,
+            amount = amount_minotari,
+            amount_fiat = amount_fiat,
+            fee = fee_minotari,
+            fee_fiat = fee_fiat,
+        )
+        .map_err(|e| CommandError::CSVFile(e.to_string()))?;
+    }
+
+    Ok(())
 }

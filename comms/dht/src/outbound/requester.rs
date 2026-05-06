@@ -21,7 +21,7 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use log::*;
-use tari_comms::{peer_manager::NodeId, types::CommsPublicKey, wrap_in_envelope_body, BytesMut};
+use tari_comms::{BytesMut, peer_manager::NodeId, types::CommsPublicKey, wrap_in_envelope_body};
 use tokio::sync::{mpsc, oneshot};
 
 use super::message::DhtOutboundRequest;
@@ -30,11 +30,11 @@ use crate::{
     domain_message::OutboundDomainMessage,
     envelope::NodeDestination,
     outbound::{
+        DhtOutboundError,
+        MessageSendStates,
         message::{OutboundEncryption, SendMessageResponse},
         message_params::{FinalSendMessageParams, SendMessageParams},
         message_send_state::MessageSendState,
-        DhtOutboundError,
-        MessageSendStates,
     },
 };
 
@@ -179,33 +179,6 @@ impl OutboundMessageRequester {
                 .with_debug_info(format!("broadcast requested from {source_info}"))
                 .with_encryption(encryption)
                 .with_destination(destination)
-                .finish(),
-            message,
-        )
-        .await?
-        .resolve()
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Send to peers closer to the given `NodeId`. This strategy will attempt to establish new some closer connections.
-    ///
-    /// Use this strategy to broadcast a message destined for a particular peer.
-    pub async fn closest_broadcast<T>(
-        &mut self,
-        destination_public_key: CommsPublicKey,
-        encryption: OutboundEncryption,
-        exclude_peers: Vec<NodeId>,
-        message: OutboundDomainMessage<T>,
-    ) -> Result<MessageSendStates, DhtOutboundError>
-    where
-        T: prost::Message,
-    {
-        self.send_message(
-            SendMessageParams::new()
-                .closest(NodeId::from_public_key(&destination_public_key), exclude_peers)
-                .with_encryption(encryption)
-                .with_destination(destination_public_key.into())
                 .finish(),
             message,
         )

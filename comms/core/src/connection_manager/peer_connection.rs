@@ -24,8 +24,8 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,27 +39,27 @@ use tokio::{
     time,
 };
 use tokio_stream::StreamExt;
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use super::{direction::ConnectionDirection, error::PeerConnectionError, manager::ConnectionManagerEvent};
 #[cfg(feature = "rpc")]
 use crate::protocol::rpc::{
-    pool::RpcClientPool,
-    pool::RpcPoolClient,
     NamedProtocolService,
+    RPC_MAX_FRAME_SIZE,
     RpcClient,
     RpcClientBuilder,
     RpcError,
-    RPC_MAX_FRAME_SIZE,
+    pool::RpcClientPool,
+    pool::RpcPoolClient,
 };
 use crate::{
+    Minimized,
     framing,
     framing::CanonicalFraming,
     multiplexing::{Control, IncomingSubstreams, Substream, Yamux, YamuxControlError},
     peer_manager::{NodeId, PeerFeatures},
     protocol::{ProtocolId, ProtocolNegotiation},
     utils::atomic_ref_counter::AtomicRefCounter,
-    Minimized,
 };
 
 const LOG_TARGET: &str = "comms::connection_manager::peer_connection";
@@ -229,8 +229,11 @@ impl PeerConnection {
         protocol_id: &ProtocolId,
     ) -> Result<NegotiatedSubstream<Substream>, PeerConnectionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _unused = self
-            .request_tx
+        // NB: on send failure the returned SendError owns the unsent request — and therefore the
+        // reply_tx inside it. We must not hold that error alive across the reply_rx.await below, or
+        // the await will block forever waiting for a sender that can never send. Propagate via `?`
+        // so the error (and its captured reply_tx) is dropped immediately.
+        self.request_tx
             .send(PeerConnectionRequest::OpenSubstream {
                 protocol_id: protocol_id.clone(),
                 reply_tx,
@@ -244,7 +247,7 @@ impl PeerConnection {
                     self.peer_node_id,
                     e
                 );
-            });
+            })?;
         reply_rx
             .await
             .map_err(|_| PeerConnectionError::InternalReplyCancelled)?

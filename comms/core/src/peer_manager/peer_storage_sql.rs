@@ -28,14 +28,13 @@ use multiaddr::Multiaddr;
 use crate::{
     net_address::PeerAddressSource,
     peer_manager::{
-        database::{PeerDatabaseSql, ThisPeerIdentity},
-        peer::Peer,
-        peer_id::PeerId,
-        NodeDistance,
         NodeId,
         PeerFeatures,
         PeerFlags,
         PeerManagerError,
+        database::{PeerDatabaseSql, ThisPeerIdentity},
+        peer::Peer,
+        peer_id::PeerId,
     },
     types::{CommsDatabase, CommsPublicKey, TransportProtocol},
 };
@@ -242,34 +241,6 @@ impl PeerStorageSql {
         )?)
     }
 
-    /// Compile a list of closest `n` active peers
-    pub fn closest_n_active_peers(
-        &self,
-        region_node_id: &NodeId,
-        n: usize,
-        excluded_peers: &[NodeId],
-        features: Option<PeerFeatures>,
-        peer_flags: Option<PeerFlags>,
-        stale_peer_threshold: Option<Duration>,
-        exclude_if_all_address_failed: bool,
-        exclusion_distance: Option<NodeDistance>,
-        external_addresses_only: bool,
-        transport_protocols: &[TransportProtocol],
-    ) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self.peer_db.get_closest_n_active_peers(
-            region_node_id,
-            n,
-            excluded_peers,
-            features,
-            peer_flags,
-            stale_peer_threshold,
-            exclude_if_all_address_failed,
-            exclusion_distance,
-            external_addresses_only,
-            transport_protocols,
-        )?)
-    }
-
     /// Get all seed peers
     pub fn get_seed_peers(&self) -> Result<Vec<Peer>, PeerManagerError> {
         let seed_peers = self.peer_db.get_seed_peers()?;
@@ -289,58 +260,11 @@ impl PeerStorageSql {
         exclude_peers: &[NodeId],
         flags: Option<PeerFlags>,
         transport_protocols: &[TransportProtocol],
+        known_good: bool,
     ) -> Result<Vec<Peer>, PeerManagerError> {
         Ok(self
             .peer_db
-            .get_n_random_peers(n, exclude_peers, flags, transport_protocols)?)
-    }
-
-    /// Get the closest `n` not failed, banned or deleted peers, ordered by their distance to the given node ID.
-    pub fn get_closest_n_good_standing_peers(
-        &self,
-        n: usize,
-        features: PeerFeatures,
-    ) -> Result<Vec<Peer>, PeerManagerError> {
-        Ok(self.peer_db.get_closest_n_good_standing_peers(n, features)?)
-    }
-
-    /// Check if a specific node_id is in the network region of the N nearest neighbours of the region specified by
-    /// region_node_id. If there are less than N known peers, this will _always_ return true
-    pub fn in_network_region(&self, node_id: &NodeId, n: usize) -> Result<bool, PeerManagerError> {
-        let region_node_id = self.this_peer_identity().node_id;
-        let region_node_distance = region_node_id.distance(node_id);
-        let node_threshold = self.calc_region_threshold(n, PeerFeatures::COMMUNICATION_NODE)?;
-        // Is node ID in the base node threshold?
-        if region_node_distance <= node_threshold {
-            return Ok(true);
-        }
-        let client_threshold = self.calc_region_threshold(n, PeerFeatures::COMMUNICATION_CLIENT)?; // Is node ID in the base client threshold?
-        Ok(region_node_distance <= client_threshold)
-    }
-
-    /// Calculate the threshold for the region specified by region_node_id.
-    pub fn calc_region_threshold(&self, n: usize, features: PeerFeatures) -> Result<NodeDistance, PeerManagerError> {
-        let region_node_id = self.this_peer_identity().node_id;
-        if n == 0 {
-            return Ok(NodeDistance::max_distance());
-        }
-
-        let closest_peers = self.peer_db.get_closest_n_good_standing_peer_node_ids(n, features)?;
-        let mut dists = Vec::new();
-        for node_id in closest_peers {
-            dists.push(region_node_id.distance(&node_id));
-        }
-
-        if dists.is_empty() {
-            return Ok(NodeDistance::max_distance());
-        }
-
-        // If we have less than `n` matching peers in our threshold group, the threshold should be max
-        if dists.len() < n {
-            return Ok(NodeDistance::max_distance());
-        }
-
-        Ok(dists.pop().expect("dists cannot be empty at this point"))
+            .get_n_random_peers(n, exclude_peers, flags, transport_protocols, known_good)?)
     }
 
     /// Unban the peer
@@ -659,12 +583,14 @@ mod test {
                 .public_key,
             peer2.public_key
         );
-        assert!(peer_storage
-            .find_by_public_key(&peer3.public_key)
-            .unwrap()
-            .unwrap()
-            .deleted_at
-            .is_some());
+        assert!(
+            peer_storage
+                .find_by_public_key(&peer3.public_key)
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_some()
+        );
 
         assert_eq!(
             peer_storage
@@ -682,12 +608,14 @@ mod test {
                 .node_id,
             peer2.node_id
         );
-        assert!(peer_storage
-            .get_peer_by_node_id(&peer3.node_id)
-            .unwrap()
-            .unwrap()
-            .deleted_at
-            .is_some());
+        assert!(
+            peer_storage
+                .get_peer_by_node_id(&peer3.node_id)
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_some()
+        );
     }
 
     fn create_test_peer(features: PeerFeatures, ban: bool) -> Peer {
@@ -726,46 +654,6 @@ mod test {
             peer.ban_for(Duration::from_secs(600), "".to_string());
         }
         peer
-    }
-
-    #[test]
-    fn test_in_network_region() {
-        let peer_storage = get_peer_storage_sql_test_db().unwrap();
-
-        let mut nodes = repeat_with(|| create_test_peer(PeerFeatures::COMMUNICATION_NODE, false))
-            .take(5)
-            .chain(repeat_with(|| create_test_peer(PeerFeatures::COMMUNICATION_CLIENT, false)).take(4))
-            .collect::<Vec<_>>();
-
-        for p in &nodes {
-            peer_storage.add_or_update_peer(p.clone()).unwrap();
-        }
-
-        let main_peer_node_id = peer_storage.this_peer_identity().node_id;
-
-        nodes.sort_by(|a, b| {
-            a.node_id
-                .distance(&main_peer_node_id)
-                .cmp(&b.node_id.distance(&main_peer_node_id))
-        });
-
-        let db_nodes = peer_storage.peer_db.get_all_peers(None).unwrap();
-        assert_eq!(db_nodes.len(), 9);
-
-        let close_node = &nodes.first().unwrap().node_id;
-        let far_node = &nodes.last().unwrap().node_id;
-
-        let is_in_region = peer_storage.in_network_region(&main_peer_node_id, 1).unwrap();
-        assert!(is_in_region);
-
-        let is_in_region = peer_storage.in_network_region(close_node, 1).unwrap();
-        assert!(is_in_region);
-
-        let is_in_region = peer_storage.in_network_region(far_node, 9).unwrap();
-        assert!(is_in_region);
-
-        let is_in_region = peer_storage.in_network_region(far_node, 3).unwrap();
-        assert!(!is_in_region);
     }
 
     #[test]
@@ -869,19 +757,25 @@ mod test {
         let nodes_all_addresses = peer_storage
             .discovery_syncing(100, &[], Some(PeerFeatures::COMMUNICATION_NODE), false)
             .unwrap();
-        assert!(nodes_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) }));
-        assert!(nodes_all_addresses
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) }));
+        assert!(
+            nodes_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| addr.is_external()) })
+        );
+        assert!(
+            nodes_all_addresses
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().any(|addr| !addr.is_external()) })
+        );
 
         // Assert that peers have external addresses only
         let nodes_external_addresses_only = peer_storage
             .discovery_syncing(100, &[], Some(PeerFeatures::COMMUNICATION_NODE), true)
             .unwrap();
-        assert!(nodes_external_addresses_only
-            .iter()
-            .all(|p| { p.addresses.addresses().iter().all(|addr| addr.is_external()) }));
+        assert!(
+            nodes_external_addresses_only
+                .iter()
+                .all(|p| { p.addresses.addresses().iter().all(|addr| addr.is_external()) })
+        );
     }
 }

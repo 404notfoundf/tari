@@ -1340,7 +1340,7 @@ service Wallet {
   // - **commitment**: The commitment associated with the burn transaction.
   // - **ownership_proof**: A proof of ownership for the burned coins.
   // - **range_proof**: The range proof associated with the burned coins.
-  // - **reciprocal_claim_public_key**: The public key of the reciprocal claim for the burn.
+  // - **claim_public_key**: The public key used for the burn claim.
   //
   // ### Example JavaScript gRPC client usage:
   // ```javascript
@@ -1364,7 +1364,7 @@ service Wallet {
   //   "failure_message": "",
   //   "commitment": "0xcommitmenthash",
   //   "ownership_proof": "0xownershipproof",
-  //   "reciprocal_claim_public_key": "0xreciprocalpublickey"
+  //   "claim_public_key": "0xclaimpublickey"
   // }
   rpc CreateBurnTransaction(CreateBurnTransactionRequest) returns (CreateBurnTransactionResponse);
 
@@ -1919,6 +1919,9 @@ service Wallet {
   rpc GetBurnClaimProof(GetBurnClaimProofRequest) returns (GetBurnClaimProofResponse);
   rpc RescanWallet(RescanWalletRequest) returns (RescanWalletResponse);
   rpc ScanAndImportUtxos(ScanAndImportUtxosRequest) returns (ScanAndImportUtxosResponse);
+  rpc DebugTransaction(DebugTransactionRequest) returns (DebugTransactionResponse);
+  rpc ValidateTransaction(ValidateTransactionRequest) returns (ValidateTransactionResponse);
+  rpc ValidateOutputs(ValidateOutputsRequest) returns (ValidateOutputsResponse);
 }
 
 
@@ -2090,7 +2093,11 @@ message CreateBurnTransactionResponse{
   // Only provided if a burn claim key is provided
   bytes commitment = 4;
   Signature ownership_proof = 5;
-  bytes reciprocal_claim_public_key = 6;
+  bytes claim_public_key = 6;
+  bytes kernel_excess = 7;
+  bytes kernel_excess_nonce = 8;
+  bytes kernel_excess_signature = 9;
+  bytes sender_offset_public_key = 10;
 }
 
 message TransferResult {
@@ -2147,6 +2154,12 @@ message TransactionInfo {
   repeated bytes payment_references_sent = 17;
   repeated bytes payment_references_received = 18;
   repeated bytes payment_references_change = 19;
+  // The reason a transaction was rejected/cancelled, if applicable.
+  // Empty string if the transaction is not rejected.
+  string rejected_reason = 20;
+  // The highest lock height among all outputs (max of maturity and script_lock_height).
+  // Outputs cannot be spent until this height is reached.
+  uint64 lock_height = 21;
 }
 
 enum TransactionDirection {
@@ -2186,6 +2199,12 @@ enum TransactionStatus {
   TRANSACTION_STATUS_COINBASE_CONFIRMED = 13;
   // This is Coinbase transaction that is not currently detected as mined
   TRANSACTION_STATUS_COINBASE_NOT_IN_BLOCK_CHAIN = 14;
+  // This transaction is mined and confirmed but outputs are still locked (maturity not reached)
+  TRANSACTION_STATUS_MINED_CONFIRMED_LOCKED = 15;
+  // One-sided transaction confirmed but outputs are still locked
+  TRANSACTION_STATUS_ONE_SIDED_CONFIRMED_LOCKED = 16;
+  // Coinbase transaction confirmed but outputs are still locked
+  TRANSACTION_STATUS_COINBASE_CONFIRMED_LOCKED = 17;
 }
 
 message GetCompletedTransactionsRequest {
@@ -2493,6 +2512,16 @@ message GetTransactionPayRefsResponse {
   repeated bytes payment_references = 1 [deprecated = true];
   // List of input commitment info for the transaction - hash, commitment, payment reference, output category.
   repeated CommitmentInfo output_commitments_info = 2;
+  // Historical PayRefs that were superseded by reorgs (output_hash + previous payref pairs).
+  repeated HistoricalPayRef historical_payment_references = 3;
+}
+
+// A historical PayRef that was superseded due to a blockchain reorg.
+message HistoricalPayRef {
+  // The output hash this PayRef was generated for.
+  bytes output_hash = 1;
+  // The previous PayRef value (before the reorg changed the block hash).
+  bytes payment_reference = 2;
 }
 
 message CommitmentInfo {
@@ -2526,9 +2555,11 @@ message GetPaymentByReferenceRequest {
 
 // Response message containing transaction information for a payment reference
 message GetPaymentByReferenceResponse {
-  // The transaction information if PayRef is found (optional).
+  // The transaction information if PayRef is found via current PayRef (optional).
   // Returns full transaction details
   TransactionInfo transaction = 1;
+  // Transactions found via historical (superseded) PayRefs from reorgs.
+  repeated TransactionInfo historical_transactions = 2;
 }
 
 
@@ -2653,8 +2684,11 @@ message GetBurnClaimProofResponse {
 message BurnClaimProof {
   bytes commitment = 1;
   Signature ownership_proof = 2;
-  bytes reciprocal_claim_public_key = 3;
-
+  bytes claim_public_key = 3;
+  bytes kernel_excess = 4;
+  bytes kernel_excess_nonce = 5;
+  bytes kernel_excess_signature = 6;
+  bytes sender_offset_public_key = 7;
 }
 
 message EncodedMerkleProof {
@@ -2682,4 +2716,58 @@ message ScanFeedback{
   bool is_found = 2;
   uint64 tx_id = 3;
   repeated string debug_info = 4;
+}
+
+message DebugTransactionRequest {
+  uint64 tx_id = 1;
+}
+
+message DebugTransactionResponse {
+  TransactionInfo transaction_info = 1;
+  repeated DbWalletOutputInfo inputs = 2;
+  repeated DbWalletOutputInfo outputs = 3;
+}
+
+message DbWalletOutputInfo {
+  bytes commitment = 1;
+  bytes hash = 2;
+  uint64 value = 3;
+  string status = 4;
+  uint64 mined_height = 5;
+  bytes mined_in_block = 6;
+  uint64 mined_timestamp = 7;
+  uint64 marked_deleted_at_height = 8;
+  bytes marked_deleted_in_block = 9;
+  string spending_priority = 10;
+  string source = 11;
+  uint64 received_in_tx_id = 12;
+  uint64 spent_in_tx_id = 13;
+  bytes payment_id = 14;
+  string script = 15;
+  uint64 maturity = 16;
+  string features_output_type = 17;
+  bytes sender_offset_public_key = 18;
+  uint64 script_lock_height = 19;
+}
+
+message ValidateTransactionRequest {
+  uint64 tx_id = 1;
+}
+
+message ValidateTransactionResponse {
+  repeated string debug_info = 1;
+}
+
+message ValidateOutputsRequest {
+  repeated string commitments = 1;
+}
+
+message ValidateOutputsResponse {
+  repeated OutputValidationFeedback feedback = 1;
+}
+
+message OutputValidationFeedback {
+  string commitment = 1;
+  string status = 2;
+  repeated string debug_info = 3;
 }

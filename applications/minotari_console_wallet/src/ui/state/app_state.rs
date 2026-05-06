@@ -23,7 +23,6 @@
 #![allow(clippy::indexing_slicing)]
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,18 +31,18 @@ use std::{
 use chrono::{DateTime, Local, NaiveDateTime};
 use log::*;
 use minotari_wallet::{
+    WalletConfig,
+    WalletSqlite,
     base_node_service::{handle::BaseNodeEventReceiver, service::BaseNodeState},
-    output_manager_service::{handle::OutputManagerEventReceiver, service::Balance, UtxoSelectionCriteria},
+    output_manager_service::{UtxoSelectionCriteria, handle::OutputManagerEventReceiver, service::Balance},
     transaction_service::{
         handle::TransactionEventReceiver,
         storage::models::{CompletedTransaction, TxCancellationReason},
     },
     util::wallet_identity::WalletIdentity,
     utxo_scanner_service::handle::UtxoScannerHandle,
-    WalletConfig,
-    WalletSqlite,
 };
-use qrcode::{render::unicode, QrCode};
+use qrcode::{QrCode, render::unicode};
 use tari_common::configuration::Network;
 use tari_common_types::{
     payment_reference::generate_payment_reference,
@@ -53,17 +52,17 @@ use tari_common_types::{
 };
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::{
-    tari_amount::{uT, MicroMinotari},
+    tari_amount::{MicroMinotari, uT},
     transaction_components::{
-        memo_field::{MemoField, TxType},
         OutputFeatures,
         TransactionError,
+        memo_field::{MemoField, TxType},
     },
     weight::TransactionWeight,
 };
 use tari_transaction_key_manager::legacy_key_manager::wallet_types::LegacyWalletType;
 use tari_utilities::hex::Hex;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 
 use super::tasks::send_one_sided_to_stealth_address_transaction;
 use crate::{
@@ -222,7 +221,6 @@ impl AppState {
 
     pub async fn send_burn_transaction(
         &mut self,
-        burn_proof_filepath: Option<String>,
         claim_public_key: Option<String>,
         amount: u64,
         selection_criteria: UtxoSelectionCriteria,
@@ -232,19 +230,6 @@ impl AppState {
         result_tx: watch::Sender<UiTransactionBurnStatus>,
     ) -> Result<(), UiError> {
         let inner = self.inner.write().await;
-
-        let burn_proof_filepath = match burn_proof_filepath {
-            None => None,
-            Some(path) => {
-                let path = PathBuf::from(path);
-
-                if path.exists() {
-                    return Err(UiError::BurntProofFileExists);
-                }
-
-                Some(path)
-            },
-        };
 
         let fee_per_gram = fee_per_gram * uT;
         let tx_service_handle = inner.wallet.transaction_service.clone();
@@ -261,7 +246,6 @@ impl AppState {
             .transpose()?;
 
         send_burn_transaction_task(
-            burn_proof_filepath,
             claim_public_key,
             MicroMinotari::from(amount),
             selection_criteria,
@@ -732,10 +716,10 @@ impl AppStateInner {
     }
 
     pub fn has_time_locked_balance(&self) -> bool {
-        if let Some(time_locked_balance) = self.data.balance.time_locked_balance {
-            if time_locked_balance > MicroMinotari::from(0) {
-                return true;
-            }
+        if let Some(time_locked_balance) = self.data.balance.time_locked_balance &&
+            time_locked_balance > MicroMinotari::from(0)
+        {
+            return true;
         }
         false
     }
@@ -873,13 +857,7 @@ impl CompletedTransactionInfo {
             amount: tx.amount,
             fee: tx.fee,
             excess_signature,
-            maturity: tx
-                .transaction
-                .body
-                .outputs()
-                .first()
-                .map(|o| o.features.maturity)
-                .unwrap_or(0),
+            maturity: tx.lock_height,
             status: tx.status,
             timestamp: tx.timestamp.naive_utc(),
             mined_timestamp: tx.mined_timestamp.map(|t| t.naive_utc()),

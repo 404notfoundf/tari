@@ -81,9 +81,6 @@ mod hashing;
 pub mod node_id;
 pub use node_id::NodeId;
 
-mod node_distance;
-pub use node_distance::NodeDistance;
-
 mod node_identity;
 pub use node_identity::NodeIdentity;
 
@@ -94,7 +91,7 @@ mod peer_features;
 pub use peer_features::PeerFeatures;
 
 mod peer_id;
-pub use peer_id::{generate_peer_id_as_i64, PeerId};
+pub use peer_id::{PeerId, generate_peer_id_as_i64};
 
 mod manager;
 pub use manager::PeerManager;
@@ -118,4 +115,4 @@ pub use or_not_found::OrNotFound;
 mod metrics;
 
 mod storage;
-pub use storage::{database, ThisPeerIdentity};
+pub use storage::{ThisPeerIdentity, database};

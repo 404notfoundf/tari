@@ -37,8 +37,8 @@ use crate::{
     base_node::{
         chain_metadata_service::{ChainMetadataEvent, PeerChainMetadata},
         state_machine_service::{
+            BaseNodeStateMachine,
             states::{
-                events_and_states,
                 BlockSync,
                 DecideNextSync,
                 HeaderSyncState,
@@ -47,8 +47,8 @@ use crate::{
                 StateInfo,
                 SyncStatus,
                 Waiting,
+                events_and_states,
             },
-            BaseNodeStateMachine,
         },
     },
     chain_storage::BlockchainBackend,
@@ -117,6 +117,7 @@ impl ListeningInfo {
 pub struct Listening {
     is_synced: bool,
     initial_delay_count: u64,
+    network_silence: bool,
 }
 
 impl Listening {
@@ -128,12 +129,17 @@ impl Listening {
         if !self.is_synced {
             self.is_synced = true;
             self.initial_delay_count = 0;
-            shared.set_state_info(StateInfo::Listening(events_and_states::ListeningInfo::new(
-                true,
-                0,
-                shared.config.initial_sync_peer_count,
-            )));
+            self.publish_status_info(shared);
         }
+    }
+
+    fn publish_status_info<B: BlockchainBackend + 'static>(&self, shared: &mut BaseNodeStateMachine<B>) {
+        shared.set_state_info(StateInfo::Listening(events_and_states::ListeningInfo::new(
+            self.is_synced,
+            self.initial_delay_count,
+            shared.config.initial_sync_peer_count,
+            self.network_silence,
+        )));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -144,6 +150,20 @@ impl Listening {
     ) -> StateEvent {
         info!(target: LOG_TARGET, "Listening for chain metadata updates");
 
+        self.network_silence = network_silence;
+
+        // If the node was previously bootstrapped (had completed initial sync at least once), restore the is_synced
+        // flag. This prevents the node from getting stuck after a failed sync attempt: without this, the node would
+        // need to collect `initial_sync_peer_count` metadata events before retrying sync, which can take a very long
+        // time on networks with few peers (especially when the failed peer is banned).
+        if shared.is_bootstrapped() && !self.is_synced {
+            debug!(
+                target: LOG_TARGET,
+                "Restoring is_synced flag from shared bootstrapped state — node was previously synced"
+            );
+            self.set_synced_response(shared);
+        }
+
         if network_silence {
             self.set_synced_response(shared);
             warn!(
@@ -152,11 +172,7 @@ impl Listening {
                 network in general is slow to respond to pings"
             );
         } else {
-            shared.set_state_info(StateInfo::Listening(events_and_states::ListeningInfo::new(
-                self.is_synced,
-                self.initial_delay_count,
-                shared.config.initial_sync_peer_count,
-            )));
+            self.publish_status_info(shared);
         }
 
         let mut time_since_better_block = None;
@@ -167,18 +183,21 @@ impl Listening {
             let metadata_event = shared.metadata_event_stream.recv().await;
             match metadata_event.as_ref().map(|v| v.deref()) {
                 Ok(ChainMetadataEvent::NetworkSilence) => {
+                    self.network_silence = true;
                     self.set_synced_response(shared);
                     debug!("NetworkSilence event received");
                 },
                 Ok(ChainMetadataEvent::PeerChainMetadataReceived(peer_metadata)) => {
+                    // We received a valid metadata update, so the network is not silent.
+                    if self.network_silence {
+                        self.network_silence = false;
+                        self.publish_status_info(shared);
+                    }
+
                     // if we are not yet synced, we wait for the initial delay of ping/pongs, so let's propagate the
                     // updated info
                     if !self.is_synced {
-                        shared.set_state_info(StateInfo::Listening(events_and_states::ListeningInfo::new(
-                            self.is_synced,
-                            self.initial_delay_count,
-                            shared.config.initial_sync_peer_count,
-                        )));
+                        self.publish_status_info(shared);
                     }
                     // We already ban the peer based on some previous logic, but this message was already in the
                     // pipeline before the ban went into effect.
@@ -349,6 +368,7 @@ impl From<Waiting> for Listening {
         Self {
             is_synced: false,
             initial_delay_count: 0,
+            network_silence: false,
         }
     }
 }
@@ -358,6 +378,7 @@ impl From<HeaderSyncState> for Listening {
         Self {
             is_synced: sync.is_synced(),
             initial_delay_count: 0,
+            network_silence: false,
         }
     }
 }
@@ -367,6 +388,7 @@ impl From<BlockSync> for Listening {
         Self {
             is_synced: sync.is_synced(),
             initial_delay_count: 0,
+            network_silence: false,
         }
     }
 }
@@ -376,6 +398,7 @@ impl From<DecideNextSync> for Listening {
         Self {
             is_synced: sync.is_synced(),
             initial_delay_count: 0,
+            network_silence: false,
         }
     }
 }

@@ -29,13 +29,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 use tari_common::{
+    SubConfigPath,
     configuration::{
-        bootstrap::{wallet_get_default_seed_https_address, wallet_http_service_default_port},
-        serializers,
         Network,
         StringList,
+        bootstrap::{wallet_get_default_seed_https_address, wallet_http_service_default_port},
+        serializers,
     },
-    SubConfigPath,
 };
 use tari_common_types::grpc_authentication::GrpcAuthentication;
 use tari_comms::multiaddr::Multiaddr;
@@ -208,6 +208,11 @@ impl WalletConfig {
         }
         if !self.db_file.is_absolute() {
             self.db_file = self.data_dir.join(self.db_file.as_path());
+        }
+        if let Some(ref mut path_mut) = self.transaction_service_config.burn_proof_output_dir &&
+            !path_mut.is_absolute()
+        {
+            *path_mut = base_path.as_ref().join(path_mut.as_path());
         }
     }
 }

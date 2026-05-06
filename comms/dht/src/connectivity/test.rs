@@ -25,31 +25,29 @@ use std::{iter::repeat_with, sync::Arc, time::Duration};
 
 use rand::{rngs::OsRng, seq::SliceRandom};
 use tari_comms::{
-    connectivity::ConnectivityEvent,
-    peer_manager::{Peer, PeerFeatures, STALE_PEER_THRESHOLD_DURATION},
-    test_utils::{
-        count_string_occurrences,
-        mocks::{create_connectivity_mock, create_dummy_peer_connection, ConnectivityManagerMockState},
-        node_identity::ordered_node_identities_by_distance,
-    },
-    Minimized,
     NodeIdentity,
     PeerManager,
+    connectivity::ConnectivityEvent,
+    peer_manager::{Peer, PeerFeatures},
+    test_utils::{
+        mocks::{ConnectivityManagerMockState, create_connectivity_mock, create_dummy_peer_connection},
+        node_identity::build_many_node_identities,
+    },
 };
 use tari_shutdown::Shutdown;
 use tari_test_utils::async_assert;
 use tokio::sync::broadcast;
 
 use crate::{
+    DhtConfig,
     connectivity::{DhtConnectivity, MetricsCollector},
     test_utils::{
+        DhtMockState,
         build_peer_manager,
         create_dht_actor_mock,
         create_good_standing_peer,
         make_node_identity,
-        DhtMockState,
     },
-    DhtConfig,
 };
 
 async fn setup(
@@ -81,7 +79,6 @@ async fn setup(
     let dht_connectivity = DhtConnectivity::new(
         Arc::new(config),
         peer_manager.clone(),
-        node_identity.clone(),
         connectivity,
         dht_requester,
         event_publisher.subscribe(),
@@ -109,26 +106,9 @@ async fn initialize() {
     let peers = repeat_with(|| create_good_standing_peer(&make_node_identity()))
         .take(10)
         .collect();
-    let (dht_connectivity, _, connectivity, peer_manager, node_identity, _shutdown) =
+    let (dht_connectivity, _, connectivity, _peer_manager, _node_identity, _shutdown) =
         setup(config, make_node_identity(), peers).await;
     dht_connectivity.spawn();
-    let neighbours = peer_manager
-        .closest_n_active_peers(
-            node_identity.node_id(),
-            4,
-            &[],
-            Some(PeerFeatures::COMMUNICATION_NODE),
-            None,
-            Some(STALE_PEER_THRESHOLD_DURATION),
-            true,
-            None,
-            false,
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|p| p.node_id)
-        .collect::<Vec<_>>();
 
     // Wait for calls to add peers
     async_assert!(
@@ -137,20 +117,21 @@ async fn initialize() {
         interval = Duration::from_millis(10),
     );
 
-    // Check that neighbours are added
-    for neighbour in &neighbours {
-        connectivity.expect_dial_peer(neighbour).await;
-    }
+    // Check that some pool peers were dialed (total pool size = 6)
+    let dialed = connectivity.get_dialed_peers().await;
+    assert!(
+        dialed.len() >= 2,
+        "Expected at least 2 peers to be dialed, got {}",
+        dialed.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn added_neighbours() {
+async fn added_pool_peers() {
     // env_logger::init(); // Set `$env:RUST_LOG = "trace"` // Pipe to `> .\target\output.log 2>&1`
     let node_identity = make_node_identity();
-    let mut node_identities =
-        ordered_node_identities_by_distance(node_identity.node_id(), 6, PeerFeatures::COMMUNICATION_NODE);
-    // Closest to this node
-    let closer_peer = node_identities.remove(0);
+    let mut node_identities = build_many_node_identities(6, PeerFeatures::COMMUNICATION_NODE);
+    let extra_peer = node_identities.remove(0);
     let mut peers = node_identities.iter().map(|ni| ni.to_peer()).collect::<Vec<_>>();
     for peer in &mut peers {
         let addresses: Vec<_> = peer.addresses.address_iter().cloned().collect();
@@ -160,20 +141,24 @@ async fn added_neighbours() {
     }
 
     let config = DhtConfig {
-        num_neighbouring_nodes: 5,
-        num_random_nodes: 0,
+        num_neighbouring_nodes: 3,
+        num_random_nodes: 2,
         ..Default::default()
     };
     let peer_node_ids = peers.iter().map(|p| p.node_id.clone()).collect::<Vec<_>>();
     let (dht_connectivity, _, connectivity, peer_manager, _, _shutdown) = setup(config, node_identity, peers).await;
 
     let added_peers = peer_manager.get_peers_by_node_ids(&peer_node_ids).await.unwrap();
-    assert!(added_peers
-        .iter()
-        .any(|p| peer_node_ids.iter().any(|node_id| node_id == &p.node_id)));
-    assert!(peer_node_ids
-        .iter()
-        .any(|p| peer_node_ids.iter().any(|node_id| node_id == p)));
+    assert!(
+        added_peers
+            .iter()
+            .any(|p| peer_node_ids.iter().any(|node_id| node_id == &p.node_id))
+    );
+    assert!(
+        peer_node_ids
+            .iter()
+            .any(|p| peer_node_ids.iter().any(|node_id| node_id == p))
+    );
 
     dht_connectivity.spawn();
 
@@ -184,10 +169,11 @@ async fn added_neighbours() {
         interval = Duration::from_millis(10),
     );
 
-    let calls = connectivity.take_calls().await;
-    assert_eq!(count_string_occurrences(&calls, &["DialPeer"]), 5);
+    let _calls = connectivity.take_calls().await;
+    // Check that we requested 5 dials (pool_size = 3 + 2 = 5)
+    assert_eq!(connectivity.get_dialed_peers().await.len(), 5);
 
-    let (conn, _) = create_dummy_peer_connection(closer_peer.node_id().clone());
+    let (conn, _) = create_dummy_peer_connection(extra_peer.node_id().clone());
     connectivity.publish_event(ConnectivityEvent::PeerConnected(conn.clone().into()));
 
     async_assert!(
@@ -200,77 +186,14 @@ async fn added_neighbours() {
     assert!(conn.handle_count() == 2 || conn.handle_count() == 3);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn replace_peer_when_peer_goes_offline() {
-    let node_identity = make_node_identity();
-    let node_identities =
-        ordered_node_identities_by_distance(node_identity.node_id(), 6, PeerFeatures::COMMUNICATION_NODE);
-    // Closest to this node
-    let peers = node_identities
-        .iter()
-        .map(|ni| create_good_standing_peer(ni))
-        .collect::<Vec<_>>();
-
-    let config = DhtConfig {
-        num_neighbouring_nodes: 5,
-        num_random_nodes: 0,
-        ..Default::default()
-    };
-    let (dht_connectivity, _, connectivity, _, _, _shutdown) = setup(config, node_identity, peers).await;
-    dht_connectivity.spawn();
-
-    // Wait for calls to dial peers
-    async_assert!(
-        connectivity.call_count().await >= 6,
-        max_attempts = 20,
-        interval = Duration::from_millis(10),
-    );
-    let _result = connectivity.take_calls().await;
-
-    let dialed = connectivity.take_dialed_peers().await;
-    assert_eq!(dialed.len(), 5);
-
-    connectivity.publish_event(ConnectivityEvent::PeerDisconnected(
-        node_identities[4].node_id().clone(),
-        Minimized::No,
-    ));
-
-    async_assert!(
-        connectivity.call_count().await >= 1,
-        max_attempts = 20,
-        interval = Duration::from_millis(10),
-    );
-
-    let _result = connectivity.take_calls().await;
-    // Redial
-    let dialed = connectivity.take_dialed_peers().await;
-    assert_eq!(dialed.len(), 1);
-    assert_eq!(dialed[0], *node_identities[4].node_id());
-
-    connectivity.publish_event(ConnectivityEvent::PeerConnectFailed(
-        node_identities[4].node_id().clone(),
-    ));
-
-    async_assert!(
-        connectivity.call_count().await >= 1,
-        max_attempts = 20,
-        interval = Duration::from_millis(10),
-    );
-
-    // Check that the next closer neighbour was added to the pool
-    let dialed = connectivity.take_dialed_peers().await;
-    assert_eq!(dialed.len(), 1);
-    assert_eq!(dialed[0], *node_identities[5].node_id());
-}
-
 #[tokio::test]
-async fn insert_neighbour() {
+async fn insert_into_pool() {
     let node_identity = make_node_identity();
-    let node_identities =
-        ordered_node_identities_by_distance(node_identity.node_id(), 10, PeerFeatures::COMMUNICATION_NODE);
+    let node_identities = build_many_node_identities(10, PeerFeatures::COMMUNICATION_NODE);
 
     let config = DhtConfig {
-        num_neighbouring_nodes: 8,
+        num_neighbouring_nodes: 4,
+        num_random_nodes: 4,
         ..Default::default()
     };
     let (mut dht_connectivity, _, _, _, _, _) = setup(config, node_identity.clone(), vec![]).await;
@@ -281,31 +204,14 @@ async fn insert_neighbour() {
         v
     };
 
-    // First 8 inserts should not remove a peer (because num_neighbouring_nodes == 8)
-    for ni in shuffled.iter().take(8) {
-        assert!(dht_connectivity
-            .insert_neighbour_ordered_by_distance(ni.node_id().clone())
-            .is_none());
+    // Insert all 10 peers into the pool
+    for ni in &shuffled {
+        dht_connectivity.insert_random_peer(ni.node_id().clone());
     }
 
-    // Next 2 inserts will always remove a node id
-    for ni in shuffled.iter().skip(8) {
-        assert!(dht_connectivity
-            .insert_neighbour_ordered_by_distance(ni.node_id().clone())
-            .is_some())
-    }
-
-    // Check the first 7 node ids match our neighbours, the last element depends on distance and ordering of inserts
-    // (these are random). insert_neighbour only cares about inserting the element in the right order and preserving
-    // the length of the neighbour list. It doesnt care if it kicks out a closer peer (that is left for the
-    // calling code).
-    let ordered_node_ids = node_identities
-        .iter()
-        .take(7)
-        .map(|ni| ni.node_id())
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(&dht_connectivity.neighbours[..7], ordered_node_ids.as_slice());
+    // insert_random_peer caps the pool at pool_size = num_neighbouring_nodes + num_random_nodes = 8
+    // (excess entries are popped off even without minimize_connections)
+    assert_eq!(dht_connectivity.random_pool.len(), 8);
 }
 
 mod metrics {

@@ -20,11 +20,11 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{fmt, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use log::*;
 use serde::{Deserialize, Serialize};
-use tari_common::configuration::serializers;
+use tari_common::configuration::{Network, serializers};
 
 const LOG_TARGET: &str = "wallet::transaction_service::config";
 
@@ -43,9 +43,6 @@ pub struct TransactionServiceConfig {
     /// This is the timeout period that will be used for sending transactions via broadcast mode
     #[serde(with = "serializers::seconds")]
     pub broadcast_send_timeout: Duration,
-    /// This is the timeout period that will be used for low power moded polling tasks
-    #[serde(with = "serializers::seconds")]
-    pub low_power_polling_timeout: Duration,
     /// This is the timeout period that will be used to resend transactions that did not make any progress
     #[serde(with = "serializers::seconds")]
     pub transaction_resend_period: Duration,
@@ -69,6 +66,18 @@ pub struct TransactionServiceConfig {
     /// This is the timeout period that will be used to re-submit transactions not found in the mempool
     #[serde(with = "serializers::seconds")]
     pub transaction_mempool_resubmission_window: Duration,
+    /// Directory where burn proof files are written after a burn transaction completes. The L2 wallet daemon reads
+    /// this directory to present claimable proofs. If not set, defaults to the platform data directory
+    /// (e.g. ~/.local/share/tari/{network}/burn_proofs on Linux, ~/Library/Application
+    /// Support/tari/{network}/burn_proofs on macOS).
+    pub burn_proof_output_dir: Option<PathBuf>,
+}
+impl TransactionServiceConfig {
+    pub fn get_burn_proof_output_dir(&self, network: Network) -> PathBuf {
+        self.burn_proof_output_dir
+            .clone()
+            .unwrap_or_else(|| default_burn_proofs_dir(network))
+    }
 }
 
 impl Default for TransactionServiceConfig {
@@ -78,7 +87,6 @@ impl Default for TransactionServiceConfig {
             chain_monitoring_timeout: Duration::from_secs(60),
             direct_send_timeout: Duration::from_secs(20),
             broadcast_send_timeout: Duration::from_secs(60),
-            low_power_polling_timeout: Duration::from_secs(300),
             transaction_resend_period: Duration::from_secs(600),
             resend_response_cooldown: Duration::from_secs(300),
             pending_transaction_cancellation_timeout: Duration::from_secs(259_200), // 3 Days
@@ -87,8 +95,17 @@ impl Default for TransactionServiceConfig {
             transaction_routing_mechanism: TransactionRoutingMechanism::default(),
             transaction_event_channel_size: 1000,
             transaction_mempool_resubmission_window: Duration::from_secs(600),
+            burn_proof_output_dir: None,
         }
     }
+}
+
+pub fn default_burn_proofs_dir(network: Network) -> PathBuf {
+    dirs_next::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tari")
+        .join(network.as_key_str())
+        .join("burn_proofs")
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, Default)]

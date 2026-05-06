@@ -31,11 +31,11 @@ pub use backend::OutputManagerBackend;
 use log::*;
 use tari_common_types::{
     transaction::TxId,
-    types::{CompressedCommitment, FixedHash, HashOutput},
+    types::{CompressedCommitment, CompressedSignature, FixedHash, HashOutput},
 };
 use tari_transaction_components::{
-    transaction_components::{OutputType, TransactionOutput},
     MicroMinotari,
+    transaction_components::{OutputType, TransactionOutput},
 };
 use tari_transaction_key_manager::legacy_key_manager::LegacyTransactionKeyManagerInterface;
 use tari_utilities::hex::Hex;
@@ -45,9 +45,9 @@ use crate::output_manager_service::{
     input_selection::UtxoSelectionCriteria,
     service::Balance,
     storage::{
+        OutputStatus,
         models::{DbWalletOutput, KnownOneSidedPaymentScript},
         sqlite_db::{CoinBucket, ReceivedOutputInfoForBatch, SpentOutputInfoForBatch},
-        OutputStatus,
     },
 };
 
@@ -517,6 +517,20 @@ where T: OutputManagerBackend + 'static
         let db = self.db.clone();
         db.set_outputs_to_unmined_and_invalid(hashes)?;
         Ok(())
+    }
+
+    pub fn fetch_kernel_signature_for_tx(
+        &self,
+        tx_id: TxId,
+    ) -> Result<Option<CompressedSignature>, OutputManagerStorageError> {
+        self.db.fetch_kernel_signature_for_tx(tx_id)
+    }
+
+    pub fn set_outputs_to_encumbered_to_be_received(
+        &self,
+        commitments: Vec<CompressedCommitment>,
+    ) -> Result<(), OutputManagerStorageError> {
+        self.db.set_outputs_to_encumbered_to_be_received(commitments)
     }
 
     pub fn set_outputs_to_be_revalidated(&self) -> Result<(), OutputManagerStorageError> {

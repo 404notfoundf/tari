@@ -21,17 +21,17 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 use std::{
     cmp,
-    cmp::{max, min, Ordering},
+    cmp::{Ordering, max, min},
     collections::VecDeque,
     convert::TryFrom,
     mem,
     ops::{Bound, RangeBounds},
     sync::{
-        atomic::{self, AtomicBool},
         Arc,
         RwLock,
         RwLockReadGuard,
         RwLockWriteGuard,
+        atomic::{self, AtomicBool},
     },
     time::{Duration, Instant},
 };
@@ -39,11 +39,11 @@ use std::{
 use blake2::Blake2b;
 use digest::consts::U32;
 use jmt::{
-    storage::{LeafNode, Node, NodeKey, TreeReader},
     JellyfishMerkleTree,
     KeyHash,
     OwnedValue,
     Version,
+    storage::{LeafNode, Node, NodeKey, TreeReader},
 };
 use log::*;
 use primitive_types::U512;
@@ -63,7 +63,7 @@ use tari_common_types::{
     },
 };
 use tari_hashing::TransactionHashDomain;
-use tari_mmr::{pruned_hashset::PrunedHashSet, MerkleProof};
+use tari_mmr::{MerkleProof, pruned_hashset::PrunedHashSet};
 use tari_node_components::blocks::{
     Block,
     BlockHeader,
@@ -75,15 +75,14 @@ use tari_node_components::blocks::{
     NewBlockTemplate,
 };
 use tari_transaction_components::{
+    BanPeriod,
     consensus::{ConsensusConstants, DomainSeparatedConsensusHasher},
     tari_proof_of_work::PowAlgorithm,
     transaction_components::{TransactionInput, TransactionKernel, TransactionOutput},
-    BanPeriod,
 };
-use tari_utilities::{epoch_time::EpochTime, hex::Hex, ByteArray};
+use tari_utilities::{ByteArray, epoch_time::EpochTime, hex::Hex};
 
 use super::{
-    smt_hasher::SmtHasher,
     AccumulatedDataRebuildStatus,
     BlockchainCheckRequest,
     CheckFailure,
@@ -91,27 +90,20 @@ use super::{
     PayrefRebuildStatus,
     TemplateRegistrationEntry,
     ValidatorNodeRegistrationInfo,
+    smt_hasher::SmtHasher,
 };
 use crate::{
+    PrunedInputMmr,
+    PrunedKernelMmr,
+    PrunedOutputMmr,
     block_output_mr_hash_from_pruned_mmr,
     blocks::{
-        genesis_block::VALIDATOR_MR_EMPTY_PLACEHOLDER_HASH,
         BlockAccumulatedData,
         BlockHeaderAccumulatedDataBuilder,
         UpdateBlockAccumulatedData,
+        genesis_block::VALIDATOR_MR_EMPTY_PLACEHOLDER_HASH,
     },
     chain_storage::{
-        consts::{
-            BLOCKCHAIN_DATABASE_ORPHAN_STORAGE_CAPACITY,
-            BLOCKCHAIN_DATABASE_PRUNED_MODE_PRUNING_INTERVAL,
-            BLOCKCHAIN_DATABASE_PRUNING_HORIZON,
-        },
-        db_transaction::{DbKey, DbTransaction, DbValue},
-        error::ChainStorageError,
-        kernel_merkle_proof::KernelMerkleProof,
-        lmdb_db::{BlockchainCheckStatus, BREATHING_TIME_MS_MAX, BREATHING_TIME_MS_MIN},
-        smt_hasher::ValidatorNodeJmtHasher,
-        utxo_mined_info::OutputMinedInfo,
         BlockAddResult,
         BlockchainBackend,
         DbBasicStats,
@@ -123,24 +115,34 @@ use crate::{
         OrNotFound,
         Reorg,
         TargetDifficulties,
+        consts::{
+            BACKGROUND_PRUNING_CHUNK_SIZE,
+            BACKGROUND_PRUNING_THRESHOLD,
+            BLOCKCHAIN_DATABASE_ORPHAN_STORAGE_CAPACITY,
+            BLOCKCHAIN_DATABASE_PRUNED_MODE_PRUNING_INTERVAL,
+            BLOCKCHAIN_DATABASE_PRUNING_HORIZON,
+        },
+        db_transaction::{DbKey, DbTransaction, DbValue, HorizonSyncOutputCheckpoint},
+        error::ChainStorageError,
+        kernel_merkle_proof::KernelMerkleProof,
+        lmdb_db::{BREATHING_TIME_MS_MAX, BREATHING_TIME_MS_MIN, BlockchainCheckStatus},
+        smt_hasher::ValidatorNodeJmtHasher,
+        utxo_mined_info::OutputMinedInfo,
     },
     common::rolling_vec::RollingVec,
-    consensus::{chain_strength_comparer::ChainStrengthComparer, BaseNodeConsensusManager},
+    consensus::{BaseNodeConsensusManager, chain_strength_comparer::ChainStrengthComparer},
     input_mr_hash_from_pruned_mmr,
     kernel_mr_hash_from_pruned_mmr,
-    proof_of_work::{randomx_factory::RandomXFactory, TargetDifficultyWindow},
+    proof_of_work::{TargetDifficultyWindow, randomx_factory::RandomXFactory},
     validation::{
-        helpers::calc_median_timestamp,
-        tari_rx_vm_key_height,
         CandidateBlockValidator,
         DifficultyCalculator,
         HeaderChainLinkedValidator,
         InternalConsistencyValidator,
         ValidationError,
+        helpers::calc_median_timestamp,
+        tari_rx_vm_key_height,
     },
-    PrunedInputMmr,
-    PrunedKernelMmr,
-    PrunedOutputMmr,
 };
 
 const LOG_TARGET: &str = "c::cs::database";
@@ -248,6 +250,7 @@ pub struct BlockchainDatabase<B> {
     consensus_manager: BaseNodeConsensusManager,
     difficulty_calculator: Arc<DifficultyCalculator>,
     disable_add_block_flag: Arc<AtomicBool>,
+    is_background_pruning: Arc<AtomicBool>,
 }
 
 #[allow(clippy::ptr_arg)]
@@ -270,6 +273,7 @@ where B: BlockchainBackend
             consensus_manager,
             difficulty_calculator: Arc::new(difficulty_calculator),
             disable_add_block_flag: Arc::new(AtomicBool::new(false)),
+            is_background_pruning: Arc::new(AtomicBool::new(false)),
         };
         Ok(blockchain_db)
     }
@@ -288,6 +292,7 @@ where B: BlockchainBackend
             consensus_manager,
             difficulty_calculator: Arc::new(difficulty_calculator),
             disable_add_block_flag: Arc::new(AtomicBool::new(false)),
+            is_background_pruning: Arc::new(AtomicBool::new(false)),
         };
         blockchain_db.start()?;
         Ok(blockchain_db)
@@ -389,6 +394,113 @@ where B: BlockchainBackend
         self.rebuild_payref_indexes_background_task()?;
         self.rebuild_accumulated_data_background_task()?;
         self.initialize_blockchain_check_tasks()?;
+        self.prune_database_background_task()?;
+
+        Ok(())
+    }
+
+    /// If there are more than `BACKGROUND_PRUNING_THRESHOLD` blocks to prune, this spawns a background task that
+    /// prunes in chunks of `BACKGROUND_PRUNING_CHUNK_SIZE` blocks. Each chunk acquires and releases the write lock
+    /// independently, allowing normal node operations to proceed between chunks. Only one background pruning task
+    /// can run at a time, controlled by the `is_background_pruning` flag.
+    pub fn prune_database_background_task(&self) -> Result<(), ChainStorageError> {
+        let metadata = {
+            let db = self.db_read_access()?;
+            db.fetch_chain_metadata()?
+        };
+
+        if !metadata.is_pruned_node() {
+            return Ok(());
+        }
+
+        let pruning_horizon = self.config.pruning_horizon;
+        let prune_to_height_target = metadata.best_block_height().saturating_sub(pruning_horizon);
+        let blocks_to_prune = prune_to_height_target.saturating_sub(metadata.pruned_height());
+
+        if blocks_to_prune <= BACKGROUND_PRUNING_THRESHOLD {
+            return Ok(());
+        }
+
+        // Use compare_exchange to ensure only one background pruning task runs at a time
+        if self
+            .is_background_pruning
+            .compare_exchange(false, true, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst)
+            .is_err()
+        {
+            debug!(
+                target: LOG_TARGET,
+                "Background pruning task is already running, skipping."
+            );
+            return Ok(());
+        }
+
+        info!(
+            target: LOG_TARGET,
+            "Starting background database pruning: {} blocks to prune (from height {} to {})",
+            blocks_to_prune,
+            metadata.pruned_height(),
+            prune_to_height_target,
+        );
+
+        let db_rw_lock = self.db.clone();
+        let is_pruning_flag = self.is_background_pruning.clone();
+
+        tokio::task::spawn(async move {
+            loop {
+                // Allow other tasks to breathe between chunks
+                tokio::time::sleep(Duration::from_millis(BREATHING_TIME_MS_MIN)).await;
+
+                let db = db_rw_lock.clone();
+                // Use a single write lock for both the metadata check and the prune operation to
+                // avoid TOCTOU issues where state changes between a read lock and write lock.
+                let res = tokio::task::spawn_blocking(move || -> Result<bool, ChainStorageError> {
+                    let mut db = db.write().map_err(|e| {
+                        ChainStorageError::AccessError(format!("Write lock on blockchain backend failed: {e:?}"))
+                    })?;
+                    let metadata = db.fetch_chain_metadata()?;
+                    let target = metadata.best_block_height().saturating_sub(pruning_horizon);
+                    let blocks_remaining = target.saturating_sub(metadata.pruned_height());
+                    if blocks_remaining <= BACKGROUND_PRUNING_THRESHOLD {
+                        return Ok(true);
+                    }
+                    let chunk_end = (metadata.pruned_height() + BACKGROUND_PRUNING_CHUNK_SIZE).min(target);
+                    prune_to_height(&mut *db, chunk_end)?;
+                    info!(
+                        target: LOG_TARGET,
+                        "Background pruning: completed chunk up to height {} (target: {})",
+                        chunk_end, target,
+                    );
+                    Ok(false)
+                })
+                .await;
+
+                match res {
+                    Ok(Ok(true)) => {
+                        break;
+                    },
+                    Ok(Ok(false)) => {
+                        // Continue to next chunk
+                    },
+                    Ok(Err(e)) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "Background pruning failed: {e}",
+                        );
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "Background pruning task panicked: {e}",
+                        );
+                        break;
+                    },
+                }
+            }
+
+            is_pruning_flag.store(false, atomic::Ordering::SeqCst);
+            info!(target: LOG_TARGET, "Background pruning task completed.");
+        });
 
         Ok(())
     }
@@ -929,12 +1041,12 @@ where B: BlockchainBackend
     /// Reset the accumulated data check counters.
     pub fn reset_accumulated_data_check_db_counters(&self) -> Result<(), ChainStorageError> {
         let acc_diff_status = self.fetch_accumulated_data_check_status()?;
-        if let Some(acc_diff) = acc_diff_status {
-            if acc_diff.is_running() {
-                return Err(ChainStorageError::InvalidOperation(
-                    "[AccData check] Cannot reset counters while a check is running.".to_string(),
-                ));
-            }
+        if let Some(acc_diff) = acc_diff_status &&
+            acc_diff.is_running()
+        {
+            return Err(ChainStorageError::InvalidOperation(
+                "[AccData check] Cannot reset counters while a check is running.".to_string(),
+            ));
         }
         let db = self.db_write_access()?;
         db.update_accumulated_data_check_status(BlockchainCheckRequest::ResetAllCounters)?;
@@ -945,12 +1057,12 @@ where B: BlockchainBackend
     /// Reset the blockchain consistency check counters.
     pub fn reset_blockchain_consistency_check_db_counters(&self) -> Result<(), ChainStorageError> {
         let consistency_status = self.fetch_blockchain_consistency_check_status()?;
-        if let Some(consistency) = consistency_status {
-            if consistency.is_running() {
-                return Err(ChainStorageError::InvalidOperation(
-                    "[Blockchain check] Cannot reset counters while a check is running.".to_string(),
-                ));
-            }
+        if let Some(consistency) = consistency_status &&
+            consistency.is_running()
+        {
+            return Err(ChainStorageError::InvalidOperation(
+                "[Blockchain check] Cannot reset counters while a check is running.".to_string(),
+            ));
         }
         let db = self.db_write_access()?;
         db.update_blockchain_consistency_check_status(BlockchainCheckRequest::ResetAllCounters)?;
@@ -1821,8 +1933,15 @@ where B: BlockchainBackend
                 "Best chain is now at height: {}",
                 db.fetch_chain_metadata()?.best_block_height()
             );
-            // If blocks were added and the node is in pruned mode, perform pruning
-            prune_database_if_needed(&mut *db, self.config.pruning_horizon, self.config.pruning_interval)?;
+            // Skip inline pruning if background pruning is already handling it
+            if self.is_background_pruning.load(atomic::Ordering::SeqCst) {
+                debug!(
+                    target: LOG_TARGET,
+                    "Background pruning is active, skipping inline prune_database_if_needed."
+                );
+            } else {
+                prune_database_if_needed(&mut *db, self.config.pruning_horizon, self.config.pruning_interval)?;
+            }
         }
 
         // Clean up orphan pool
@@ -2030,6 +2149,22 @@ where B: BlockchainBackend
     pub fn fetch_horizon_data(&self) -> Result<HorizonData, ChainStorageError> {
         let db = self.db_read_access()?;
         Ok(db.fetch_horizon_data()?.unwrap_or_default())
+    }
+
+    pub fn fetch_horizon_sync_output_checkpoint(
+        &self,
+    ) -> Result<Option<HorizonSyncOutputCheckpoint>, ChainStorageError> {
+        let db = self.db_read_access()?;
+        db.fetch_horizon_sync_output_checkpoint()
+    }
+
+    pub fn verify_horizon_sync_output_root(
+        &self,
+        version: u64,
+        expected_root: HashOutput,
+    ) -> Result<(), ChainStorageError> {
+        let db = self.db_read_access()?;
+        db.verify_horizon_sync_output_root(version, expected_root)
     }
 
     pub fn get_stats(&self) -> Result<DbBasicStats, ChainStorageError> {
@@ -2583,7 +2718,7 @@ fn fetch_block<T: BlockchainBackend>(db: &T, height: u64, compact: bool) -> Resu
                 Ok(None) => {
                     return Err(ChainStorageError::InvalidBlock(
                         "An Input in a block doesn't contain a matching spending output".to_string(),
-                    ))
+                    ));
                 },
                 Err(e) => return Err(e),
             };
@@ -2710,12 +2845,22 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
     // We might have more headers than blocks, so we first see if we need to delete the extra headers.
     let mut txn = DbTransaction::new();
     for h in 0..steps_back {
+        let height = last_header_height - h;
         info!(
             target: LOG_TARGET,
             "Rewinding headers at height {}",
-            last_header_height - h
+            height,
         );
-        txn.delete_header(last_header_height - h);
+        // If block accumulated data exists at this height (e.g. from a previous incomplete rewind
+        // past pruning horizon), remove it and any remaining block data before deleting the header.
+        if db.fetch_block_accumulated_data_by_height(height)?.is_some() {
+            let header = fetch_header(db, height)?;
+            let header_hash = header.hash();
+            txn.delete_block_accumulated_data(height);
+            txn.delete_all_kernerls_in_block(header_hash);
+            txn.delete_all_inputs_in_block(header_hash);
+        }
+        txn.delete_header(height);
     }
     db.write(txn)?;
     // Delete blocks
@@ -2777,6 +2922,11 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
             expected_block_hash,
             chain_header.timestamp(),
         );
+        // When rewinding past the pruning horizon to height 0, reset pruned_height in the same
+        // transaction to maintain the invariant that pruned_height <= best_block_height.
+        if prune_past_horizon && h + 1 == steps_back {
+            txn.set_pruned_height(0);
+        }
         if h == 0 {
             // insert the new orphan chain tip
             debug!(target: LOG_TARGET, "Inserting new orphan chain tip: {block_hash}");
@@ -2795,20 +2945,29 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
     }
 
     if prune_past_horizon {
-        // We are rewinding past pruning horizon, so we need to remove all blocks and the UTXO's from them. We do not
-        // have to delete the headers as they are still valid.
+        // We are rewinding past pruning horizon, so we need to remove all blocks and the UTXO's from them.
+        // We also delete headers above the target height since they belong to the old chain and will be
+        // replaced during re-sync. The header at target_height is preserved as it is the chain split point.
         // We don't have these complete blocks, so we don't push them to the removed blocks.
         for h in 0..(last_block_height - steps_back) {
-            let mut txn = DbTransaction::new();
+            let height = last_block_height - h - steps_back;
             debug!(
                 target: LOG_TARGET,
-                "Deleting blocks and utxos {}",
-                last_block_height - h - steps_back,
+                "Deleting pruned block data at height {}",
+                height,
             );
-            let header = fetch_header(db, last_block_height - h - steps_back)?;
-            // Although we do not have this full block, this method  will remove all remaining data that is linked to
-            // the specific header hash
-            txn.delete_tip_block(header.hash());
+            // For pruned blocks, we cannot use delete_tip_block because it requires JMT validation
+            // which is not possible for pruned data. Instead, directly delete the accumulated data,
+            // kernels, inputs and then the header (above the target height).
+            let header = fetch_header(db, height)?;
+            let header_hash = header.hash();
+            let mut txn = DbTransaction::new();
+            txn.delete_block_accumulated_data(height);
+            txn.delete_all_kernerls_in_block(header_hash);
+            txn.delete_all_inputs_in_block(header_hash);
+            if height > target_height {
+                txn.delete_header(height);
+            }
             db.write(txn)?;
         }
     }
@@ -3541,6 +3700,7 @@ impl<T> Clone for BlockchainDatabase<T> {
             consensus_manager: self.consensus_manager.clone(),
             difficulty_calculator: self.difficulty_calculator.clone(),
             disable_add_block_flag: self.disable_add_block_flag.clone(),
+            is_background_pruning: self.is_background_pruning.clone(),
         }
     }
 }
@@ -3745,37 +3905,33 @@ fn verify_blockchain_consistency_for_height<B: BlockchainBackend>(
     }
 
     // Full validation of block body and internal consistency if requested
-    if full_validation {
-        if let Some((block, accumulated_data)) = block_data {
-            let read_lock = db
-                .read()
-                .map_err(|_e| ChainStorageError::AccessError("Read lock on blockchain backend failed".into()))?;
-            let block_hash = block.hash();
-            let accumulated_data_hash = accumulated_data.hash;
-            let chain_block = ChainBlock::try_construct(Arc::new(block), accumulated_data).ok_or_else(|| {
+    if full_validation && let Some((block, accumulated_data)) = block_data {
+        let read_lock = db
+            .read()
+            .map_err(|_e| ChainStorageError::AccessError("Read lock on blockchain backend failed".into()))?;
+        let block_hash = block.hash();
+        let accumulated_data_hash = accumulated_data.hash;
+        let chain_block = ChainBlock::try_construct(Arc::new(block), accumulated_data).ok_or_else(|| {
+            ChainStorageError::CorruptedDatabase(format!(
+                "Inconsistent hash in historical block: block hash {} vs. acc_data hash {}",
+                block_hash, accumulated_data_hash
+            ))
+        })?;
+        let block_validator = validators.block.clone();
+        block_validator
+            .validate_body_at_height(&read_lock, &chain_block)
+            .map_err(|e| {
+                ChainStorageError::CorruptedDatabase(format!("Block body validation failed for height {height}: {e}"))
+            })?;
+
+        let orphan_validator = validators.orphan.clone();
+        orphan_validator
+            .validate_internal_consistency(chain_block.block())
+            .map_err(|e| {
                 ChainStorageError::CorruptedDatabase(format!(
-                    "Inconsistent hash in historical block: block hash {} vs. acc_data hash {}",
-                    block_hash, accumulated_data_hash
+                    "Block internal consistency validation failed for height {height}: {e}"
                 ))
             })?;
-            let block_validator = validators.block.clone();
-            block_validator
-                .validate_body_at_height(&read_lock, &chain_block)
-                .map_err(|e| {
-                    ChainStorageError::CorruptedDatabase(format!(
-                        "Block body validation failed for height {height}: {e}"
-                    ))
-                })?;
-
-            let orphan_validator = validators.orphan.clone();
-            orphan_validator
-                .validate_internal_consistency(chain_block.block())
-                .map_err(|e| {
-                    ChainStorageError::CorruptedDatabase(format!(
-                        "Block internal consistency validation failed for height {height}: {e}"
-                    ))
-                })?;
-        }
     }
 
     let write_lock = db
@@ -3800,7 +3956,7 @@ mod test {
     use tari_common::configuration::Network;
     use tari_test_utils::unpack_enum;
     use tari_transaction_components::{
-        consensus::{consensus_constants::PowAlgorithmConstants, ConsensusConstantsBuilder},
+        consensus::{ConsensusConstantsBuilder, consensus_constants::PowAlgorithmConstants},
         tari_proof_of_work::Difficulty,
     };
 
@@ -3809,15 +3965,15 @@ mod test {
         block_specs,
         consensus::chain_strength_comparer::strongest_chain,
         test_helpers::{
+            BlockSpecs,
             blockchain::{
+                TempDatabase,
                 create_chained_blocks,
                 create_main_chain,
                 create_new_blockchain,
                 create_orphan_chain,
                 create_test_blockchain_db,
-                TempDatabase,
             },
-            BlockSpecs,
         },
         validation::{header::HeaderFullValidator, mocks::MockValidator},
     };
@@ -4589,20 +4745,26 @@ mod test {
 
         // 4. Rewind to height 3 (removes H4, H5, H6, H7)
         let fork_root = main_chain.get("B3").unwrap().clone();
-        assert!(banked_headers
-            .iter()
-            .all(|h| test.db.fetch_block_by_hash(*h.hash(), false).unwrap().is_some()));
+        assert!(
+            banked_headers
+                .iter()
+                .all(|h| test.db.fetch_block_by_hash(*h.hash(), false).unwrap().is_some())
+        );
         test.db.rewind_to_height(fork_root.height()).unwrap();
         test.db.cleanup_all_orphans().unwrap();
-        assert!(banked_headers
-            .iter()
-            .all(|h| test.db.fetch_block_by_hash(*h.hash(), false).unwrap().is_none()));
+        assert!(
+            banked_headers
+                .iter()
+                .all(|h| test.db.fetch_block_by_hash(*h.hash(), false).unwrap().is_none())
+        );
 
         // 5. Add banked headers back in (headers only)
         test.db.insert_valid_headers(banked_headers.clone()).unwrap();
-        assert!(banked_headers
-            .iter()
-            .all(|h| test.db.fetch_header_by_block_hash(*h.hash()).unwrap().is_some()));
+        assert!(
+            banked_headers
+                .iter()
+                .all(|h| test.db.fetch_header_by_block_hash(*h.hash()).unwrap().is_some())
+        );
 
         // 6. Create a new block that builds on the fork root (propagated block)
         let (_, reorg_chain) = create_chained_blocks(&test.db, block_specs!(["newB->GB"]), fork_root);
@@ -4614,9 +4776,11 @@ mod test {
         // 8. Assert that the new propagated block is in the db and banked headers are removed
         assert!(result.is_ok());
         assert!(test.db.fetch_block_by_hash(new_block.hash(), false).unwrap().is_some());
-        assert!(banked_headers
-            .iter()
-            .all(|h| test.db.fetch_header_by_block_hash(*h.hash()).unwrap().is_none()));
+        assert!(
+            banked_headers
+                .iter()
+                .all(|h| test.db.fetch_header_by_block_hash(*h.hash()).unwrap().is_none())
+        );
     }
 
     #[ignore]

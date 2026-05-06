@@ -29,20 +29,20 @@ use std::{
 
 use blake2::Blake2b;
 use borsh::{BorshDeserialize, BorshSerialize};
-use digest::{consts::U32, Digest};
+use digest::{Digest, consts::U32};
 use integer_encoding::VarIntWriter;
 use tari_crypto::hashing::DomainSeparation;
 
 use super::{
-    decoder::{CovenantDecodeError, CovenantReadExt},
-    encoder::CovenentWriteExt,
     BaseLayerCovenantsDomain,
     COVENANTS_FIELD_HASHER_LABEL,
+    decoder::{CovenantDecodeError, CovenantReadExt},
+    encoder::CovenentWriteExt,
 };
 use crate::transaction_components::{
-    covenants::{byte_codes, error::CovenantError},
     TransactionInput,
     TransactionOutput,
+    covenants::{byte_codes, error::CovenantError},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -64,9 +64,9 @@ pub enum OutputField {
 
 impl OutputField {
     pub fn from_byte(byte: u8) -> Result<Self, CovenantDecodeError> {
-        use byte_codes::*;
         #[allow(clippy::enum_glob_use)]
         use OutputField::*;
+        use byte_codes::*;
         match byte {
             FIELD_COMMITMENT => Ok(Commitment),
             FIELD_SCRIPT => Ok(Script),
@@ -384,10 +384,10 @@ mod test {
         key_manager::KeyManager,
         test_helpers::UtxoTestParams,
         transaction_components::{
-            covenants::test::{create_input, create_outputs, make_sample_sidechain_feature},
             OutputFeatures,
             OutputType,
             SpentOutput,
+            covenants::test::{create_input, create_outputs, make_sample_sidechain_feature},
         },
     };
 
@@ -396,10 +396,10 @@ mod test {
 
         mod is_eq {
             use super::*;
-            use crate::{transaction_components::RangeProofType, MicroMinotari};
+            use crate::{MicroMinotari, transaction_components::RangeProofType};
 
-            #[tokio::test]
-            async fn it_returns_true_if_eq() {
+            #[test]
+            fn it_returns_true_if_eq() {
                 let key_manager = KeyManager::new_random().unwrap();
                 let side_chain_features = make_sample_sidechain_feature();
                 let output = create_outputs(
@@ -418,30 +418,42 @@ mod test {
 
                 assert!(OutputField::Commitment.is_eq(&output, &output.commitment).unwrap());
                 assert!(OutputField::Script.is_eq(&output, &output.script).unwrap());
-                assert!(OutputField::SenderOffsetPublicKey
-                    .is_eq(&output, &output.sender_offset_public_key)
-                    .unwrap());
+                assert!(
+                    OutputField::SenderOffsetPublicKey
+                        .is_eq(&output, &output.sender_offset_public_key)
+                        .unwrap()
+                );
                 assert!(OutputField::Covenant.is_eq(&output, &output.covenant).unwrap());
                 assert!(OutputField::Features.is_eq(&output, &output.features).unwrap());
-                assert!(OutputField::FeaturesOutputType
-                    .is_eq(&output, &output.features.output_type)
-                    .unwrap());
-                assert!(OutputField::FeaturesMaturity
-                    .is_eq(&output, &output.features.maturity)
-                    .unwrap());
-                assert!(OutputField::FeaturesSideChainFeatures
-                    .is_eq(&output, output.features.sidechain_feature.as_ref().unwrap())
-                    .unwrap());
-                assert!(OutputField::FeaturesRangeProofType
-                    .is_eq(&output, &output.features.range_proof_type)
-                    .unwrap());
-                assert!(OutputField::MinimumValuePromise
-                    .is_eq(&output, &output.minimum_value_promise)
-                    .unwrap());
+                assert!(
+                    OutputField::FeaturesOutputType
+                        .is_eq(&output, &output.features.output_type)
+                        .unwrap()
+                );
+                assert!(
+                    OutputField::FeaturesMaturity
+                        .is_eq(&output, &output.features.maturity)
+                        .unwrap()
+                );
+                assert!(
+                    OutputField::FeaturesSideChainFeatures
+                        .is_eq(&output, output.features.sidechain_feature.as_ref().unwrap())
+                        .unwrap()
+                );
+                assert!(
+                    OutputField::FeaturesRangeProofType
+                        .is_eq(&output, &output.features.range_proof_type)
+                        .unwrap()
+                );
+                assert!(
+                    OutputField::MinimumValuePromise
+                        .is_eq(&output, &output.minimum_value_promise)
+                        .unwrap()
+                );
             }
 
-            #[tokio::test]
-            async fn it_returns_false_if_not_eq() {
+            #[test]
+            fn it_returns_false_if_not_eq() {
                 let key_manager = KeyManager::new_random().unwrap();
                 let side_chain_features = make_sample_sidechain_feature();
                 let output = create_outputs(
@@ -462,29 +474,43 @@ mod test {
                 )
                 .remove(0);
 
-                assert!(!OutputField::Commitment
-                    .is_eq(&output, &CompressedCommitment::default())
-                    .unwrap());
+                assert!(
+                    !OutputField::Commitment
+                        .is_eq(&output, &CompressedCommitment::default())
+                        .unwrap()
+                );
                 assert!(!OutputField::Script.is_eq(&output, &script![Nop Drop].unwrap()).unwrap());
-                assert!(!OutputField::SenderOffsetPublicKey
-                    .is_eq(&output, &CompressedPublicKey::default())
-                    .unwrap());
-                assert!(!OutputField::Covenant
-                    .is_eq(&output, &covenant!(and(identity(), identity())).unwrap())
-                    .unwrap());
-                assert!(!OutputField::Features
-                    .is_eq(&output, &OutputFeatures::default())
-                    .unwrap());
+                assert!(
+                    !OutputField::SenderOffsetPublicKey
+                        .is_eq(&output, &CompressedPublicKey::default())
+                        .unwrap()
+                );
+                assert!(
+                    !OutputField::Covenant
+                        .is_eq(&output, &covenant!(and(identity(), identity())).unwrap())
+                        .unwrap()
+                );
+                assert!(
+                    !OutputField::Features
+                        .is_eq(&output, &OutputFeatures::default())
+                        .unwrap()
+                );
                 assert!(!OutputField::FeaturesMaturity.is_eq(&output, &123u64).unwrap());
-                assert!(!OutputField::FeaturesOutputType
-                    .is_eq(&output, &OutputType::Coinbase)
-                    .unwrap());
-                assert!(!OutputField::FeaturesRangeProofType
-                    .is_eq(&output, &RangeProofType::BulletProofPlus)
-                    .unwrap());
-                assert!(!OutputField::MinimumValuePromise
-                    .is_eq(&output, &MicroMinotari::default())
-                    .unwrap());
+                assert!(
+                    !OutputField::FeaturesOutputType
+                        .is_eq(&output, &OutputType::Coinbase)
+                        .unwrap()
+                );
+                assert!(
+                    !OutputField::FeaturesRangeProofType
+                        .is_eq(&output, &RangeProofType::BulletProofPlus)
+                        .unwrap()
+                );
+                assert!(
+                    !OutputField::MinimumValuePromise
+                        .is_eq(&output, &MicroMinotari::default())
+                        .unwrap()
+                );
             }
         }
 
@@ -492,8 +518,8 @@ mod test {
 
             use super::*;
 
-            #[tokio::test]
-            async fn it_returns_true_if_eq_input() {
+            #[test]
+            fn it_returns_true_if_eq_input() {
                 let key_manager = KeyManager::new_random().unwrap();
                 let output = create_outputs(
                     1,
@@ -565,10 +591,10 @@ mod test {
             use digest::Update;
 
             use super::*;
-            use crate::{transaction_components::RangeProofType, MicroMinotari};
+            use crate::{MicroMinotari, transaction_components::RangeProofType};
 
-            #[tokio::test]
-            async fn it_constructs_challenge_using_consensus_encoding() {
+            #[test]
+            fn it_constructs_challenge_using_consensus_encoding() {
                 let key_manager = KeyManager::new_random().unwrap();
                 let features = OutputFeatures {
                     maturity: 42,
@@ -612,10 +638,10 @@ mod test {
 
         mod get_field_value_ref {
             use super::*;
-            use crate::{transaction_components::RangeProofType, MicroMinotari};
+            use crate::{MicroMinotari, transaction_components::RangeProofType};
 
-            #[tokio::test]
-            async fn it_retrieves_the_value_as_ref() {
+            #[test]
+            fn it_retrieves_the_value_as_ref() {
                 let key_manager = KeyManager::new_random().unwrap();
                 let features = OutputFeatures {
                     maturity: 42,

@@ -23,7 +23,7 @@
 // Portions of this file were originally copyrighted (c) 2018 The Grin Developers, issued under the Apache License,
 // Version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0.
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, max},
     default::Default,
     fmt::{Debug, Formatter},
     sync::OnceLock,
@@ -36,17 +36,15 @@ use tari_common_types::{
     transaction::TxId,
     types::{ComAndPubSignature, CompressedCommitment, CompressedPublicKey, FixedHash, RangeProof},
 };
-use tari_script::{inputs, script, ExecutionStack, Opcode, TariScript};
+use tari_script::{ExecutionStack, Opcode, TariScript, inputs, script};
 
 use super::TransactionOutputVersion;
 use crate::{
+    MicroMinotari,
     helpers::borsh::SerializedSize,
     key_manager::{SerializedKeyString, TariKeyId, TransactionKeyManagerInterface},
     transaction_components,
     transaction_components::{
-        covenants::Covenant,
-        transaction_input::{SpentOutput, TransactionInput},
-        transaction_output::TransactionOutput,
         EncryptedData,
         MemoField,
         OutputFeatures,
@@ -54,8 +52,10 @@ use crate::{
         RangeProofType,
         TransactionError,
         TransactionInputVersion,
+        covenants::Covenant,
+        transaction_input::{SpentOutput, TransactionInput},
+        transaction_output::TransactionOutput,
     },
-    MicroMinotari,
 };
 
 /// A wallet output is one where the value and spending key (blinding factor) are known. This can be used to
@@ -543,7 +543,8 @@ impl WalletOutput {
     pub fn features_and_scripts_byte_size(&self) -> std::io::Result<usize> {
         Ok(self.features.get_serialized_size()? +
             self.script.get_serialized_size()? +
-            self.covenant.get_serialized_size()?)
+            self.covenant.get_serialized_size()? +
+            self.encrypted_data.get_payment_id_size())
     }
 
     /// Is this a burned output kernel?
@@ -554,6 +555,10 @@ impl WalletOutput {
     /// helper function to determine if this is a coinbase or not
     pub fn is_coinbase(&self) -> bool {
         matches!(self.features.output_type, OutputType::Coinbase)
+    }
+
+    pub fn max_lock_height(&self) -> u64 {
+        max(self.script_lock_height, self.features.maturity)
     }
 
     pub fn change_encrypted_data<KM: TransactionKeyManagerInterface>(

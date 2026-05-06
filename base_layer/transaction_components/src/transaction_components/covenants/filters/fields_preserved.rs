@@ -50,13 +50,13 @@ mod test {
         covenant,
         key_manager::KeyManager,
         transaction_components::{
-            covenants::{filters::test::setup_filter_test, test::create_input},
             OutputType,
+            covenants::{filters::test::setup_filter_test, test::create_input},
         },
     };
 
-    #[tokio::test]
-    async fn it_filters_outputs_that_match_input_fields() {
+    #[test]
+    fn it_filters_outputs_that_match_input_fields() {
         let covenant =
             covenant!(fields_preserved(@fields(@field::features_maturity, @field::features_output_type))).unwrap();
         let key_manager = KeyManager::new_random().unwrap();

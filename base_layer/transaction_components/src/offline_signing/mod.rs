@@ -45,49 +45,49 @@ mod test {
         transaction::TxId,
     };
     use tari_script::{
-        push_pubkey_script,
         CompressedCheckSigSchnorrSignature,
         ExecutionStack,
         Opcode,
         StackItem,
         TariScript,
+        push_pubkey_script,
     };
 
     use crate::{
+        MicroMinotari,
+        TransactionBuilder,
         crypto_factories::CryptoFactories,
         fee::Fee,
         helpers::borsh::SerializedSize,
         key_manager::{
-            error::KeyManagerError,
-            wallet_types::{ViewWallet, WalletType},
             KeyManager,
             SerializedKeyString,
             TariKeyId,
             TransactionKeyManagerInterface,
+            error::KeyManagerError,
+            wallet_types::{ViewWallet, WalletType},
         },
         multisig::script::derive_multisig_ephemeral_pubkeys,
         offline_signing::{
+            PaymentRecipient,
             offline_signer::sign_locked_transaction,
             prepare_deposit_multisig_transaction,
             prepare_one_sided_transaction_for_signing,
             prepare_withdraw_multisig_transaction,
             sign_locked_deposit_multisig_transaction,
             sign_locked_withdraw_multisig_transaction,
-            PaymentRecipient,
         },
         test_helpers::{create_consensus_manager, create_test_input},
         transaction_components::{
-            covenants::Covenant,
-            memo_field::TxType,
-            one_sided::public_key_to_output_encryption_key,
             EncryptedData,
             MemoField,
             OutputFeatures,
             WalletOutputBuilder,
+            covenants::Covenant,
+            memo_field::TxType,
+            one_sided::public_key_to_output_encryption_key,
         },
         validation::transaction::TransactionInternalConsistencyValidator,
-        MicroMinotari,
-        TransactionBuilder,
     };
 
     fn create_view_key_manager(view_wallet: ViewWallet) -> Result<KeyManager, KeyManagerError> {
@@ -95,8 +95,8 @@ mod test {
         KeyManager::new(wallet)
     }
 
-    #[tokio::test]
-    async fn offline_sign_is_valid() {
+    #[test]
+    fn offline_sign_is_valid() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -196,7 +196,7 @@ mod test {
         assert!(signed.signed_transaction.change_output.is_some());
         assert_eq!(
             signed.signed_transaction.transaction.body.kernels()[0].fee,
-            MicroMinotari(2960)
+            MicroMinotari(3120)
         );
         assert_eq!(signed.signed_transaction.transaction.body.inputs().len(), 3);
         assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 2);
@@ -209,9 +209,9 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
-    async fn batch_offline_sign_is_valid() {
+    fn batch_offline_sign_is_valid() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -332,7 +332,7 @@ mod test {
         assert!(signed.signed_transaction.change_output.is_some());
         assert_eq!(
             signed.signed_transaction.transaction.body.kernels()[0].fee,
-            MicroMinotari(4100)
+            MicroMinotari(4280)
         );
         assert_eq!(signed.signed_transaction.transaction.body.inputs().len(), 3);
         assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 3);
@@ -345,8 +345,8 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
-    #[tokio::test]
-    async fn large_batch_offline_sign_is_valid() {
+    #[test]
+    fn large_batch_offline_sign_is_valid() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -430,7 +430,7 @@ mod test {
         assert!(signed.signed_transaction.change_output.is_some());
         assert_eq!(
             signed.signed_transaction.transaction.body.kernels()[0].fee,
-            MicroMinotari(115500)
+            MicroMinotari(115660)
         );
         assert_eq!(signed.signed_transaction.transaction.body.inputs().len(), 1);
         assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 101);
@@ -443,9 +443,9 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
-    async fn offline_deposit_multisign_is_valid() {
+    fn offline_deposit_multisign_is_valid() {
         let rules = create_consensus_manager();
         let charlie_key_manager = KeyManager::new_random().unwrap();
         let bob_key_manager = KeyManager::new_random().unwrap();
@@ -552,7 +552,7 @@ mod test {
         assert!(signed.signed_transaction.change_output.is_some());
         assert_eq!(
             signed.signed_transaction.transaction.body.kernels()[0].fee,
-            MicroMinotari(3120)
+            MicroMinotari(3280)
         );
         assert_eq!(signed.signed_transaction.transaction.body.inputs().len(), 3);
         assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 2);
@@ -564,9 +564,9 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
-    #[tokio::test]
+    #[test]
     #[allow(clippy::too_many_lines)]
-    async fn offline_withdraw_multisign_is_valid() {
+    fn offline_withdraw_multisign_is_valid() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -764,8 +764,8 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
-    #[tokio::test]
-    async fn offline_sign_can_be_claimed() {
+    #[test]
+    fn offline_sign_can_be_claimed() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -853,13 +853,17 @@ mod test {
         let change_output = &signed.signed_transaction.transaction.body.outputs()[change_index].clone();
 
         // let see if alice's view wallet can claim the change:
-        assert!(alice_view_key_manager
-            .is_this_output_ours(&change_output.commitment, &change_output.encrypted_data, None,)
-            .unwrap());
+        assert!(
+            alice_view_key_manager
+                .is_this_output_ours(&change_output.commitment, &change_output.encrypted_data, None,)
+                .unwrap()
+        );
         // lets test the hot wallet
-        assert!(alice_key_manager
-            .is_this_output_ours(&change_output.commitment, &change_output.encrypted_data, None,)
-            .unwrap());
+        assert!(
+            alice_key_manager
+                .is_this_output_ours(&change_output.commitment, &change_output.encrypted_data, None,)
+                .unwrap()
+        );
 
         // lets see if bob's wallet can claim the sent:
         let sent_output = &signed.signed_transaction.transaction.body.outputs()[sent_index].clone();
@@ -875,8 +879,8 @@ mod test {
         assert_eq!(res.2, payment_id_bob);
     }
 
-    #[tokio::test]
-    async fn view_only_cannot_sign_offline() {
+    #[test]
+    fn view_only_cannot_sign_offline() {
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
         let alice_keys = ViewWallet::new(
@@ -965,12 +969,14 @@ mod test {
         assert_eq!(init.info.inputs.len(), 3);
         assert_eq!(init.info.outputs.len(), 0);
 
-        assert!(sign_locked_transaction(
-            &alice_view_key_manager,
-            rules.consensus_constants(0).clone(),
-            Network::LocalNet,
-            init
-        )
-        .is_err());
+        assert!(
+            sign_locked_transaction(
+                &alice_view_key_manager,
+                rules.consensus_constants(0).clone(),
+                Network::LocalNet,
+                init
+            )
+            .is_err()
+        );
     }
 }

@@ -29,18 +29,18 @@ use std::{
 use config::Config;
 use serde::{Deserialize, Serialize};
 use tari_common::{
+    ConfigurationError,
+    DefaultConfigLoader,
+    SubConfigPath,
     configuration::{
-        bootstrap::wallet_http_service_default_port,
-        serializers,
-        serializers::optional_seconds,
         CommonConfig,
         ConfigList,
         Network,
         StringList,
+        bootstrap::wallet_http_service_default_port,
+        serializers,
+        serializers::optional_seconds,
     },
-    ConfigurationError,
-    DefaultConfigLoader,
-    SubConfigPath,
 };
 use tari_common_types::grpc_authentication::GrpcAuthentication;
 use tari_comms::multiaddr::Multiaddr;
@@ -49,13 +49,14 @@ use tari_core::{
     chain_storage::BlockchainDatabaseConfig,
     mempool::MempoolConfig,
 };
-use tari_p2p::{auto_update::AutoUpdateConfig, P2pConfig, PeerSeedsConfig};
+use tari_p2p::{P2pConfig, PeerSeedsConfig, auto_update::AutoUpdateConfig};
 use tari_storage::lmdb_store::LMDBConfig;
+use tari_transaction_components::transaction_components::RangeProofType;
 use url::Url;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::MetricsConfig;
-use crate::{grpc_method::GrpcMethod, HttpCacheConfig};
+use crate::{HttpCacheConfig, grpc_method::GrpcMethod};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApplicationConfig {
@@ -104,6 +105,8 @@ pub struct BaseNodeConfig {
     pub grpc_authentication: GrpcAuthentication,
     /// GRPC tls enabled
     pub grpc_tls_enabled: bool,
+    /// Enable the readiness gRPC server
+    pub grpc_readiness_enabled: bool,
     /// Enable mining on the base node, overriding other settings regarding mining
     pub mining_enabled: bool,
     /// Enable second layer specific grpc methods.
@@ -163,6 +166,17 @@ pub struct BaseNodeConfig {
     pub tari_pulse_health_check: Option<Duration>,
     /// Wallet HTTP service configuration
     pub http_wallet_query_service: WalletHttpServiceConfig,
+    /// Enable the built-in XMRig-compatible JSON-RPC proxy for solo RandomXT mining.
+    /// When enabled, XMRig can be pointed at `xmrig_proxy_address` with `"coin": "tari"`, `"daemon": true`.
+    pub xmrig_proxy_enabled: bool,
+    /// The address the XMRig proxy listens on (default: /ip4/127.0.0.1/tcp/18085).
+    pub xmrig_proxy_address: Multiaddr,
+    /// Wallet address that receives RandomXT mining rewards via the XMRig proxy.
+    pub xmrig_proxy_wallet_payment_address: String,
+    /// Extra data embedded in the coinbase produced by the XMRig proxy (e.g. pool tag).
+    pub xmrig_proxy_coinbase_extra: String,
+    /// Range proof type used for coinbase outputs produced by the XMRig proxy.
+    pub xmrig_proxy_range_proof_type: RangeProofType,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -208,6 +222,7 @@ impl Default for BaseNodeConfig {
             grpc_server_allow_methods: vec![GrpcMethod::GetVersion].into(),
             grpc_authentication: GrpcAuthentication::default(),
             grpc_tls_enabled: false,
+            grpc_readiness_enabled: true,
             mining_enabled: false,
             second_layer_grpc_enabled: false,
             identity_file: PathBuf::from("config/base_node_id.json"),
@@ -234,6 +249,11 @@ impl Default for BaseNodeConfig {
             tari_pulse_interval: Duration::from_secs(120),
             tari_pulse_health_check: None,
             http_wallet_query_service: Default::default(),
+            xmrig_proxy_enabled: false,
+            xmrig_proxy_address: "/ip4/127.0.0.1/tcp/18085".parse().unwrap(),
+            xmrig_proxy_wallet_payment_address: String::new(),
+            xmrig_proxy_coinbase_extra: "tari_base_node_xmrig".to_string(),
+            xmrig_proxy_range_proof_type: RangeProofType::RevealedValue,
         }
     }
 }

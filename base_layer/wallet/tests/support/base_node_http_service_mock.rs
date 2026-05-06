@@ -43,7 +43,7 @@ use tari_transaction_components::{
     transaction_components::{Transaction, TransactionOutput},
 };
 use tari_utilities::ByteArray;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use url::Url;
 
 use crate::support::comms_rpc::UtxosByBlock;
@@ -144,11 +144,7 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
 
     async fn is_online(&self) -> bool {
         let state = self.state.read().await;
-        if state.tip_info.is_some() {
-            state.online
-        } else {
-            false
-        }
+        if state.tip_info.is_some() { state.online } else { false }
     }
 
     async fn get_last_request_latency(&self) -> Option<Duration> {
@@ -156,7 +152,11 @@ impl BaseNodeWalletClient for HttpBaseNodeMock {
         state.last_request_latency
     }
 
-    async fn get_utxos_mined_info(&self, _hashes: Vec<Vec<u8>>) -> Result<GetUtxosMinedInfoResponse, Error> {
+    async fn get_utxos_mined_info(
+        &self,
+        _hashes: Vec<Vec<u8>>,
+        _version: u32,
+    ) -> Result<GetUtxosMinedInfoResponse, Error> {
         todo!()
     }
 

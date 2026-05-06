@@ -4,17 +4,17 @@
 use std::{fmt::Display, sync::Arc};
 
 use axum::{
+    Extension,
+    Json,
     extract::Query,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension,
-    Json,
 };
 use log::debug;
 use serde::Deserialize;
 use tari_common_types::types::HashOutput;
 use tari_core::{
-    base_node::rpc::{query_service, BaseNodeWalletQueryService},
+    base_node::rpc::{BaseNodeWalletQueryService, query_service},
     chain_storage::BlockchainBackend,
 };
 use tari_transaction_components::rpc::models::{
@@ -26,11 +26,11 @@ use tari_utilities::hex::Hex;
 use tonic::service::AxumBody;
 
 use crate::{
-    http::{
-        cache_config::{apply_cache_control, RouteKey},
-        handler::{error_handler_with_message, util::from_hex, ErrorResponse},
-    },
     HttpCacheConfig,
+    http::{
+        cache_config::{RouteKey, apply_cache_control},
+        handler::{ErrorResponse, error_handler_with_message, util::from_hex},
+    },
 };
 
 const LOG_TARGET: &str = "c::base_node::rpc::http::handler::sync_utxos_by_block";
@@ -50,6 +50,9 @@ pub struct SyncUtxosByBlockQueryParams {
     #[param(value_type = bool, example = false)]
     pub exclude_spent: bool,
     #[serde(default)]
+    #[param(value_type = bool, example = false)]
+    pub exclude_inputs: bool,
+    #[serde(default)]
     pub version: u8,
 }
 
@@ -60,6 +63,7 @@ impl From<SyncUtxosByBlockQueryParams> for SyncUtxosByBlockRequest {
             limit: params.limit,
             page: params.page,
             exclude_spent: params.exclude_spent,
+            exclude_inputs: params.exclude_inputs,
             version: params.version,
         }
     }
@@ -123,13 +127,15 @@ impl Display for SyncUtxosByBlockQueryParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SyncUtxosByBlockQueryParams {{ start_header_hash: {}, limit: {}, page: {}, exclude_spent: {} }}",
+            "SyncUtxosByBlockQueryParams {{ start_header_hash: {}, limit: {}, page: {}, exclude_spent: {}, \
+             exclude_inputs: {} }}",
             HashOutput::try_from(self.start_header_hash.as_slice())
                 .unwrap_or_default()
                 .to_hex(),
             self.limit,
             self.page,
-            self.exclude_spent
+            self.exclude_spent,
+            self.exclude_inputs
         )
     }
 }

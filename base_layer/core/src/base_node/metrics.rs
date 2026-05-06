@@ -186,6 +186,30 @@ pub fn reorg(fork_height: u64, num_added: usize, num_removed: usize) -> IntGauge
     ])
 }
 
+pub fn reorg_blocks_added() -> &'static IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "base_node::blockchain::reorg_blocks_added_total",
+            "Total number of blocks added due to chain reorgs",
+        )
+        .unwrap()
+    });
+
+    &METER
+}
+
+pub fn reorg_blocks_removed() -> &'static IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "base_node::blockchain::reorg_blocks_removed_total",
+            "Total number of blocks removed due to chain reorgs",
+        )
+        .unwrap()
+    });
+
+    &METER
+}
+
 pub fn compact_block_tx_misses(height: u64) -> IntGauge {
     static METER: Lazy<IntGaugeVec> = Lazy::new(|| {
         tari_metrics::register_int_gauge_vec(
@@ -351,7 +375,7 @@ pub fn approximate_u512_with_f64(value: &U512) -> Option<f64> {
     // Grafana-style reconstruction: (sig53 / 2^52) * 2^exp2
     // This is not exact (limited by f64), but should be within a tiny relative error.
     const TWO_P52: f64 = 4503599627370496.0; // 2^52
-                                             // Build 2^exp2 by setting the exponent (bias 1023), mantissa 0
+    // Build 2^exp2 by setting the exponent (bias 1023), mantissa 0
     let two_pow_exp2 = f64::from_bits(((exp2 + 1023) as u64) << 52);
     Some((sig53 as f64 / TWO_P52) * two_pow_exp2)
 }

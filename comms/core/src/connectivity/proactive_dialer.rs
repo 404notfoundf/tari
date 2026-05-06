@@ -42,7 +42,6 @@ pub struct ProactiveDialer {
     config: ConnectivityConfig,
     connection_manager: ConnectionManagerRequester,
     peer_manager: Arc<PeerManager>,
-    node_identity: Arc<crate::NodeIdentity>,
 }
 
 impl ProactiveDialer {
@@ -50,13 +49,11 @@ impl ProactiveDialer {
         config: ConnectivityConfig,
         connection_manager: ConnectionManagerRequester,
         peer_manager: Arc<PeerManager>,
-        node_identity: Arc<crate::NodeIdentity>,
     ) -> Self {
         Self {
             config,
             connection_manager,
             peer_manager,
-            node_identity,
         }
     }
 
@@ -215,16 +212,16 @@ impl ProactiveDialer {
         for peer in candidates {
             // The SQL query already filtered for communication nodes, non-banned, non-deleted
             // Just need to check circuit breaker state
-            if let Some(stats) = connection_stats.get(&peer.node_id) {
-                if !stats.should_allow_connection(self.config.circuit_breaker_retry_interval) {
-                    trace!(
-                        target: LOG_TARGET,
-                        "({}) Skipping peer {} due to circuit breaker",
-                        task_id,
-                        peer.node_id.short_str()
-                    );
-                    continue;
-                }
+            if let Some(stats) = connection_stats.get(&peer.node_id) &&
+                !stats.should_allow_connection(self.config.circuit_breaker_retry_interval)
+            {
+                trace!(
+                    target: LOG_TARGET,
+                    "({}) Skipping peer {} due to circuit breaker",
+                    task_id,
+                    peer.node_id.short_str()
+                );
+                continue;
             }
 
             final_candidates.push(peer);
@@ -244,14 +241,11 @@ impl ProactiveDialer {
 
             // Primary sort by health (descending)
             match health_b.partial_cmp(&health_a) {
-                Some(std::cmp::Ordering::Equal) => {
-                    // Secondary sort by distance (ascending)
-                    let dist_a = a.node_id.distance(self.node_identity.node_id());
-                    let dist_b = b.node_id.distance(self.node_identity.node_id());
-                    dist_a.cmp(&dist_b)
+                Some(order) if order != std::cmp::Ordering::Equal => order,
+                _ => {
+                    // Secondary sort by node_id for determinism
+                    a.node_id.cmp(&b.node_id)
                 },
-                Some(order) => order,
-                None => std::cmp::Ordering::Equal,
             }
         });
 

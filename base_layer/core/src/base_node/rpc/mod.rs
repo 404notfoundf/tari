@@ -24,7 +24,7 @@ use url::Url;
 
 use crate::{
     base_node::StateMachineHandle,
-    chain_storage::{async_db::AsyncBlockchainDb, BlockchainBackend},
+    chain_storage::{BlockchainBackend, async_db::AsyncBlockchainDb},
     mempool::service::MempoolHandle,
     proto::{
         self,
@@ -89,12 +89,19 @@ pub trait BaseNodeWalletQueryService: Send + Sync + 'static {
         request: models::GetUtxosDeletedInfoRequest,
     ) -> Result<models::GetUtxosDeletedInfoResponse, Self::Error>;
 
+    async fn get_utxos_deleted_info_v1(
+        &self,
+        request: models::GetUtxosDeletedInfoRequest,
+    ) -> Result<models::GetUtxosDeletedInfoResponseV1, Self::Error>;
+
     async fn generate_kernel_merkle_proof(
         &self,
         excess_sig: CompressedSignature,
     ) -> Result<GenerateKernelMerkleProofResponse, Self::Error>;
 
     async fn get_utxo(&self, request: models::GetUtxoRequest) -> Result<Option<TransactionOutput>, Self::Error>;
+
+    async fn get_mempool_fee_per_gram_stats(&self, count: usize) -> Result<Vec<models::FeePerGramStat>, Self::Error>;
 }
 
 #[tari_rpc(protocol_name = b"t/bnwallet/1", server_struct = BaseNodeWalletRpcServer, client_struct = BaseNodeWalletRpcClient)]
