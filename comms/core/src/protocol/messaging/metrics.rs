@@ -47,6 +47,66 @@ pub fn outbound_message_count() -> IntCounter {
     METER.clone()
 }
 
+pub fn outbound_queue_enqueue_count() -> IntCounter {
+    static METER: Lazy<IntCounter> = Lazy::new(|| {
+        tari_metrics::register_int_counter(
+            "comms::messaging::outbound_queue_enqueue_count",
+            "The number of messages enqueued onto peer outbound queues",
+        )
+        .unwrap()
+    });
+
+    METER.clone()
+}
+
+pub fn outbound_queue_dequeue_count() -> IntCounter {
+    static METER: Lazy<IntCounter> = Lazy::new(|| {
+        tari_metrics::register_int_counter(
+            "comms::messaging::outbound_queue_dequeue_count",
+            "The number of messages dequeued from peer outbound queues",
+        )
+        .unwrap()
+    });
+
+    METER.clone()
+}
+
+pub fn outbound_pending_messages() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::outbound_pending_messages",
+            "The current number of messages waiting in peer outbound queues",
+        )
+        .unwrap()
+    });
+
+    METER.clone()
+}
+
+pub fn retry_queue_messages() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::retry_queue_messages",
+            "The current number of messages waiting in the outbound retry queue",
+        )
+        .unwrap()
+    });
+
+    METER.clone()
+}
+
+pub fn active_outbound_queues() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::active_outbound_queues",
+            "The current number of active per-peer outbound queues",
+        )
+        .unwrap()
+    });
+
+    METER.clone()
+}
+
 pub fn inbound_message_count() -> IntCounter {
     static METER: Lazy<IntCounter> = Lazy::new(|| {
         tari_metrics::register_int_counter(

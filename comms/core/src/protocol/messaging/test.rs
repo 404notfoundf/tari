@@ -28,6 +28,8 @@ use rand::rngs::OsRng;
 use tari_common_sqlite::connection::DbConnection;
 use tari_shutdown::Shutdown;
 use tari_test_utils::{collect_stream, unpack_enum};
+#[cfg(feature = "metrics")]
+use tari_metrics::proto::MetricType;
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     time,
@@ -66,6 +68,28 @@ static TEST_MSG1: Bytes = Bytes::from_static(b"TEST_MSG1");
 static TEST_MSG2: Bytes = Bytes::from_static(b"TEST_MSG2");
 
 static MESSAGING_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"test/msg");
+
+#[cfg(feature = "metrics")]
+fn get_metric_value(name: &str) -> f64 {
+    tari_metrics::get_default_registry()
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .map(|metric| match family.get_field_type() {
+                    MetricType::COUNTER => metric.get_counter().value(),
+                    MetricType::GAUGE => metric.get_gauge().value(),
+                    MetricType::SUMMARY => metric.get_summary().sample_sum(),
+                    MetricType::UNTYPED => metric.get_untyped().value(),
+                    MetricType::HISTOGRAM => metric.get_histogram().get_sample_sum(),
+                })
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
 
 fn create_peer_manager() -> Arc<PeerManager> {
     let db_connection = DbConnection::connect_temp_file_and_migrate(MIGRATIONS).unwrap();
@@ -218,6 +242,50 @@ async fn send_message_request() {
     assert_eq!(peer_conn_mock1.call_count(), 1);
 }
 
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn send_message_updates_prometheus_metrics() {
+    let enqueue_before = get_metric_value("comms::messaging::outbound_queue_enqueue_count");
+    let dequeue_before = get_metric_value("comms::messaging::outbound_queue_dequeue_count");
+    let pending_before = get_metric_value("comms::messaging::outbound_pending_messages");
+    let active_before = get_metric_value("comms::messaging::active_outbound_queues");
+
+    let (_, node_identity, conn_man_mock, _, request_tx, _, _, _shutdown) = spawn_messaging_protocol().await;
+    let peer_node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
+
+    let (conn1, _peer_conn_mock1, _, peer_conn_mock2) =
+        create_peer_connection_mock_pair(node_identity.to_peer(), peer_node_identity.to_peer()).await;
+
+    conn_man_mock.add_active_connection(conn1).await;
+
+    let out_msg = OutboundMessage::new(peer_node_identity.node_id().clone(), TEST_MSG1.clone());
+    request_tx.send(out_msg).unwrap();
+
+    let stream = peer_conn_mock2.next_incoming_substream().await.unwrap();
+    let mut framed = MessagingProtocol::framed(stream);
+    let msg = time::timeout(Duration::from_secs(5), framed.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(msg, TEST_MSG1);
+
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            let enqueue_after = get_metric_value("comms::messaging::outbound_queue_enqueue_count");
+            let dequeue_after = get_metric_value("comms::messaging::outbound_queue_dequeue_count");
+            let pending_after = get_metric_value("comms::messaging::outbound_pending_messages");
+            let active_after = get_metric_value("comms::messaging::active_outbound_queues");
+            if enqueue_after >= enqueue_before + 1.0 &&
+                dequeue_after >= dequeue_before + 1.0 &&
+                pending_after <= pending_before &&
+                active_after >= active_before + 1.0
+            {
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn send_message_dial_failed() {
     let (_, _, conn_manager_mock, _, request_tx, _, mut event_tx, _shutdown) = spawn_messaging_protocol().await;
@@ -303,6 +371,97 @@ async fn send_message_substream_bulk_failure() {
         .unwrap();
     unpack_enum!(MessagingEvent::OutboundProtocolExited(node_id) = &event);
     assert_eq!(node_id, peer_node_id);
+}
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn send_message_disconnect_updates_retry_metrics() {
+    let retry_before = get_metric_value("comms::messaging::retry_queue_messages");
+
+    let (_, node_identity, conn_manager_mock, _, mut request_tx, _, mut events_rx, _shutdown) =
+        spawn_messaging_protocol().await;
+
+    let peer_node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
+    let (conn1, _, _, peer_conn_mock2) =
+        create_peer_connection_mock_pair(node_identity.to_peer(), peer_node_identity.to_peer()).await;
+
+    let peer_node_id = peer_node_identity.node_id();
+    conn_manager_mock.add_active_connection(conn1).await;
+
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    let out_msg = OutboundMessage::with_reply(peer_node_id.clone(), TEST_MSG1.clone(), reply_tx.into());
+    request_tx.send(out_msg).unwrap();
+
+    let _substream = peer_conn_mock2.next_incoming_substream().await.unwrap();
+    peer_conn_mock2.disconnect().await.unwrap();
+    drop(peer_conn_mock2);
+
+    for _ in 0..3 {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let out_msg = OutboundMessage::with_reply(peer_node_id.clone(), TEST_MSG1.clone(), reply_tx.into());
+        request_tx.send(out_msg).unwrap();
+    }
+
+    let _ = time::timeout(Duration::from_secs(10), events_rx.recv()).await.unwrap().unwrap();
+
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            let retry_after = get_metric_value("comms::messaging::retry_queue_messages");
+            if retry_after >= retry_before + 1.0 {
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn send_message_backpressure_increases_pending_metrics() {
+    const NUM_MSGS: usize = 128;
+    const MSG_SIZE: usize = 256 * 1024;
+
+    let pending_before = get_metric_value("comms::messaging::outbound_pending_messages");
+    let enqueue_before = get_metric_value("comms::messaging::outbound_queue_enqueue_count");
+    let dequeue_before = get_metric_value("comms::messaging::outbound_queue_dequeue_count");
+
+    let (_, node_identity, conn_man_mock, _, request_tx, _, _, _shutdown) = spawn_messaging_protocol().await;
+    let peer_node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
+
+    let (conn1, _peer_conn_mock1, _, peer_conn_mock2) =
+        create_peer_connection_mock_pair(node_identity.to_peer(), peer_node_identity.to_peer()).await;
+
+    conn_man_mock.add_active_connection(conn1).await;
+
+    let body = Bytes::from(vec![0u8; MSG_SIZE]);
+    for _ in 0..NUM_MSGS {
+        let out_msg = OutboundMessage::new(peer_node_identity.node_id().clone(), body.clone());
+        request_tx.send(out_msg).unwrap();
+    }
+
+    let _substream = peer_conn_mock2.next_incoming_substream().await.unwrap();
+
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            let pending_after = get_metric_value("comms::messaging::outbound_pending_messages");
+            let enqueue_after = get_metric_value("comms::messaging::outbound_queue_enqueue_count");
+            let dequeue_after = get_metric_value("comms::messaging::outbound_queue_dequeue_count");
+            if enqueue_after >= enqueue_before + NUM_MSGS as f64 &&
+                pending_after > pending_before &&
+                enqueue_after > dequeue_after
+            {
+                break;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(get_metric_value("comms::messaging::outbound_pending_messages") > pending_before);
+    assert!(get_metric_value("comms::messaging::outbound_queue_dequeue_count") >= dequeue_before);
 }
 
 #[tokio::test]

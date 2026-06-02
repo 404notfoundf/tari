@@ -271,7 +271,11 @@ impl OutboundMessaging {
         let outbound_count = metrics::outbound_message_count();
         let stream = outbound_stream.map(|mut out_msg| {
             #[cfg(feature = "metrics")]
-            outbound_count.inc();
+            {
+                outbound_count.inc();
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             trace!(
                 target: LOG_TARGET,
                 "Message for peer '{}' sending {} on stream {}", peer_node_id, out_msg, stream_id
@@ -309,10 +313,17 @@ impl OutboundMessaging {
         // dropped.
         let mut retried_messages_count = 0;
         while let Some(msg) = messages_rx.recv().await {
+            #[cfg(feature = "metrics")]
+            {
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             if self.retry_queue_tx.send(msg).is_err() {
                 // The messaging protocol has shut down, so let's exit too
                 break;
             }
+            #[cfg(feature = "metrics")]
+            metrics::retry_queue_messages().inc();
             retried_messages_count += 1;
         }
 
@@ -335,6 +346,11 @@ impl OutboundMessaging {
         // to a failed event
         self.messages_rx.close();
         while let Some(mut out_msg) = self.messages_rx.recv().await {
+            #[cfg(feature = "metrics")]
+            {
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             out_msg.reply_fail(reason);
         }
     }

@@ -38,6 +38,8 @@ use tokio::{
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use super::error::MessagingProtocolError;
+#[cfg(feature = "metrics")]
+use super::metrics;
 use crate::{
     PeerConnection,
     connectivity::ConnectivityRequester,
@@ -184,6 +186,8 @@ impl MessagingProtocol {
                 },
 
                 Some(msg) = self.retry_queue_rx.recv() => {
+                    #[cfg(feature = "metrics")]
+                    metrics::retry_queue_messages().dec();
                     if let Err(err) = self.handle_retry_queue_messages(msg) {
                         error!(
                             target: LOG_TARGET,
@@ -240,6 +244,8 @@ impl MessagingProtocol {
                         node_id.short_str()
                     );
                 }
+                #[cfg(feature = "metrics")]
+                metrics::active_outbound_queues().set(self.active_queues.len() as i64);
             },
             InboundProtocolExited(node_id) => {
                 debug!(
@@ -280,6 +286,8 @@ impl MessagingProtocol {
                 Entry::Occupied(entry) => {
                     if entry.get().is_closed() {
                         entry.remove();
+                        #[cfg(feature = "metrics")]
+                        metrics::active_outbound_queues().set(self.active_queues.len() as i64);
                         continue;
                     }
                     break entry.into_mut();
@@ -292,7 +300,10 @@ impl MessagingProtocol {
                         self.retry_queue_tx.clone(),
                         self.protocol_id.clone(),
                     );
-                    break entry.insert(sender);
+                    let sender = entry.insert(sender);
+                    #[cfg(feature = "metrics")]
+                    metrics::active_outbound_queues().set(self.active_queues.len() as i64);
+                    break sender;
                 },
             }
         };
@@ -301,6 +312,11 @@ impl MessagingProtocol {
         let tag = out_msg.tag;
         match sender.send(out_msg) {
             Ok(_) => {
+                #[cfg(feature = "metrics")]
+                {
+                    metrics::outbound_queue_enqueue_count().inc();
+                    metrics::outbound_pending_messages().inc();
+                }
                 trace!(target: LOG_TARGET, "Message ({tag}) dispatched to outbound handler");
                 Ok(())
             },
