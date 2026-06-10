@@ -20,7 +20,10 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
@@ -163,6 +166,8 @@ async fn new_inbound_substream_handling() {
         reply: reply_tx.into(),
         peer_node_id: peer1.node_id.clone(),
         body: TEST_MSG1.clone(),
+        expires_at: None,
+        queued_at: Instant::now(),
     };
     outbound_msg_tx.send(out_msg).unwrap();
 
@@ -330,6 +335,8 @@ async fn many_concurrent_send_message_requests() {
             reply: reply_tx.into(),
             peer_node_id: node_id2.clone(),
             body: TEST_MSG1.clone(),
+            expires_at: None,
+            queued_at: Instant::now(),
         };
         msg_tags.push(out_msg.tag);
         reply_rxs.push(reply_rx);
@@ -370,6 +377,8 @@ async fn many_concurrent_send_message_requests_that_fail() {
             reply: reply_tx.into(),
             peer_node_id: node_id2.clone(),
             body: TEST_MSG1.clone(),
+            expires_at: None,
+            queued_at: Instant::now(),
         };
         msg_tags.push(out_msg.tag);
         reply_rxs.push(reply_rx);

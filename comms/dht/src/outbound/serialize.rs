@@ -20,7 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::task::Poll;
+use std::{task::Poll, time::Instant};
 
 use futures::task::Context;
 use log::*;
@@ -112,6 +112,8 @@ where
             peer_node_id: destination_node_id,
             reply,
             body,
+            expires_at: expires,
+            queued_at: Instant::now(),
         })
     }
 }

@@ -23,9 +23,11 @@
 use std::{
     fmt,
     fmt::{Error, Formatter},
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use tari_utilities::epoch_time::EpochTime;
 use tokio::sync::oneshot;
 
 use crate::{message::MessageTag, peer_manager::NodeId, protocol::messaging::SendFailReason};
@@ -41,6 +43,8 @@ pub struct OutboundMessage {
     pub peer_node_id: NodeId,
     pub body: Bytes,
     pub reply: MessagingReplyTx,
+    pub expires_at: Option<u64>,
+    pub queued_at: Instant,
 }
 
 impl OutboundMessage {
@@ -50,6 +54,8 @@ impl OutboundMessage {
             peer_node_id,
             body,
             reply: MessagingReplyTx::none(),
+            expires_at: None,
+            queued_at: Instant::now(),
         }
     }
 
@@ -59,7 +65,19 @@ impl OutboundMessage {
             peer_node_id,
             body,
             reply,
+            expires_at: None,
+            queued_at: Instant::now(),
         }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .map(|expires_at| expires_at < EpochTime::now().as_u64())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn has_exceeded_queue_age(&self, max_age: Duration) -> bool {
+        self.queued_at.elapsed() >= max_age
     }
 
     #[inline]
@@ -153,9 +171,27 @@ mod test {
             peer_node_id: node_id.clone(),
             reply: MessagingReplyTx::none(),
             body: TEST_MSG.clone(),
+            expires_at: None,
+            queued_at: Instant::now(),
         };
         assert_eq!(tag, subject.tag);
         assert_eq!(subject.body, TEST_MSG);
         assert_eq!(subject.peer_node_id, node_id);
+    }
+
+    #[test]
+    fn expired_message() {
+        let mut subject = OutboundMessage::new(NodeId::new(), Bytes::new());
+        subject.expires_at = Some(0);
+
+        assert!(subject.is_expired());
+    }
+
+    #[test]
+    fn detects_message_that_has_exceeded_queue_age() {
+        let mut subject = OutboundMessage::new(NodeId::new(), Bytes::new());
+        subject.queued_at = Instant::now() - Duration::from_secs(2);
+
+        assert!(subject.has_exceeded_queue_age(Duration::from_secs(1)));
     }
 }

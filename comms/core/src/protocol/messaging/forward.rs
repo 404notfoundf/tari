@@ -34,6 +34,25 @@ use futures::{
     task::{Context, Poll},
 };
 use pin_project::pin_project;
+use tokio::time::{Instant, Sleep};
+
+#[derive(Debug)]
+pub(crate) struct ForwardItem<Item> {
+    item: Item,
+    deadline: Instant,
+}
+
+impl<Item> ForwardItem<Item> {
+    pub(crate) fn new(item: Item, deadline: Instant) -> Self {
+        Self { item, deadline }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ForwardError<E> {
+    Sink(E),
+    HeadMessageTooOld,
+}
 
 /// Future for the [`forward`](super::StreamExt::forward) method.
 #[pin_project(project = ForwardProj)]
@@ -44,7 +63,10 @@ pub struct Forward<St, Si, Item> {
     sink: Option<Si>,
     #[pin]
     stream: Fuse<St>,
-    buffered_item: Option<Item>,
+    buffered_item: Option<ForwardItem<Item>>,
+    inflight_deadline: Option<Instant>,
+    #[pin]
+    deadline_timer: Sleep,
 }
 
 impl<St, Si, Item> Forward<St, Si, Item>
@@ -55,6 +77,8 @@ where St: TryStream
             sink: Some(sink),
             stream: stream.fuse(),
             buffered_item: None,
+            inflight_deadline: None,
+            deadline_timer: tokio::time::sleep_until(Instant::now()),
         }
     }
 }
@@ -62,7 +86,7 @@ where St: TryStream
 impl<St, Si, Item, E> FusedFuture for Forward<St, Si, Item>
 where
     Si: Sink<Item, Error = E>,
-    St: Stream<Item = Result<Item, E>>,
+    St: Stream<Item = Result<ForwardItem<Item>, E>>,
 {
     fn is_terminated(&self) -> bool {
         self.sink.is_none()
@@ -72,15 +96,17 @@ where
 impl<St, Si, Item, E> Future for Forward<St, Si, Item>
 where
     Si: Sink<Item, Error = E>,
-    St: Stream<Item = Result<Item, E>>,
+    St: Stream<Item = Result<ForwardItem<Item>, E>>,
 {
-    type Output = Result<(), E>;
+    type Output = Result<(), ForwardError<E>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let ForwardProj {
             mut sink,
             mut stream,
             buffered_item,
+            inflight_deadline,
+            mut deadline_timer,
         } = self.project();
         let mut si = sink.as_mut().as_pin_mut().expect("polled `Forward` after completion");
 
@@ -88,24 +114,145 @@ where
             // If we've got an item buffered already, we need to write it to the
             // sink before we can do anything else
             if buffered_item.is_some() {
-                ready!(si.as_mut().poll_ready(cx))?;
-                si.as_mut().start_send(buffered_item.take().unwrap())?;
+                match si.as_mut().poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {
+                        let buffered = buffered_item.take().unwrap();
+                        if let Err(err) = si.as_mut().start_send(buffered.item) {
+                            return Poll::Ready(Err(ForwardError::Sink(err)));
+                        }
+                        *inflight_deadline = Some(
+                            inflight_deadline
+                                .map(|deadline| deadline.min(buffered.deadline))
+                                .unwrap_or(buffered.deadline),
+                        );
+                    },
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(ForwardError::Sink(err))),
+                    Poll::Pending => {
+                        let deadline = buffered_item.as_ref().unwrap().deadline;
+                        deadline_timer.as_mut().reset(deadline);
+                        ready!(deadline_timer.as_mut().poll(cx));
+                        return Poll::Ready(Err(ForwardError::HeadMessageTooOld));
+                    },
+                }
             }
 
-            match stream.as_mut().poll_next(cx)? {
-                Poll::Ready(Some(item)) => {
+            match stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(item))) => {
                     *buffered_item = Some(item);
                 },
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(ForwardError::Sink(err))),
                 Poll::Ready(None) => {
-                    ready!(si.poll_close(cx))?;
+                    match si.as_mut().poll_close(cx) {
+                        Poll::Ready(Ok(())) => {},
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(ForwardError::Sink(err))),
+                        Poll::Pending => {
+                            if let Some(deadline) = inflight_deadline {
+                                deadline_timer.as_mut().reset(*deadline);
+                                ready!(deadline_timer.as_mut().poll(cx));
+                                return Poll::Ready(Err(ForwardError::HeadMessageTooOld));
+                            }
+                            return Poll::Pending;
+                        },
+                    }
                     sink.set(None);
                     return Poll::Ready(Ok(()));
                 },
                 Poll::Pending => {
-                    ready!(si.poll_flush(cx))?;
+                    match si.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            *inflight_deadline = None;
+                        },
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(ForwardError::Sink(err))),
+                        Poll::Pending => {
+                            if let Some(deadline) = inflight_deadline {
+                                deadline_timer.as_mut().reset(*deadline);
+                                ready!(deadline_timer.as_mut().poll(cx));
+                                return Poll::Ready(Err(ForwardError::HeadMessageTooOld));
+                            }
+                        },
+                    }
                     return Poll::Pending;
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use super::*;
+
+    struct PendingSink;
+    struct PendingFlushSink;
+
+    impl Sink<u8> for PendingSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: u8) -> Result<(), Self::Error> {
+            unreachable!("pending sink must not accept an item")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<u8> for PendingFlushSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_error_when_queue_head_is_blocked_past_deadline() {
+        let stream = futures::stream::iter([Ok::<_, ()>(ForwardItem::new(
+            1,
+            Instant::now() + Duration::from_millis(10),
+        ))]);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), Forward::new(stream, PendingSink))
+            .await
+            .expect("forward did not observe the queue head deadline");
+
+        assert!(matches!(result, Err(ForwardError::HeadMessageTooOld)));
+    }
+
+    #[tokio::test]
+    async fn returns_error_when_flush_is_blocked_past_deadline() {
+        let stream = futures::stream::iter([Ok::<_, ()>(ForwardItem::new(
+            1,
+            Instant::now() + Duration::from_millis(10),
+        ))])
+        .chain(futures::stream::pending());
+
+        let result = tokio::time::timeout(Duration::from_secs(1), Forward::new(stream, PendingFlushSink))
+            .await
+            .expect("forward did not observe the in-flight message deadline");
+
+        assert!(matches!(result, Err(ForwardError::HeadMessageTooOld)));
     }
 }

@@ -20,11 +20,11 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt, future};
 use tokio::{pin, sync::mpsc};
-use tracing::{Instrument, Level, debug, error, span, trace};
+use tracing::{Instrument, Level, debug, error, span, trace, warn};
 
 #[cfg(feature = "metrics")]
 use super::metrics;
@@ -37,6 +37,7 @@ use crate::{
     peer_manager::NodeId,
     protocol::ProtocolId,
     stream_id::StreamId,
+    Minimized,
 };
 
 const LOG_TARGET: &str = "comms::protocol::messaging::outbound";
@@ -44,6 +45,7 @@ const LOG_TARGET: &str = "comms::protocol::messaging::outbound";
 /// This should only need to be 1 to handle the case where the pending dial is cancelled due to to tie breaking
 /// and because the connection manager already retries dialing a number of times for each requested dial.
 const MAX_SEND_RETRIES: usize = 1;
+const MAX_OUTBOUND_QUEUE_AGE: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Actor for outbound messaging for a peer. This is spawned lazily when an outbound message must be sent.
 pub struct OutboundMessaging {
@@ -238,7 +240,7 @@ impl OutboundMessaging {
     }
 
     async fn start_forwarding_messages(
-        self,
+        mut self,
         conn: PeerConnection,
         substream: NegotiatedSubstream<Substream>,
     ) -> Result<(), MessagingProtocolError> {
@@ -260,6 +262,7 @@ impl OutboundMessaging {
         );
 
         let (sink, mut remote_stream) = MessagingProtocol::framed(substream.stream).split();
+        let connection_id = conn.id();
 
         // Convert unbounded channel to a stream
         let outbound_stream = futures::stream::unfold(&mut messages_rx, |rx| async move {
@@ -269,16 +272,29 @@ impl OutboundMessaging {
 
         #[cfg(feature = "metrics")]
         let outbound_count = metrics::outbound_message_count();
-        let stream = outbound_stream.map(|mut out_msg| {
+        let stream = outbound_stream.filter_map(|mut out_msg| {
             #[cfg(feature = "metrics")]
             outbound_count.inc();
+            if out_msg.is_expired() {
+                debug!(
+                    target: LOG_TARGET,
+                    "Dropping expired message for peer '{}' before send {}",
+                    peer_node_id,
+                    out_msg.tag
+                );
+                out_msg.reply_fail(SendFailReason::Dropped);
+                return future::ready(None);
+            }
             trace!(
                 target: LOG_TARGET,
                 "Message for peer '{}' sending {} on stream {}", peer_node_id, out_msg, stream_id
             );
 
+            let deadline = tokio::time::Instant::from_std(out_msg.queued_at + MAX_OUTBOUND_QUEUE_AGE);
             out_msg.reply_success();
-            Result::<_, MessagingProtocolError>::Ok(out_msg.body)
+            future::ready(Some(Result::<_, MessagingProtocolError>::Ok(
+                super::forward::ForwardItem::new(out_msg.body, deadline),
+            )))
         });
 
         // Stop the stream as soon as the disconnection occurs, this allows the outbound stream to terminate as soon as
@@ -300,15 +316,54 @@ impl OutboundMessaging {
             )
         });
 
-        super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await?;
+        let forward_result = super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await;
 
         // Close so that the protocol handler does not resend to this session
         messages_rx.close();
+        if matches!(
+            &forward_result,
+            Err(super::forward::ForwardError::HeadMessageTooOld)
+        ) {
+            match self.connectivity.get_connection(peer_node_id.clone()).await {
+                Ok(Some(mut connection)) if connection.id() == connection_id => {
+                    if let Err(err) = connection
+                        .disconnect(Minimized::No, "Outbound messaging queue head stalled")
+                        .await
+                    {
+                        warn!(
+                            target: LOG_TARGET,
+                            "Failed to disconnect peer '{}' after outbound queue head stalled: {}",
+                            peer_node_id,
+                            err
+                        );
+                    }
+                },
+                Ok(_) => {},
+                Err(err) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Failed to get peer '{}' connection after outbound queue head stalled: {}",
+                        peer_node_id,
+                        err
+                    );
+                },
+            }
+        }
         // The stream ended, perhaps due to a disconnect, but there could be more messages left on the queue. Collect
         // any messages and queue them up for retry. If we cannot reconnect to the peer, the queued messages will be
         // dropped.
         let mut retried_messages_count = 0;
-        while let Some(msg) = messages_rx.recv().await {
+        while let Some(mut msg) = messages_rx.recv().await {
+            if msg.is_expired() || msg.has_exceeded_queue_age(MAX_OUTBOUND_QUEUE_AGE) {
+                debug!(
+                    target: LOG_TARGET,
+                    "Dropping expired or stale message for peer '{}' before retry {}",
+                    peer_node_id,
+                    msg.tag
+                );
+                msg.reply_fail(SendFailReason::Dropped);
+                continue;
+            }
             if self.retry_queue_tx.send(msg).is_err() {
                 // The messaging protocol has shut down, so let's exit too
                 break;
@@ -323,11 +378,25 @@ impl OutboundMessaging {
             );
         }
 
-        debug!(
-            target: LOG_TARGET,
-            "Direct message forwarding successfully completed for peer `{}` (stream: {}).", peer_node_id, stream_id
-        );
-        Ok(())
+        match forward_result {
+            Ok(()) => {
+                debug!(
+                    target: LOG_TARGET,
+                    "Direct message forwarding successfully completed for peer `{}` (stream: {}).", peer_node_id, stream_id
+                );
+                Ok(())
+            },
+            Err(super::forward::ForwardError::Sink(err)) => Err(err),
+            Err(super::forward::ForwardError::HeadMessageTooOld) => {
+                debug!(
+                    target: LOG_TARGET,
+                    "Disconnected peer '{}' because the outbound queue head was blocked for more than {:?}.",
+                    peer_node_id,
+                    MAX_OUTBOUND_QUEUE_AGE
+                );
+                Err(MessagingProtocolError::OutboundQueueHeadStalled)
+            },
+        }
     }
 
     async fn fail_all_pending_messages(&mut self, reason: SendFailReason) {

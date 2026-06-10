@@ -51,6 +51,8 @@ pub enum MessagingProtocolError {
     SenderError(#[from] mpsc::error::SendError<OutboundMessage>),
     #[error("Connection closed")]
     ConnectionClosed(io::Error),
+    #[error("Outbound message queue head was blocked for too long")]
+    OutboundQueueHeadStalled,
 }
 
 impl From<io::Error> for MessagingProtocolError {
