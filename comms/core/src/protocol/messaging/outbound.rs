@@ -264,6 +264,11 @@ impl OutboundMessaging {
         // Convert unbounded channel to a stream
         let outbound_stream = futures::stream::unfold(&mut messages_rx, |rx| async move {
             let v = rx.recv().await;
+            #[cfg(feature = "metrics")]
+            if v.is_some() {
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             v.map(|v| (v, rx))
         });
 
@@ -300,7 +305,16 @@ impl OutboundMessaging {
             )
         });
 
-        super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await?;
+        if let Err(err) = super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await {
+            messages_rx.close();
+            #[cfg(feature = "metrics")]
+            {
+                let abandoned = messages_rx.len();
+                metrics::outbound_pending_messages().sub(abandoned as i64);
+                metrics::outbound_queue_abandoned_count().inc_by(abandoned as u64);
+            }
+            return Err(err);
+        }
 
         // Close so that the protocol handler does not resend to this session
         messages_rx.close();
@@ -309,10 +323,17 @@ impl OutboundMessaging {
         // dropped.
         let mut retried_messages_count = 0;
         while let Some(msg) = messages_rx.recv().await {
+            #[cfg(feature = "metrics")]
+            {
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             if self.retry_queue_tx.send(msg).is_err() {
                 // The messaging protocol has shut down, so let's exit too
                 break;
             }
+            #[cfg(feature = "metrics")]
+            metrics::retry_queue_messages().inc();
             retried_messages_count += 1;
         }
 
@@ -335,6 +356,11 @@ impl OutboundMessaging {
         // to a failed event
         self.messages_rx.close();
         while let Some(mut out_msg) = self.messages_rx.recv().await {
+            #[cfg(feature = "metrics")]
+            {
+                metrics::outbound_queue_dequeue_count().inc();
+                metrics::outbound_pending_messages().dec();
+            }
             out_msg.reply_fail(reason);
         }
     }

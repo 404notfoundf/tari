@@ -65,3 +65,69 @@ pub fn error_count() -> IntCounter {
 
     METER.clone()
 }
+
+pub fn outbound_queue_enqueue_count() -> IntCounter {
+    static METER: Lazy<IntCounter> = Lazy::new(|| {
+        tari_metrics::register_int_counter(
+            "comms::messaging::outbound_queue_enqueue_count",
+            "The total number of messages enqueued into per-peer outbound queues",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}
+
+pub fn outbound_queue_dequeue_count() -> IntCounter {
+    static METER: Lazy<IntCounter> = Lazy::new(|| {
+        tari_metrics::register_int_counter(
+            "comms::messaging::outbound_queue_dequeue_count",
+            "The total number of messages dequeued from per-peer outbound queues",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}
+
+pub fn outbound_pending_messages() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::outbound_pending_messages",
+            "The current number of messages waiting in per-peer outbound queues",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}
+
+pub fn retry_queue_messages() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::retry_queue_messages",
+            "The current number of messages waiting in the outbound retry queue",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}
+
+pub fn active_outbound_queues() -> IntGauge {
+    static METER: Lazy<IntGauge> = Lazy::new(|| {
+        tari_metrics::register_int_gauge(
+            "comms::messaging::active_outbound_queues",
+            "The current number of active per-peer outbound queues",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}
+
+pub fn outbound_queue_abandoned_count() -> IntCounter {
+    static METER: Lazy<IntCounter> = Lazy::new(|| {
+        tari_metrics::register_int_counter(
+            "comms::messaging::outbound_queue_abandoned_count",
+            "The total number of queued messages abandoned when an outbound handler exits with an error",
+        )
+        .unwrap()
+    });
+    METER.clone()
+}

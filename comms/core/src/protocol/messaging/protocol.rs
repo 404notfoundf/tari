@@ -37,6 +37,8 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+#[cfg(feature = "metrics")]
+use super::metrics;
 use super::error::MessagingProtocolError;
 use crate::{
     PeerConnection,
@@ -239,6 +241,9 @@ impl MessagingProtocol {
                          for peer `{}`",
                         node_id.short_str()
                     );
+                } else {
+                    #[cfg(feature = "metrics")]
+                    metrics::active_outbound_queues().dec();
                 }
             },
             InboundProtocolExited(node_id) => {
@@ -267,6 +272,8 @@ impl MessagingProtocol {
     }
 
     fn handle_retry_queue_messages(&mut self, msg: OutboundMessage) -> Result<(), MessagingProtocolError> {
+        #[cfg(feature = "metrics")]
+        metrics::retry_queue_messages().dec();
         debug!(target: LOG_TARGET, "Retrying outbound message ({msg})");
         self.send_message(msg)?;
         Ok(())
@@ -292,6 +299,8 @@ impl MessagingProtocol {
                         self.retry_queue_tx.clone(),
                         self.protocol_id.clone(),
                     );
+                    #[cfg(feature = "metrics")]
+                    metrics::active_outbound_queues().inc();
                     break entry.insert(sender);
                 },
             }
@@ -301,6 +310,11 @@ impl MessagingProtocol {
         let tag = out_msg.tag;
         match sender.send(out_msg) {
             Ok(_) => {
+                #[cfg(feature = "metrics")]
+                {
+                    metrics::outbound_queue_enqueue_count().inc();
+                    metrics::outbound_pending_messages().inc();
+                }
                 trace!(target: LOG_TARGET, "Message ({tag}) dispatched to outbound handler");
                 Ok(())
             },
