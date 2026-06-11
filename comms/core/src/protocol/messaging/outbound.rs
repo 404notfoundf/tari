@@ -305,16 +305,7 @@ impl OutboundMessaging {
             )
         });
 
-        if let Err(err) = super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await {
-            messages_rx.close();
-            #[cfg(feature = "metrics")]
-            {
-                let abandoned = messages_rx.len();
-                metrics::outbound_pending_messages().sub(abandoned as i64);
-                metrics::outbound_queue_abandoned_count().inc_by(abandoned as u64);
-            }
-            return Err(err);
-        }
+        super::forward::Forward::new(stream, sink.sink_map_err(Into::into)).await?;
 
         // Close so that the protocol handler does not resend to this session
         messages_rx.close();
