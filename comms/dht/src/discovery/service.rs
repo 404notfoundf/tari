@@ -23,7 +23,7 @@
 use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Instant};
 
 use log::*;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use tari_comms::{
     log_if_error,
     peer_manager::{NodeIdentity, Peer, PeerManager},
@@ -294,7 +294,7 @@ impl DhtDiscoveryService {
         destination: NodeDestination,
         reply_tx: oneshot::Sender<Result<Peer, DhtDiscoveryError>>,
     ) -> Result<(), DhtDiscoveryError> {
-        let nonce = OsRng.next_u64();
+        let nonce = rand::rng().next_u64();
         if *dest_pubkey == *self.node_identity.public_key() {
             let _result = reply_tx.send(Err(DhtDiscoveryError::CannotDiscoverThisNode));
             return Ok(());
@@ -353,7 +353,7 @@ impl DhtDiscoveryService {
         };
         debug!(
             target: LOG_TARGET,
-            "Sending Discovery message for peer public key '{}' with destination {}", &dest_public_key, destination
+            "Sending Discovery message for peer public key '{}' with destination {}", dest_public_key, destination
         );
 
         self.outbound_requester
@@ -361,7 +361,7 @@ impl DhtDiscoveryService {
                 SendMessageParams::new()
                     .broadcast(Vec::new())
                     .with_destination(destination)
-                    .with_debug_info(format!("discover: {}", &dest_public_key))
+                    .with_debug_info(format!("discover: {}", dest_public_key))
                     .with_encryption(OutboundEncryption::EncryptFor(dest_public_key))
                     .with_dht_message_type(DhtMessageType::Discovery)
                     .finish(),

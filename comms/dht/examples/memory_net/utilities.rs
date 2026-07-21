@@ -31,12 +31,13 @@ use std::{
 
 use futures::future;
 use once_cell::sync::Lazy;
-use rand::{Rng, distributions, rngs::OsRng};
+use rand::{RngExt, distr};
 use tari_common_sqlite::connection::{DbConnection, DbConnectionUrl};
 use tari_comms::{
     CommsBuilder,
     CommsNode,
     PeerConnection,
+    RefKind,
     backoff::ConstantBackoff,
     connection_manager::{ConnectionDirection, ConnectionManagerEvent},
     peer_manager::{
@@ -260,7 +261,7 @@ pub async fn network_connectivity_stats(nodes: &[TestNode], wallets: &[TestNode]
 pub async fn do_network_wide_propagation(nodes: &mut [TestNode], origin_node_index: Option<usize>) -> (usize, usize) {
     let random_node = match origin_node_index {
         Some(n) if n < nodes.len() => &nodes[n],
-        Some(_) | None => &nodes[OsRng.gen_range(0..nodes.len() - 1)],
+        Some(_) | None => &nodes[rand::rng().random_range(0..nodes.len() - 1)],
     };
 
     let random_node_id = random_node.comms.node_identity().node_id().clone();
@@ -581,7 +582,13 @@ impl TestNode {
 
     #[allow(dead_code)]
     pub async fn expect_peer_connection(&mut self, node_id: &NodeId) -> Option<PeerConnection> {
-        if let Some(conn) = self.comms.connectivity().get_connection(node_id.clone()).await.unwrap() {
+        if let Some(conn) = self
+            .comms
+            .connectivity()
+            .get_connection(node_id.clone(), RefKind::Weak)
+            .await
+            .unwrap()
+        {
             return Some(conn);
         }
         use ConnectionManagerEvent::PeerConnected;
@@ -625,7 +632,7 @@ impl fmt::Display for TestNode {
 pub fn make_node_identity(features: PeerFeatures) -> Arc<NodeIdentity> {
     let port = MemoryTransport::acquire_next_memsocket_port();
     Arc::new(NodeIdentity::random(
-        &mut OsRng,
+        &mut rand::rng(),
         format!("/memory/{port}").parse().unwrap(),
         features,
     ))
@@ -723,7 +730,7 @@ async fn setup_comms_dht(
     }
 
     let db_name = iter::repeat(())
-        .map(|_| OsRng.sample(distributions::Alphanumeric) as char)
+        .map(|_| rand::rng().sample(distr::Alphanumeric) as char)
         .take(8)
         .collect::<String>();
 

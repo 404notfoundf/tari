@@ -381,7 +381,6 @@ mod test {
     use blake2::Blake2b;
     use borsh::{BorshDeserialize, BorshSerialize};
     use digest::{Digest, consts::U32};
-    use rand::rngs::OsRng;
     use tari_crypto::{
         compressed_commitment::CompressedCommitment,
         compressed_key::CompressedKey,
@@ -405,10 +404,10 @@ mod test {
     #[test]
     fn as_bytes_roundtrip() {
         use crate::StackItem::{Number, PublicKey, Signature};
-        let k = RistrettoSecretKey::random(&mut rand::thread_rng());
+        let k = RistrettoSecretKey::random(&mut rand::rng());
         let p = CompressedKey::<RistrettoPublicKey>::from_secret_key(&k);
         let s = CompressedCheckSigSchnorrSignature::new_from_schnorr(
-            CheckSigSchnorrSignature::sign(&k, b"hi", &mut OsRng).unwrap(),
+            CheckSigSchnorrSignature::sign(&k, b"hi", &mut rand::rng()).unwrap(),
         );
         let items = vec![Number(5432), Number(21), Signature(s), PublicKey(p)];
         let stack = ExecutionStack::new(items);
@@ -429,8 +428,10 @@ mod test {
             CheckSigSchnorrSignature::sign_with_nonce_and_message(&k, r, m).unwrap(),
         );
         let inputs = inputs!(sig, p, m as HashValue);
-        assert_eq!(inputs.to_hex(),
-        "0500f7c695528c858cde76dab3076908e01228b6dbdd5f671bed1b03b89e170c31c6134be1c65544fa3f26c59903165f664db0dc364cbbaa4b35a9b33342cc01000456c0fa32558d6edc0916baa26b48e745de834571534ca253ea82435f08ebbc7c060101010101010101010101010101010101010101010101010101010101010101");
+        assert_eq!(
+            inputs.to_hex(),
+            "0500f7c695528c858cde76dab3076908e01228b6dbdd5f671bed1b03b89e170c31c6134be1c65544fa3f26c59903165f664db0dc364cbbaa4b35a9b33342cc01000456c0fa32558d6edc0916baa26b48e745de834571534ca253ea82435f08ebbc7c060101010101010101010101010101010101010101010101010101010101010101"
+        );
     }
 
     #[test]

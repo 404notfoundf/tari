@@ -1462,6 +1462,25 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
             })
             .collect())
     }
+
+    fn fetch_outputs_with_legacy_key_ids(
+        &self,
+        last_id: i32,
+        batch_size: i64,
+    ) -> Result<Vec<(i32, String, String)>, OutputManagerStorageError> {
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        OutputSql::find_outputs_with_legacy_key_ids(last_id, batch_size, &mut conn)
+    }
+
+    fn update_output_key_ids(
+        &self,
+        output_id: i32,
+        spending_key: String,
+        script_private_key: String,
+    ) -> Result<(), OutputManagerStorageError> {
+        let mut conn = self.database_connection.get_pooled_connection()?;
+        OutputSql::update_key_ids(output_id, &spending_key, &script_private_key, &mut conn)
+    }
 }
 
 fn replace_tx_id(
@@ -1752,7 +1771,7 @@ mod test {
 
     use diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
-    use rand::{RngCore, rngs::OsRng};
+    use rand::Rng;
     use tari_script::script;
     use tari_test_utils::random;
     use tari_transaction_components::{
@@ -1817,7 +1836,7 @@ mod test {
 
         let key_manager = KeyManager::new_random().unwrap();
         for _i in 0..2 {
-            let (_, uo) = make_input(MicroMinotari::from(100 + OsRng.next_u64() % 1000), &key_manager);
+            let (_, uo) = make_input(MicroMinotari::from(100 + rand::rng().next_u64() % 1000), &key_manager);
             let uo = DbWalletOutput::from_wallet_output(uo, None, OutputSource::Standard, None, None);
             let o = NewOutputSql::new(uo, Some(OutputStatus::Unspent), None).unwrap();
             outputs.push(o.clone());
@@ -1826,7 +1845,7 @@ mod test {
         }
 
         for _i in 0..3 {
-            let (_, uo) = make_input(MicroMinotari::from(100 + OsRng.next_u64() % 1000), &key_manager);
+            let (_, uo) = make_input(MicroMinotari::from(100 + rand::rng().next_u64() % 1000), &key_manager);
             let uo = DbWalletOutput::from_wallet_output(uo, None, OutputSource::Standard, None, None);
             let o = NewOutputSql::new(uo, Some(OutputStatus::Spent), None).unwrap();
             outputs.push(o.clone());

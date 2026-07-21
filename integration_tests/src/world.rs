@@ -30,7 +30,6 @@ use std::{
 use cucumber::gherkin::{Feature, Scenario};
 use indexmap::IndexMap;
 use minotari_app_grpc::tari_rpc::GetBalanceResponse;
-use rand::rngs::OsRng;
 use serde_json::Value;
 use tari_common::configuration::Network;
 use tari_common_types::{
@@ -99,6 +98,10 @@ pub struct TariWorld {
     pub last_imported_tx_ids: Vec<u64>,
     // We need to store this for the merge mining proxy steps. The checks are get and check are done on separate steps.
     pub last_merge_miner_response: Value,
+    // Used for offline signing integration test — stores prepared and signed transaction JSON between steps.
+    pub offline_signing_prepared: Option<String>,
+    pub offline_signing_signed: Option<String>,
+    pub offline_signer_keystores: IndexMap<String, PathBuf>,
     pub key_manager: KeyManager,
     // This will be used for all one-sided coinbase payments
     pub wallet_private_key: PrivateKey,
@@ -131,6 +134,9 @@ impl Debug for TariWorld {
             .field("errors", &self.errors)
             .field("last_imported_tx_ids", &self.last_imported_tx_ids)
             .field("last_merge_miner_response", &self.last_merge_miner_response)
+            .field("offline_signing_prepared", &self.offline_signing_prepared)
+            .field("offline_signing_signed", &self.offline_signing_signed)
+            .field("offline_signer_keystores", &self.offline_signer_keystores)
             .finish()
     }
 }
@@ -142,7 +148,7 @@ pub enum NodeClient {
 
 impl TariWorld {
     pub async fn new() -> Self {
-        let wallet_private_key = PrivateKey::random(&mut OsRng);
+        let wallet_private_key = PrivateKey::random(&mut rand::rng());
         let default_payment_address = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&wallet_private_key),
             CompressedPublicKey::from_secret_key(&wallet_private_key),
@@ -172,6 +178,9 @@ impl TariWorld {
             errors: Default::default(),
             last_imported_tx_ids: vec![],
             last_merge_miner_response: Default::default(),
+            offline_signing_prepared: None,
+            offline_signing_signed: None,
+            offline_signer_keystores: Default::default(),
             key_manager: KeyManager::new_random().unwrap(),
             wallet_private_key,
             default_payment_address,

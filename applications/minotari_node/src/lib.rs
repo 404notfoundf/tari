@@ -52,7 +52,11 @@ pub use http::HttpCacheConfig;
 use log::*;
 use minotari_app_grpc::{
     authentication::ServerAuthenticationInterceptor,
-    tari_rpc::{self, readiness_status::State as ReadinessState},
+    tari_rpc::{
+        self,
+        base_node_server::SERVICE_NAME as BASE_NODE_GRPC_SERVICE_NAME,
+        readiness_status::State as ReadinessState,
+    },
     tls::identity::read_identity,
 };
 use minotari_app_utilities::common_cli_args::CommonCliArgs;
@@ -63,6 +67,7 @@ use tari_common::{
 };
 use tari_common_types::grpc_authentication::GrpcAuthentication;
 use tari_comms::{NodeIdentity, multiaddr::Multiaddr, utils::multiaddr::multiaddr_to_socketaddr};
+use tari_core::base_node::{StateMachineHandle, state_machine_service::states::StatusInfo};
 use tari_shutdown::{Shutdown, ShutdownSignal};
 use tokio::{
     task::{self, JoinHandle},
@@ -72,6 +77,7 @@ use tonic::{
     codegen::InterceptedService,
     transport::{Identity, Server, ServerTlsConfig},
 };
+use tonic_health::{ServingStatus, server::HealthReporter};
 
 pub use crate::config::{ApplicationConfig, BaseNodeConfig, DatabaseType};
 #[cfg(feature = "metrics")]
@@ -79,6 +85,7 @@ pub use crate::metrics::MetricsConfig;
 use crate::{cli::Cli, grpc::readiness_grpc_server::ReadinessGrpcServer};
 
 const LOG_TARGET: &str = "minotari::base_node::app";
+const GRPC_HEALTH_OVERALL_SERVICE_NAME: &str = "";
 
 pub async fn run_base_node(
     shutdown: Shutdown,
@@ -146,6 +153,7 @@ pub async fn run_base_node_with_cli(
             grpc_address.clone(),
             auth.clone(),
             tls_identity.clone(),
+            None,
             readiness_grpc_shutdown.to_signal(),
         )));
     } else {
@@ -178,7 +186,15 @@ pub async fn run_base_node_with_cli(
 
     readiness_grpc_shutdown.trigger();
     if let Some(task) = readiness_task {
-        match timeout(std::time::Duration::from_secs(1), task).await {
+        // The readiness gRPC server listens on the same address as the main gRPC server,
+        // so we MUST ensure its socket is fully released before binding the main server,
+        // otherwise the main bind will fail with EADDRINUSE.
+        const READINESS_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        // Keep an abort handle so that on timeout we can cancel the task and await its
+        // termination, which guarantees the listener is dropped before we continue. Simply
+        // dropping the JoinHandle does NOT cancel the task.
+        let abort_handle = task.abort_handle();
+        match timeout(READINESS_SHUTDOWN_TIMEOUT, task).await {
             Ok(Ok(Ok(()))) => {
                 info!(target: LOG_TARGET, "Readiness gRPC server shutdown successfully");
             },
@@ -188,8 +204,16 @@ pub async fn run_base_node_with_cli(
             Ok(Err(e)) => {
                 error!(target: LOG_TARGET, "Readiness gRPC server task failed: {e}");
             },
-            Err(_) => {
-                error!(target: LOG_TARGET, "Readiness gRPC server shutdown timed out after 1 second");
+            Err(_elapsed) => {
+                error!(
+                    target: LOG_TARGET,
+                    "Readiness gRPC server shutdown did not complete in {:?}; aborting it to release the listener",
+                    READINESS_SHUTDOWN_TIMEOUT
+                );
+                abort_handle.abort();
+                // Yield once so the abort is observed and the task's listener is dropped
+                // before we attempt to bind the main gRPC server on the same address.
+                tokio::task::yield_now().await;
             },
         }
     }
@@ -198,13 +222,43 @@ pub async fn run_base_node_with_cli(
     let grpc = grpc::base_node_grpc_server::BaseNodeGrpcServer::from_base_node_context(&ctx, config.base_node.clone());
 
     if config.base_node.grpc_enabled {
-        task::spawn(run_grpc(
+        // Spawn the main gRPC server and keep its handle so a bind failure (e.g. EADDRINUSE)
+        // is surfaced as a fatal startup error rather than silently disabling gRPC for the
+        // lifetime of the process.
+        let grpc_handle = task::spawn(run_grpc(
             grpc,
             grpc_address.clone(),
             auth.clone(),
             tls_identity,
+            Some(ctx.state_machine()),
             shutdown.to_signal(),
         ));
+
+        // Give the server a brief window to either bind successfully or fail. tonic does the
+        // bind inside the future, so a successful bind means the future is still pending after
+        // this short wait. A bind error returns essentially immediately.
+        match timeout(std::time::Duration::from_millis(500), grpc_handle).await {
+            Err(_still_running) => {
+                // Still running after the wait → bind succeeded.
+            },
+            Ok(Ok(Ok(()))) => {
+                // Server returned Ok before we even got here — only possible on immediate
+                // shutdown signal, which would be unusual at this stage but is not an error.
+                info!(target: LOG_TARGET, "GRPC server returned during startup window");
+            },
+            Ok(Ok(Err(e))) => {
+                return Err(ExitError::new(
+                    ExitCode::GrpcError,
+                    format!("Failed to start gRPC server on {grpc_address}: {e}"),
+                ));
+            },
+            Ok(Err(e)) => {
+                return Err(ExitError::new(
+                    ExitCode::GrpcError,
+                    format!("gRPC server task panicked during startup: {e}"),
+                ));
+            },
+        }
     }
 
     // Start the built-in XMRig proxy if enabled
@@ -300,6 +354,7 @@ async fn run_grpc<T: tari_rpc::base_node_server::BaseNode>(
     grpc_address: Multiaddr,
     auth_config: GrpcAuthentication,
     tls_identity: Option<Identity>,
+    health_state_machine: Option<StateMachineHandle>,
     interrupt_signal: ShutdownSignal,
 ) -> Result<(), anyhow::Error> {
     info!(target: LOG_TARGET, "Starting GRPC on {grpc_address}");
@@ -319,17 +374,72 @@ async fn run_grpc<T: tari_rpc::base_node_server::BaseNode>(
         Server::builder()
     };
 
-    server_builder
-        .add_service(service)
-        .serve_with_shutdown(grpc_address, interrupt_signal.map(|_| ()))
-        .await
-        .map_err(|err| {
-            error!(target: LOG_TARGET, "GRPC encountered an error: {err:?}");
-            err
-        })?;
+    if let Some(state_machine_handle) = health_state_machine {
+        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        let mut status_watch = state_machine_handle.get_status_info_watch();
+        let is_serving = is_grpc_health_serving(&status_watch.borrow_and_update());
+        update_grpc_health_status(&mut health_reporter, is_serving).await;
+        spawn_grpc_health_updater(health_reporter, status_watch, is_serving);
+
+        server_builder
+            .add_service(service)
+            .add_service(health_service)
+            .serve_with_shutdown(grpc_address, interrupt_signal.map(|_| ()))
+            .await
+    } else {
+        server_builder
+            .add_service(service)
+            .serve_with_shutdown(grpc_address, interrupt_signal.map(|_| ()))
+            .await
+    }
+    .map_err(|err| {
+        error!(target: LOG_TARGET, "GRPC encountered an error: {err:?}");
+        err
+    })?;
 
     info!(target: LOG_TARGET, "Stopping GRPC");
     Ok(())
+}
+
+fn spawn_grpc_health_updater(
+    mut health_reporter: HealthReporter,
+    mut status_watch: tokio::sync::watch::Receiver<StatusInfo>,
+    mut last_is_serving: bool,
+) {
+    task::spawn(async move {
+        loop {
+            if status_watch.changed().await.is_err() {
+                break;
+            }
+            let is_serving = is_grpc_health_serving(&status_watch.borrow());
+            if is_serving == last_is_serving {
+                continue;
+            }
+            update_grpc_health_status(&mut health_reporter, is_serving).await;
+            last_is_serving = is_serving;
+        }
+    });
+}
+
+async fn update_grpc_health_status(health_reporter: &mut HealthReporter, is_serving: bool) {
+    health_reporter
+        .set_service_status(GRPC_HEALTH_OVERALL_SERVICE_NAME, grpc_serving_status(is_serving))
+        .await;
+    health_reporter
+        .set_service_status(BASE_NODE_GRPC_SERVICE_NAME, grpc_serving_status(is_serving))
+        .await;
+}
+
+fn grpc_serving_status(is_serving: bool) -> ServingStatus {
+    if is_serving {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    }
+}
+
+fn is_grpc_health_serving(status: &StatusInfo) -> bool {
+    status.bootstrapped && status.state_info.is_synced()
 }
 
 /// Prepares the parameters required to call the `run_grpc` function
@@ -352,4 +462,101 @@ async fn prepare_grpc_params(
     }
 
     Ok((grpc_address, auth, tls_identity))
+}
+
+#[cfg(test)]
+mod tests {
+    use minotari_app_grpc::tari_rpc::base_node_server::SERVICE_NAME as BASE_NODE_GRPC_SERVICE_NAME;
+    use tari_core::base_node::state_machine_service::states::{
+        StateInfo,
+        StatusInfo,
+        events_and_states::ListeningInfo,
+    };
+    use tonic::{Code, Request};
+    use tonic_health::{
+        ServingStatus,
+        pb::{HealthCheckRequest, health_check_response, health_server::Health},
+        server::HealthService,
+    };
+
+    use super::{grpc_serving_status, is_grpc_health_serving};
+
+    fn status_info(bootstrapped: bool, state_info: StateInfo) -> StatusInfo {
+        StatusInfo {
+            bootstrapped,
+            state_info,
+            ..StatusInfo::default()
+        }
+    }
+
+    fn expected_wire_status(status: ServingStatus) -> i32 {
+        health_check_response::ServingStatus::from(status) as i32
+    }
+
+    async fn assert_health_status(service: &HealthService, service_name: &str, expected: ServingStatus) {
+        let response = service
+            .check(Request::new(HealthCheckRequest {
+                service: service_name.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.status, expected_wire_status(expected));
+    }
+
+    async fn assert_health_service_not_registered(service: &HealthService, service_name: &str) {
+        let err = service
+            .check(Request::new(HealthCheckRequest {
+                service: service_name.to_string(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[test]
+    fn grpc_serving_status_maps_boolean_to_tonic_status() {
+        assert_eq!(grpc_serving_status(true), ServingStatus::Serving);
+        assert_eq!(grpc_serving_status(false), ServingStatus::NotServing);
+    }
+
+    #[test]
+    fn grpc_health_is_serving_only_when_bootstrapped_and_synced() {
+        let synced_listening = StateInfo::Listening(ListeningInfo::new(true, 0, 0, false));
+        let unsynced_listening = StateInfo::Listening(ListeningInfo::new(false, 0, 1, false));
+
+        assert!(is_grpc_health_serving(&status_info(true, synced_listening.clone())));
+        assert!(!is_grpc_health_serving(&status_info(false, synced_listening)));
+        assert!(!is_grpc_health_serving(&status_info(true, unsynced_listening)));
+        assert!(!is_grpc_health_serving(&status_info(true, StateInfo::StartUp)));
+    }
+
+    #[tokio::test]
+    async fn update_grpc_health_status_updates_overall_and_base_node_services() {
+        let (mut health_reporter, _health_server) = tonic_health::server::health_reporter();
+        let health_service = HealthService::from_health_reporter(health_reporter.clone());
+
+        super::update_grpc_health_status(&mut health_reporter, false).await;
+
+        assert_health_status(
+            &health_service,
+            super::GRPC_HEALTH_OVERALL_SERVICE_NAME,
+            ServingStatus::NotServing,
+        )
+        .await;
+        assert_health_status(&health_service, BASE_NODE_GRPC_SERVICE_NAME, ServingStatus::NotServing).await;
+        assert_health_service_not_registered(&health_service, "unknown.service").await;
+
+        super::update_grpc_health_status(&mut health_reporter, true).await;
+
+        assert_health_status(
+            &health_service,
+            super::GRPC_HEALTH_OVERALL_SERVICE_NAME,
+            ServingStatus::Serving,
+        )
+        .await;
+        assert_health_status(&health_service, BASE_NODE_GRPC_SERVICE_NAME, ServingStatus::Serving).await;
+    }
 }

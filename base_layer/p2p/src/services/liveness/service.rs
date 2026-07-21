@@ -31,6 +31,7 @@ use log::*;
 use tari_comms::{
     Minimized,
     PeerManager,
+    RefKind,
     connectivity::{ConnectivityRequester, ConnectivitySelection},
     peer_manager::NodeId,
     types::CommsPublicKey,
@@ -412,7 +413,8 @@ where
             .filter(|(_, n)| **n > max_allowed_ping_failures)
             .map(|(node_id, _)| node_id)
         {
-            if let Ok(Some(mut conn)) = self.connectivity.get_connection(node_id.clone()).await {
+            // Liveness service is happy to be reaped — Weak handle.
+            if let Ok(Some(mut conn)) = self.connectivity.get_connection(node_id.clone(), RefKind::Weak).await {
                 debug!(
                     target: LOG_TARGET,
                     "Disconnecting peer {node_id} that failed {max_allowed_ping_failures} rounds of pings"
@@ -456,7 +458,6 @@ mod test {
     use std::time::Duration;
 
     use futures::stream;
-    use rand::rngs::OsRng;
     use tari_common_sqlite::connection::DbConnection;
     use tari_comms::{
         message::MessageTag,
@@ -567,7 +568,7 @@ mod test {
         // Run the LivenessService
         task::spawn(service.run());
 
-        let (_, pk) = CommsPublicKey::random_keypair(&mut rand::rngs::OsRng);
+        let (_, pk) = CommsPublicKey::random_keypair(&mut rand::rng());
         let node_id = NodeId::from_key(&pk);
         // Receive outbound request
         task::spawn(async move {
@@ -589,7 +590,7 @@ mod test {
     }
 
     fn create_dummy_message<T>(inner: T) -> DomainMessage<Result<T, prost::DecodeError>> {
-        let (_, pk) = CommsPublicKey::random_keypair(&mut OsRng);
+        let (_, pk) = CommsPublicKey::random_keypair(&mut rand::rng());
         let source_peer = Peer::new(
             pk.clone(),
             NodeId::from_key(&pk),

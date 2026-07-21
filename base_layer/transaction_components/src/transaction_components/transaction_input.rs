@@ -31,7 +31,6 @@ use std::{
 use blake2::Blake2b;
 use borsh::{BorshDeserialize, BorshSerialize};
 use digest::consts::{U32, U64};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::{
     ComAndPubSignature,
@@ -381,7 +380,7 @@ impl TransactionInput {
                     &script_public_key.to_public_key()?,
                     &challenge,
                     factory,
-                    &mut OsRng,
+                    &mut rand::rng(),
                 ) {
                     Ok(())
                 } else {
@@ -590,6 +589,17 @@ impl SpentOutput {
         match self {
             SpentOutput::OutputHash(_) => 0,
             SpentOutput::OutputData { .. } => 1,
+        }
+    }
+
+    pub fn matches_output(&self, output: &TransactionOutput) -> bool {
+        match self {
+            SpentOutput::OutputHash(h) => *h == output.hash(),
+            SpentOutput::OutputData {
+                commitment,
+                metadata_signature,
+                ..
+            } => (commitment == &output.commitment) & (metadata_signature == &output.metadata_signature),
         }
     }
 

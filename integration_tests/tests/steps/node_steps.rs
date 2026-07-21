@@ -592,10 +592,10 @@ async fn node_lists_heights(world: &mut TariWorld, node: String, start: u64, end
         if height != block_height {
             panic!(
                 "Invalid block height for node {}: expected height {} != current height {}",
-                &node, block_height, height
+                node, block_height, height
             );
         }
-        println!("Valid block height {}, listed by node {}", height, &node);
+        println!("Valid block height {}, listed by node {}", height, node);
         height += 1;
     }
 }
@@ -618,10 +618,10 @@ async fn node_lists_headers_with_correct_heights(world: &mut TariWorld, node: St
         if header_height != height {
             panic!(
                 "incorrect listing of height headers by node {}: expected height to be {} but got height {}",
-                &node, height, header_height
+                node, height, header_height
             );
         }
-        println!("correct listing of height header {} by node {}", height, &node);
+        println!("correct listing of height header {} by node {}", height, node);
         height += 1;
     }
 }
@@ -639,7 +639,6 @@ async fn connect_node_to_other_node(world: &mut TariWorld, node_a: String, node_
     let is_seed_node = node_a_ps.is_seed_node;
     node_a_peers.push(node_b);
     node_a_ps.kill();
-    tokio::time::sleep(Duration::from_secs(15)).await;
     spawn_base_node(world, is_seed_node, node_a, node_a_peers).await;
 }
 

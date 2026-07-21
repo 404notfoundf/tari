@@ -2,6 +2,198 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [5.5.0-pre.1](https://github.com/tari-project/tari/compare/v5.5.0-pre.0...v5.5.0-pre.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* linux builds ([#7925](https://github.com/tari-project/tari/issues/7925)) ([d5979b5](https://github.com/tari-project/tari/commit/d5979b57a9fa0c30919f5547ac1133adf97079f7))
+
+## [5.5.0-pre.0](https://github.com/tari-project/tari/compare/v5.4.0-rc.0...v5.5.0-pre.0) (2026-07-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* enforce unique burn commtiments (#7910)
+
+### Features
+
+*  better logs ([#7924](https://github.com/tari-project/tari/issues/7924)) ([2c394a9](https://github.com/tari-project/tari/commit/2c394a9ded48067cd4383e345a877a7cfb272b97))
+*  better resize management ([#7906](https://github.com/tari-project/tari/issues/7906)) ([45425cb](https://github.com/tari-project/tari/commit/45425cb325afeba28bfecb44e945d3c68f6b9d39))
+* add mined_in_epoch to burn claim proof file ([#7919](https://github.com/tari-project/tari/issues/7919)) ([dd1cf1d](https://github.com/tari-project/tari/commit/dd1cf1d018a3876e949bf9c3b423ac3bdffd694d))
+* enforce unique burn commtiments ([#7910](https://github.com/tari-project/tari/issues/7910)) ([8c10d94](https://github.com/tari-project/tari/commit/8c10d94184a2b8376c99a7c6c85dc1959b86ee8a))
+* improve node pool management ([#7921](https://github.com/tari-project/tari/issues/7921)) ([9542ed2](https://github.com/tari-project/tari/commit/9542ed274e31dd759cdd65b084403e3cef6b7423))
+* improve peer sync ([#7903](https://github.com/tari-project/tari/issues/7903)) ([1dbd6e0](https://github.com/tari-project/tari/commit/1dbd6e06e1ba3ad127daf5ad0e716901a4cf9208))
+* improve template calls ([#7900](https://github.com/tari-project/tari/issues/7900)) ([a1845cc](https://github.com/tari-project/tari/commit/a1845ccb524a58a8399aa9534d152daa624c203d))
+* **installer:** add unified Minotari Ledger installer ([#7864](https://github.com/tari-project/tari/issues/7864)) ([bad5a5f](https://github.com/tari-project/tari/commit/bad5a5fb3f077cf03d81d51362916b7bb4b46c2f)), closes [#7795](https://github.com/tari-project/tari/issues/7795)
+* make taripulse optional ([#7897](https://github.com/tari-project/tari/issues/7897)) ([4223d34](https://github.com/tari-project/tari/commit/4223d34c2221a8c804fe971297696ac1c25935ac))
+* use uv and not python directly ([#7922](https://github.com/tari-project/tari/issues/7922)) ([1c714ec](https://github.com/tari-project/tari/commit/1c714ecc5b374b70cec64e3576ac172e1168189a))
+
+
+### Bug Fixes
+
+* coinbase status ([#7911](https://github.com/tari-project/tari/issues/7911)) ([1739585](https://github.com/tari-project/tari/commit/173958528be1722e06d71ab936ca54da0c858dd4))
+* **deps:** update crossbeam-epoch advisory ([#7918](https://github.com/tari-project/tari/issues/7918)) ([1c7c5ac](https://github.com/tari-project/tari/commit/1c7c5acba21112b735ed69f290cca75dc5433cb9))
+* harden utxo scanner ([#7898](https://github.com/tari-project/tari/issues/7898)) ([4062b24](https://github.com/tari-project/tari/commit/4062b241fc24dabdb46965b79fe22a99d01dd285))
+* prune  deleted_txo_hash_to_header_index ([#7894](https://github.com/tari-project/tari/issues/7894)) ([8871066](https://github.com/tari-project/tari/commit/88710661114317c71079ab56adacc676fef31cd6))
+* reduce listening state log spam ([#7905](https://github.com/tari-project/tari/issues/7905)) ([7c1104f](https://github.com/tari-project/tari/commit/7c1104f2e215a40faa6ed7b343859f4a3cf3ea46))
+
+## [5.4.0-pre.8](https://github.com/tari-project/tari/compare/v5.4.0-pre.7...v5.4.0-pre.8) (2026-06-29)
+
+
+### Features
+
+* harden prune mode ([#7902](https://github.com/tari-project/tari/issues/7902)) ([152e281](https://github.com/tari-project/tari/commit/152e2811e7d2b8df10aaa13afa9b00ad08d75c83))
+
+## [5.4.0-pre.7](https://github.com/tari-project/tari/compare/v5.4.0-pre.6...v5.4.0-pre.7) (2026-06-24)
+
+
+### Bug Fixes
+
+* update wallet utxo selection ([#7895](https://github.com/tari-project/tari/issues/7895)) ([6c2937c](https://github.com/tari-project/tari/commit/6c2937cb78365a20a5243fcd469bfd7d7b351caf))
+
+## [5.4.0-pre.6](https://github.com/tari-project/tari/compare/v5.4.0-pre.5...v5.4.0-pre.6) (2026-06-22)
+
+
+### Features
+
+* change wallet output selection ([#7889](https://github.com/tari-project/tari/issues/7889)) ([401093a](https://github.com/tari-project/tari/commit/401093ac031b0ad7d7bab8d350a7f6631f50b050))
+* harden block add ([#7888](https://github.com/tari-project/tari/issues/7888)) ([9125a95](https://github.com/tari-project/tari/commit/9125a9500dc4ae3a1b512fc575a658db894d40f5))
+
+
+### Bug Fixes
+
+* diff check ([#7890](https://github.com/tari-project/tari/issues/7890)) ([0741da5](https://github.com/tari-project/tari/commit/0741da50efbbd830f2e724ec246ff720f8b064c8))
+
+## [5.4.0-pre.5](https://github.com/tari-project/tari/compare/v5.4.0-pre.4...v5.4.0-pre.5) (2026-06-15)
+
+
+### Features
+
+* bundle install scripts ([#7879](https://github.com/tari-project/tari/issues/7879)) ([fe12274](https://github.com/tari-project/tari/commit/fe1227415e7a8c40ba71b30ee8fd69ea09bd2d46))
+* update reorg logic ([#7881](https://github.com/tari-project/tari/issues/7881)) ([9d41c68](https://github.com/tari-project/tari/commit/9d41c68c988bf6d481249f7c061b3893a4b0c538))
+
+## [5.4.0-pre.4](https://github.com/tari-project/tari/compare/v5.4.0-pre.3...v5.4.0-pre.4) (2026-06-12)
+
+
+### Features
+
+* add ledger scripts to assets ([#7878](https://github.com/tari-project/tari/issues/7878)) ([5822b36](https://github.com/tari-project/tari/commit/5822b36c81deb10fb540be1d54e34b901e4b0701))
+* make lmdb compaction disk space non fatal ([#7874](https://github.com/tari-project/tari/issues/7874)) ([1b13660](https://github.com/tari-project/tari/commit/1b1366088a4d8dec6376269e5bb4c7d190b74923))
+
+
+### Bug Fixes
+
+* ledger ([#7877](https://github.com/tari-project/tari/issues/7877)) ([0fd9331](https://github.com/tari-project/tari/commit/0fd933111c831711f9117db85d4d376ba77b207f))
+
+## [5.4.0-pre.3](https://github.com/tari-project/tari/compare/v5.4.0-pre.2...v5.4.0-pre.3) (2026-06-08)
+
+
+### Features
+
+* add synced gRPC healthcheck ([#7867](https://github.com/tari-project/tari/issues/7867)) ([561f415](https://github.com/tari-project/tari/commit/561f41531bd04c52413b9394154a503f20282881)), closes [/#diff-16fa446fb226d326cfbacc0938b31c552672cb25fb555d2e48b93b5c8ea2f3f6R346](https://github.com/tari-project///issues/diff-16fa446fb226d326cfbacc0938b31c552672cb25fb555d2e48b93b5c8ea2f3f6R346) [/#diff-16fa446fb226d326cfbacc0938b31c552672cb25fb555d2e48b93b5c8ea2f3f6R366-R383](https://github.com/tari-project///issues/diff-16fa446fb226d326cfbacc0938b31c552672cb25fb555d2e48b93b5c8ea2f3f6R366-R383)
+* change connection handling ([#7865](https://github.com/tari-project/tari/issues/7865)) ([8b3e358](https://github.com/tari-project/tari/commit/8b3e3582c00337dc034a2f199b0b3f57f1b4dbd1))
+* improve migration flow of jmt upgrade ([#7862](https://github.com/tari-project/tari/issues/7862)) ([0c12351](https://github.com/tari-project/tari/commit/0c123516654a0feb63901d7ef3e149d94cbb88df))
+
+
+### Bug Fixes
+
+* **base_node:** reject duplicate validator node registrations within a block ([#7870](https://github.com/tari-project/tari/issues/7870)) ([d584707](https://github.com/tari-project/tari/commit/d584707bf6aa98e495d7e5f9e4e1c93bf15cebbc))
+* potential cache issues ([#7623](https://github.com/tari-project/tari/issues/7623)) ([7cab6cb](https://github.com/tari-project/tari/commit/7cab6cb9c18ab164147275dac1cde31513fa42e0))
+* remove unnecessary clone from [#7868](https://github.com/tari-project/tari/issues/7868) ([#7869](https://github.com/tari-project/tari/issues/7869)) ([e2cf3b5](https://github.com/tari-project/tari/commit/e2cf3b50ace10954f9c031870f1b19d110119a97))
+* **wallet:** bind target sidechain into burn claim ownership proof ([#7868](https://github.com/tari-project/tari/issues/7868)) ([00ab044](https://github.com/tari-project/tari/commit/00ab044565ee994782a53947f9c7ea4008437afc)), closes [tari-project/tari-ootle#445](https://github.com/tari-project/tari-ootle/issues/445) [tari-project/tari-ootle#445](https://github.com/tari-project/tari-ootle/issues/445)
+
+## [5.4.0-pre.2](https://github.com/tari-project/tari/compare/v5.4.0-pre.1...v5.4.0-pre.2) (2026-05-29)
+
+
+### Features
+
+* add peer transport preference modes ([#7851](https://github.com/tari-project/tari/issues/7851)) ([0c3c87d](https://github.com/tari-project/tari/commit/0c3c87df4ce14938be56fc3cbd056298484a5600)), closes [#7830](https://github.com/tari-project/tari/issues/7830)
+* **wallet:** migrate legacy output key-ids to current format on startup (closes [#7829](https://github.com/tari-project/tari/issues/7829)) ([#7859](https://github.com/tari-project/tari/issues/7859)) ([9e9c832](https://github.com/tari-project/tari/commit/9e9c8323f0d4bddb2631ff789b4e4c00004ae6fb))
+* **wallet:** stealth-address claim key for L1->L2 burns ([#7861](https://github.com/tari-project/tari/issues/7861)) ([d17fac8](https://github.com/tari-project/tari/commit/d17fac8e588c98820dff1250c4e00752545a6aed)), closes [tari-project/tari-ootle#1890](https://github.com/tari-project/tari-ootle/issues/1890)
+
+
+### Bug Fixes
+
+* **common:** make StaticApplicationInfo work for crates.io consumers ([#7860](https://github.com/tari-project/tari/issues/7860)) ([3241ca9](https://github.com/tari-project/tari/commit/3241ca916bf0b6529ca72ca27e5eb748aa1b29af))
+
+## [5.4.0-pre.1](https://github.com/tari-project/tari/compare/v5.4.0-pre.0...v5.4.0-pre.1) (2026-05-27)
+
+### Features
+
+* **sidechain:** carry next-epoch hash in EndEpoch command ([#7856](https://github.com/tari-project/tari/issues/7856)) ([941dd85](https://github.com/tari-project/tari/commit/941dd8592993629bbb1d2cc9f0dca51689a4bfef))
+
+### Bug Fixes
+
+* improve pool management ([#7857](https://github.com/tari-project/tari/issues/7857)) ([53f34f2](https://github.com/tari-project/tari/commit/53f34f25fb68f8fb42a63dc64eeb43f52d27dc1f))
+
+## [5.4.0-pre.0](https://github.com/tari-project/tari/compare/v5.3.1-pre.3...v5.4.0-pre.0) (2026-05-25)
+
+
+### Features
+
+* better wallet feedback ([#7845](https://github.com/tari-project/tari/issues/7845)) ([88b893b](https://github.com/tari-project/tari/commit/88b893b437cdef7658b18d3b69e4af4a40b5bbee))
+* **xmrig-proxy:** add getinfo and getheight methods to the node's integrated xmrig_proxy ([#7827](https://github.com/tari-project/tari/issues/7827)) ([7ae1410](https://github.com/tari-project/tari/commit/7ae14100bcc3844f14d1e6a5b10cd221f0bed1ad))
+
+
+### Bug Fixes
+
+* builds ([#7841](https://github.com/tari-project/tari/issues/7841)) ([ca68990](https://github.com/tari-project/tari/commit/ca689909ebd8cdb32e7a0c44944bc9a6875f5ccf))
+* increase buffer ([#7844](https://github.com/tari-project/tari/issues/7844)) ([cbce477](https://github.com/tari-project/tari/commit/cbce477b37155b7352eed9a1d063108bc97e9ca4))
+* jmt data usage ([#7824](https://github.com/tari-project/tari/issues/7824)) ([2ffe7da](https://github.com/tari-project/tari/commit/2ffe7dadcb319037482edf2daa77d6c3098fcd28))
+
+### [5.3.1-pre.3](https://github.com/tari-project/tari/compare/v5.3.1-pre.2...v5.3.1-pre.3) (2026-05-15)
+
+
+### Features
+
+* improve block add ([#7825](https://github.com/tari-project/tari/issues/7825)) ([578d932](https://github.com/tari-project/tari/commit/578d93222181d31562a2da39cece60c6309cb300))
+
+
+### Bug Fixes
+
+* cargo build crash on git not found ([#7836](https://github.com/tari-project/tari/issues/7836)) ([3359c35](https://github.com/tari-project/tari/commit/3359c35b932e385e66e796a3d667d1494864ab93))
+* consume merge mining proxy monero reservation ([#7822](https://github.com/tari-project/tari/issues/7822)) ([afe7e20](https://github.com/tari-project/tari/commit/afe7e208d6f9e58d13fb72404636ddb50cd5b624)), closes [#7045](https://github.com/tari-project/tari/issues/7045)
+* ledger builds ([#7834](https://github.com/tari-project/tari/issues/7834)) ([ef6ddb0](https://github.com/tari-project/tari/commit/ef6ddb0985bc2554ef109cfb67a7c66139fb487c))
+* mempool block on broadcast ([#7835](https://github.com/tari-project/tari/issues/7835)) ([dd5236f](https://github.com/tari-project/tari/commit/dd5236ff65e1e74c92d73164d697017fe7178b0a))
+* propagate mempool rejection details to wallet via HTTP API ([#7811](https://github.com/tari-project/tari/issues/7811)) ([7737abb](https://github.com/tari-project/tari/commit/7737abb23b9bf9e88f83fbbb19b1ac918b849032)), closes [#7776](https://github.com/tari-project/tari/issues/7776)
+* **security:** add payload integrity signature to harden offline signing (fixes [#7796](https://github.com/tari-project/tari/issues/7796)) ([#7804](https://github.com/tari-project/tari/issues/7804)) ([2c6f3fd](https://github.com/tari-project/tari/commit/2c6f3fd0eaa4aaf77f20b488eb9c4897c926cf14))
+
+### [5.3.1-pre.2](https://github.com/tari-project/tari/compare/v5.3.1-pre.1...v5.3.1-pre.2) (2026-05-07)
+
+
+### Features
+
+* add LMDB unit tests for BlockchainBackend read methods ([#7741](https://github.com/tari-project/tari/issues/7741)) ([b7cf7f1](https://github.com/tari-project/tari/commit/b7cf7f1121d85eef672d4a3a82edbd64dcd7cf32)), closes [#7715](https://github.com/tari-project/tari/issues/7715)
+
+
+### Bug Fixes
+
+* prevent EADDRINUSE race on gRPC handoff from readiness server ([#7815](https://github.com/tari-project/tari/issues/7815)) ([61b364e](https://github.com/tari-project/tari/commit/61b364eaaa17e64ff9dd293f757cd2b76015edc4))
+
+### [5.3.1-pre.1](https://github.com/tari-project/tari/compare/v5.3.1-pre.0...v5.3.1-pre.1) (2026-05-05)
+
+
+### Bug Fixes
+
+* check sidechain validation rules ([#7801](https://github.com/tari-project/tari/issues/7801)) ([1c23b6f](https://github.com/tari-project/tari/commit/1c23b6f0b206d1fc046e34cdd7fc5a6497f0a9ac))
+* clean up network start logs ([#7809](https://github.com/tari-project/tari/issues/7809)) ([9b2fa62](https://github.com/tari-project/tari/commit/9b2fa629acc5a19040e2217f5a608b65f9776c14))
+* validate tx to look at lock status ([#7808](https://github.com/tari-project/tari/issues/7808)) ([c32026d](https://github.com/tari-project/tari/commit/c32026d739114e3b04034e02a05a730c011c8d8f))
+
+### [5.3.1-pre.0](https://github.com/tari-project/tari/compare/v5.3.0-pre.12...v5.3.1-pre.0) (2026-04-29)
+
+
+### Features
+
+* add offline one-sided transaction signing cucumber test ([#7743](https://github.com/tari-project/tari/issues/7743)) ([66581fe](https://github.com/tari-project/tari/commit/66581fed8042deb541748d47019fac7608b107b5)), closes [#7736](https://github.com/tari-project/tari/issues/7736)
+
+
+### Bug Fixes
+
+* **deps:** update rustls-webpki for RUSTSEC-2026-0104 ([#7791](https://github.com/tari-project/tari/issues/7791)) ([e2d1e4c](https://github.com/tari-project/tari/commit/e2d1e4c7c68fe8583b2cf799341ef2d9c95d582d))
+* **deps:** upgrade diesel to 2.3.8 for RUSTSEC-2026-0111 ([#7790](https://github.com/tari-project/tari/issues/7790)) ([725ddf2](https://github.com/tari-project/tari/commit/725ddf2cd80236d4de1c3aa17515a6f5ccd119d3))
+* **deps:** upgrade rand to 0.10
+
 ## [5.3.0-pre.12](https://github.com/tari-project/tari/compare/v5.3.0-pre.11...v5.3.0-pre.12) (2026-04-23)
 
 ### Features

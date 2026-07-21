@@ -31,12 +31,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-
-mod cli;
-mod error;
-mod keystore;
-
-use cli::Cli;
+use minotari_offline_signer::cli::Cli;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

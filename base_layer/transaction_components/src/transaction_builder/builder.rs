@@ -123,6 +123,13 @@ where KM: TransactionKeyManagerInterface
         self.fee_per_gram
     }
 
+    /// Returns a reference to the key manager embedded in this builder.
+    /// Used by the offline signing prepare functions to sign the payload
+    /// for integrity verification.
+    pub fn key_manager(&self) -> &KM {
+        &self.key_manager
+    }
+
     pub fn with_lock_height(&mut self, lock_height: u64) -> &mut Self {
         self.lock_height = lock_height;
         self
@@ -1057,7 +1064,6 @@ mod test {
         let wallet = WalletType::ViewWallet(view_wallet);
         KeyManager::new(wallet)
     }
-    use chacha20poly1305::aead::OsRng;
     use tari_crypto::keys::SecretKey;
     use tari_script::{TariScript, script};
 
@@ -1430,8 +1436,8 @@ mod test {
             .with_input(input3)
             .unwrap();
         let bob_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();

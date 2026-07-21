@@ -26,7 +26,7 @@ use futures::{StreamExt, pin_mut};
 use log::*;
 use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use minotari_node_wallet_client::BaseNodeWalletClient;
-use rand::{RngCore, rngs::OsRng};
+use rand::{Rng, RngExt};
 use tari_common::configuration::Network;
 use tari_common_types::{
     tari_address::{TariAddress, TariAddressFeatures},
@@ -85,7 +85,11 @@ use tari_transaction_components::{
         branch_bound_builder::BranchAndBoundUtxoSelectionBuilder,
     },
 };
-use tari_transaction_key_manager::legacy_key_manager::{LegacyTransactionKeyManagerInterface, wallet_types::FeeType};
+use tari_transaction_key_manager::legacy_key_manager::{
+    LegacyTariKeyId,
+    LegacyTransactionKeyManagerInterface,
+    wallet_types::FeeType,
+};
 use tari_utilities::{ByteArray, hex::Hex};
 use tokio::{sync::Mutex, time::Instant};
 
@@ -218,6 +222,12 @@ where
         debug!(target: LOG_TARGET, "Output Manager Service started");
         // Outputs marked as shorttermencumbered are not yet stored as transactions in the TMS, so lets clear them
         self.resources.db.clear_short_term_encumberances()?;
+
+        // Spawn a background task that converts any legacy key-id strings still stored in the output table to the
+        // current format. This runs without blocking service startup - the main event loop below processes requests
+        // concurrently while the migration works through the table in batches.
+        tokio::spawn(migrate_legacy_output_keys(self.resources.clone()));
+
         loop {
             tokio::select! {
                 event = base_node_service_event_stream.recv() => {
@@ -648,7 +658,7 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn validate_outputs(&mut self) -> Result<u64, OutputManagerError> {
-        let id = OsRng.next_u64();
+        let id = rand::rng().next_u64();
         let txo_validation = TxoValidationTask::new(
             id,
             self.resources.db.clone(),
@@ -1884,6 +1894,14 @@ where
             total_output_features_and_scripts_byte_size,
         );
         let input_fee = fee_calc.calculate(fee_per_gram, 0, 1, 0, 0);
+
+        // If `force_change_output` is enabled we may need to add an extra UTXO after branch-and-bound to guarantee a
+        // change output. Snapshot the spendable outputs to choose from (branch-and-bound consumes `uo` below), but only
+        // for standard selections (we never pull in extra inputs for coin-control selections where the user
+        // deliberately picked the inputs).
+        let force_change_enabled = self.resources.config.force_change_output && selection_criteria.filter.is_standard();
+        let force_change_pool = if force_change_enabled { uo.clone() } else { Vec::new() };
+
         let bnb = BranchAndBoundUtxoSelectionBuilder::new(uo)
             .with_target_amount(amount + kernel_fee)
             .with_fee_per_input(input_fee)
@@ -1947,14 +1965,58 @@ where
         // branch and bound does not cound the kernel fee, so we need to include it here
         let final_fee = final_fee + kernel_fee;
 
-        let (fee_with_change, fee_without_change) = if has_change {
+        let (mut fee_with_change, mut fee_without_change) = if has_change {
             (final_fee, final_fee - default_output_fee)
         } else {
             (final_fee + default_output_fee, final_fee)
         };
+
+        let mut utxos = utxos;
+        let mut total_value = total_value;
+        let mut requires_change_output = has_change;
+
+        // `force_change_output`: branch-and-bound found a selection that needs no change (a perfect match or a
+        // selection where the surplus was too small to warrant change). Add one extra UTXO so the transaction produces
+        // a meaningful change output, then recompute the fee to account for the extra input and the change output.
+        if force_change_enabled && !has_change {
+            // Exclude the outputs branch-and-bound already selected (matched by commitment) so the forced extra input
+            // is never one of the inputs we are already spending.
+            let force_change_candidates: Vec<DbWalletOutput> = force_change_pool
+                .into_iter()
+                .filter(|c| !utxos.iter().any(|s| s.commitment == c.commitment))
+                .collect();
+            let marginal_cost = input_fee + default_output_fee;
+            let dust_ignore_value = MicroMinotari::from(self.resources.config.dust_ignore_value);
+            match select_forced_change_utxo(&force_change_candidates, marginal_cost, dust_ignore_value) {
+                Some(extra) => {
+                    total_value += extra.wallet_output.value();
+                    utxos.push(extra);
+                    requires_change_output = true;
+                    let num_inputs = utxos.len() as u64;
+                    // Fees are additive in the input/output weights, so recompute from the components (this drops the
+                    // dust waste that branch-and-bound folded into the no-change fee, since the surplus is now change).
+                    fee_with_change = output_fee + input_fee * num_inputs + default_output_fee + kernel_fee;
+                    fee_without_change = output_fee + input_fee * num_inputs + kernel_fee;
+                    debug!(
+                        target: LOG_TARGET,
+                        "select_utxos force_change_output: added an extra input, now {} inputs, total_value {}",
+                        utxos.len(),
+                        total_value,
+                    );
+                },
+                None => {
+                    debug!(
+                        target: LOG_TARGET,
+                        "select_utxos force_change_output enabled but no suitable extra UTXO is available to force a \
+                         change output; proceeding without change"
+                    );
+                },
+            }
+        }
+
         Ok(UtxoSelection {
             utxos,
-            requires_change_output: has_change,
+            requires_change_output,
             total_value,
             fee_without_change,
             fee_with_change,
@@ -3377,6 +3439,60 @@ impl UtxoSelection {
     }
 }
 
+/// Choose an extra UTXO to force a transaction to produce a meaningful change output (see
+/// [`OutputManagerServiceConfig::force_change_output`]).
+///
+/// `candidates` must already exclude the outputs being spent. `marginal_cost` is the additional fee of adding one input
+/// plus a change output; a candidate must exceed it for the resulting change to be positive. Candidates above
+/// `marginal_cost + dust_ignore_value` produce non-dust change and are preferred (one is chosen at random). If none
+/// qualify, the largest candidate that still covers `marginal_cost` is used. Returns `None` when no candidate can
+/// create change.
+fn select_forced_change_utxo(
+    candidates: &[DbWalletOutput],
+    marginal_cost: MicroMinotari,
+    dust_ignore_value: MicroMinotari,
+) -> Option<DbWalletOutput> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let values: Vec<MicroMinotari> = candidates.iter().map(|u| u.wallet_output.value()).collect();
+    let index = pick_forced_change_index(&values, marginal_cost, dust_ignore_value, |len| {
+        rand::rng().random_range(0..len)
+    })?;
+    candidates.get(index).cloned()
+}
+
+/// Pure selection logic for [`select_forced_change_utxo`], factored out so it can be unit tested without constructing
+/// wallet outputs. `random_pick` is given the number of preferred (non-dust) candidates and must return an index less
+/// than that number. Returns the index (into `values`) of the chosen candidate, or `None` if none can create change.
+fn pick_forced_change_index(
+    values: &[MicroMinotari],
+    marginal_cost: MicroMinotari,
+    dust_ignore_value: MicroMinotari,
+    random_pick: impl FnOnce(usize) -> usize,
+) -> Option<usize> {
+    let min_meaningful = marginal_cost + dust_ignore_value;
+    // Prefer candidates large enough to yield a non-dust change output, picked at random.
+    let meaningful: Vec<usize> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v >= min_meaningful)
+        .map(|(i, _)| i)
+        .collect();
+    if !meaningful.is_empty() {
+        let pick = random_pick(meaningful.len()).min(meaningful.len() - 1);
+        return meaningful.get(pick).copied();
+    }
+    // Otherwise fall back to the largest candidate that still covers the marginal cost (so change is at least
+    // positive).
+    values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > marginal_cost)
+        .max_by_key(|(_, v)| **v)
+        .map(|(i, _)| i)
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputInfoByTxId {
     pub statuses: Vec<OutputStatus>,
@@ -3398,5 +3514,207 @@ impl Display for OutputInfoByTxId {
             }
         )?;
         Ok(())
+    }
+}
+
+/// Number of output rows processed per iteration of the legacy-key migration.
+const LEGACY_KEY_MIGRATION_BATCH_SIZE: i64 = 100;
+
+/// Convert one stored key-id string from the legacy encoding to the current `TariKeyId` encoding.
+///
+/// Returns the converted string and whether a conversion actually happened. If the input already parses as a
+/// current `TariKeyId` the original string is returned unchanged. If both `TariKeyId::from_str` and
+/// `LegacyTariKeyId::from_str` reject the input, or the legacy-to-current conversion errors, the original string
+/// is returned unchanged and `converted = false` is reported so the caller can decide whether to write it back.
+fn convert_one_key_id<KM: LegacyTransactionKeyManagerInterface>(
+    raw: &str,
+    output_id: i32,
+    field_name: &str,
+    key_manager: &KM,
+) -> (String, bool) {
+    use std::str::FromStr;
+    if TariKeyId::from_str(raw).is_ok() {
+        // Already in current format - nothing to do.
+        return (raw.to_string(), false);
+    }
+    match LegacyTariKeyId::from_str(raw) {
+        Ok(legacy_id) => match key_manager.convert_legacy_tari_key_id_to_current(&legacy_id) {
+            Ok(current_id) => (current_id.to_string(), true),
+            Err(e) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "Legacy key migration: could not convert {field_name} for output id={output_id}: {e}"
+                );
+                (raw.to_string(), false)
+            },
+        },
+        Err(e) => {
+            warn!(
+                target: LOG_TARGET,
+                "Legacy key migration: unrecognised {field_name} format for output id={output_id}: {e}"
+            );
+            (raw.to_string(), false)
+        },
+    }
+}
+
+/// Sleep between batches to yield to the main service event loop and avoid `SQLITE_BUSY` contention against the
+/// shared connection pool. The migration is a one-time, non-time-critical task, so a short pause is appropriate.
+const LEGACY_KEY_MIGRATION_BATCH_PAUSE_MS: u64 = 50;
+
+/// Background task that converts any `spending_key` / `script_private_key` column values stored in the legacy
+/// `LegacyTariKeyId` encoding to the current `TariKeyId` encoding.
+///
+/// The LIKE filter in `OutputSql::find_outputs_with_legacy_key_ids` targets the substrings `"managed."` and
+/// `"imported."` - the only two legacy variants without a current `TariKeyId` equivalent. Using substring
+/// matching rather than prefix enumeration catches every nesting depth (`derived.managed.X`,
+/// `encrypted.<bytes>.imported.<pubkey>`, `derived.derived.managed.X`, etc.) in a single filter.
+///
+/// Iteration uses **keyset pagination** on `outputs.id` (`id > last_id`, `ORDER BY id ASC`). This guarantees
+/// the migration always makes forward progress through the table, even if some rows fail to convert and remain
+/// in the LIKE filter. Without keyset paging, a row stuck in the filter would be re-fetched on every iteration
+/// and the task would loop forever at 100% CPU.
+///
+/// Rows whose conversion fails are left in their original legacy form. They will still be converted lazily on
+/// read via the existing fallback path in `OutputSql::to_db_wallet_output`, so functionality is preserved.
+///
+/// Errors for individual rows are logged and skipped. Errors fetching a batch cause the migration to abort
+/// early with a warning.
+async fn migrate_legacy_output_keys<TBackend, TWalletConnectivity, TKeyManagerInterface>(
+    resources: OutputManagerResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
+) where
+    TBackend: OutputManagerBackend + 'static,
+    TWalletConnectivity: Send,
+    TKeyManagerInterface: LegacyTransactionKeyManagerInterface,
+{
+    let mut last_id: i32 = 0;
+    let mut total_migrated: usize = 0;
+    let mut total_unconvertable: usize = 0;
+
+    loop {
+        let batch = match resources
+            .db
+            .fetch_outputs_with_legacy_key_ids(last_id, LEGACY_KEY_MIGRATION_BATCH_SIZE)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "Legacy key migration: failed to fetch next batch - aborting migration early: {e}"
+                );
+                return;
+            },
+        };
+
+        if batch.is_empty() {
+            break;
+        }
+
+        for (output_id, spending_key_str, script_key_str) in &batch {
+            let (new_spending, spending_converted) =
+                convert_one_key_id(spending_key_str, *output_id, "spending_key", &resources.key_manager);
+            let (new_script, script_converted) =
+                convert_one_key_id(script_key_str, *output_id, "script_private_key", &resources.key_manager);
+
+            if !spending_converted && !script_converted {
+                // Nothing changed - writing back is a no-op. Keyset paging advances past this row anyway.
+                total_unconvertable += 1;
+                continue;
+            }
+
+            if let Err(e) = resources.db.update_output_key_ids(*output_id, new_spending, new_script) {
+                warn!(
+                    target: LOG_TARGET,
+                    "Legacy key migration: failed to update output id={output_id}: {e}"
+                );
+            } else {
+                total_migrated += 1;
+            }
+        }
+
+        // Advance the keyset cursor to the largest id seen in this batch. Rows are ORDER BY id ASC so the last
+        // tuple holds the max.
+        if let Some((max_id, _, _)) = batch.last() {
+            last_id = *max_id;
+        }
+
+        // Yield so the main service event loop and any other DB consumers can make progress.
+        tokio::time::sleep(std::time::Duration::from_millis(LEGACY_KEY_MIGRATION_BATCH_PAUSE_MS)).await;
+    }
+
+    if total_migrated > 0 {
+        info!(
+            target: LOG_TARGET,
+            "Legacy key migration complete: {total_migrated} output(s) converted to current key-id format \
+             ({total_unconvertable} row(s) could not be converted)."
+        );
+    } else {
+        debug!(
+            target: LOG_TARGET,
+            "Legacy key migration: no legacy key-ids found requiring conversion."
+        );
+    }
+}
+
+#[cfg(test)]
+mod force_change_output_tests {
+    use tari_transaction_components::MicroMinotari;
+
+    use super::pick_forced_change_index;
+
+    const MARGINAL: MicroMinotari = MicroMinotari(10);
+    const DUST: MicroMinotari = MicroMinotari(100);
+    // Anything above MARGINAL + DUST = 110 yields a meaningful (non-dust) change output.
+
+    #[test]
+    fn prefers_meaningful_candidates_using_random_pick() {
+        // Indices 1 and 3 are above the meaningful threshold (110). The injected random pick selects the second of
+        // them.
+        let values = vec![
+            MicroMinotari(50),
+            MicroMinotari(200),
+            MicroMinotari(80),
+            MicroMinotari(500),
+        ];
+        let chosen = pick_forced_change_index(&values, MARGINAL, DUST, |len| {
+            assert_eq!(len, 2); // only the two meaningful candidates are offered to the random picker
+            1
+        });
+        assert_eq!(chosen, Some(3));
+    }
+
+    #[test]
+    fn random_pick_out_of_range_is_clamped() {
+        let values = vec![MicroMinotari(200), MicroMinotari(300)];
+        let chosen = pick_forced_change_index(&values, MARGINAL, DUST, |_len| usize::MAX);
+        // Clamped to the last meaningful candidate rather than panicking/indexing out of bounds.
+        assert_eq!(chosen, Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_largest_when_no_meaningful_candidate() {
+        // None exceed the meaningful threshold (110), but two exceed the marginal cost (10): pick the largest of those.
+        let values = vec![
+            MicroMinotari(5),  // below marginal cost, cannot create change
+            MicroMinotari(40), // covers marginal cost
+            MicroMinotari(90), // largest that covers marginal cost
+        ];
+        let chosen = pick_forced_change_index(&values, MARGINAL, DUST, |_| {
+            panic!("random pick must not be used when falling back to the largest candidate")
+        });
+        assert_eq!(chosen, Some(2));
+    }
+
+    #[test]
+    fn returns_none_when_no_candidate_covers_marginal_cost() {
+        let values = vec![MicroMinotari(1), MicroMinotari(10)]; // none strictly greater than marginal cost (10)
+        let chosen = pick_forced_change_index(&values, MARGINAL, DUST, |_| 0);
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn returns_none_for_empty_candidates() {
+        let chosen = pick_forced_change_index(&[], MARGINAL, DUST, |_| 0);
+        assert_eq!(chosen, None);
     }
 }

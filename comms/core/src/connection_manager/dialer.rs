@@ -64,7 +64,7 @@ use crate::{
     peer_manager::{NodeId, NodeIdentity, Peer, PeerManager},
     protocol::ProtocolId,
     transports::Transport,
-    types::CommsPublicKey,
+    types::{CommsPublicKey, TransportProtocol},
 };
 
 const LOG_TARGET: &str = "comms::connection_manager::dialer";
@@ -307,9 +307,10 @@ where
             .and_then(|reply_oneshots| {
                 reply_oneshots.into_iter().for_each(|tx| {
                     log_if_error_fmt!(
+                        level: debug,
                         target: LOG_TARGET,
                         tx.send(result.clone()),
-                        "Failed to send dial result for peer '{}'",
+                        "Failed to send dial result for peer '{}' (requester no longer waiting)",
                         peer_node_id.short_str()
                     );
                 });
@@ -605,7 +606,7 @@ where
         let supported_transport_protocols = transport.supported_protocols();
         trace!(target: LOG_TARGET, "Supported transport protocols: {:?}", supported_transport_protocols);
 
-        let addresses = dial_state
+        let mut addresses = dial_state
             .peer()
             .addresses
             .clone()
@@ -617,6 +618,7 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
+        Self::sort_addresses_by_transport_preference(&mut addresses, &supported_transport_protocols);
 
         if addresses.is_empty() {
             let node_id_hex = dial_state.peer().node_id.clone().to_hex();
@@ -757,5 +759,18 @@ where
         }
 
         (dial_state, Err(ConnectionManagerError::DialConnectFailedAllAddresses))
+    }
+
+    pub(super) fn sort_addresses_by_transport_preference(
+        addresses: &mut [Multiaddr],
+        supported_transport_protocols: &[TransportProtocol],
+    ) {
+        addresses.sort_by_key(|addr| {
+            let protocol = TransportProtocol::from(addr);
+            supported_transport_protocols
+                .iter()
+                .position(|supported| supported == &protocol)
+                .unwrap_or(usize::MAX)
+        });
     }
 }

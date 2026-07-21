@@ -25,9 +25,9 @@ use std::{fmt, fs, io, net::TcpListener, path::PathBuf, thread};
 use derivative::Derivative;
 use libtor::{LogDestination, LogLevel, TorFlag};
 use log::*;
-use rand::{Rng, distributions::Alphanumeric, thread_rng};
+use rand::{RngExt, distr::Alphanumeric};
 use tari_common::exit_codes::{ExitCode, ExitError};
-use tari_p2p::{TorControlAuthentication, TransportConfig, TransportType};
+use tari_p2p::{TorControlAuthentication, TransportConfig};
 use tor_hash_passwd::EncryptedKey;
 
 const LOG_TARGET: &str = "tari_libtor";
@@ -82,7 +82,7 @@ impl Tor {
         instance.control_port = control_port;
 
         // generate a random passphrase
-        let passphrase: String = thread_rng()
+        let passphrase: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(30)
             .map(char::from)
@@ -124,20 +124,17 @@ impl Tor {
 
     /// Override a given Tor comms transport with the control address and auth from this instance
     pub fn update_comms_transport(&self, transport: &mut TransportConfig) -> Result<(), ExitError> {
-        match transport.transport_type {
-            TransportType::Tor => {
-                if let Some(ref passphrase) = self.passphrase.0 {
-                    transport.tor.control_auth = TorControlAuthentication::Password(passphrase.to_owned());
-                }
-                transport.tor.control_address = format!("/ip4/127.0.0.1/tcp/{}", self.control_port).parse().unwrap();
-                debug!(target: LOG_TARGET, "updated comms transport: {transport:?}");
-                Ok(())
-            },
-            _ => {
-                let e = format!("Expected a TorHiddenService comms transport, received: {transport:?}");
-                Err(ExitError::new(ExitCode::ConfigError, e))
-            },
+        if !transport.transport_type.uses_tor_hidden_service() {
+            let e = format!("Expected a TorHiddenService comms transport, received: {transport:?}");
+            return Err(ExitError::new(ExitCode::ConfigError, e));
         }
+
+        if let Some(ref passphrase) = self.passphrase.0 {
+            transport.tor.control_auth = TorControlAuthentication::Password(passphrase.to_owned());
+        }
+        transport.tor.control_address = format!("/ip4/127.0.0.1/tcp/{}", self.control_port).parse().unwrap();
+        debug!(target: LOG_TARGET, "updated comms transport: {transport:?}");
+        Ok(())
     }
 
     /// Run the Tor instance in the background and return a handle to the thread.

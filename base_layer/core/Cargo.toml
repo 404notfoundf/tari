@@ -43,14 +43,13 @@ async-trait = { version = "0.1.50" }
 bincode = "1.1.4"
 blake2 = "0.10"
 borsh = { workspace = true, features = ["derive"] }
-chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 digest = "0.10"
 dirs-next = "1.0.2"
 fs2 = "0.4.0"
 futures = { version = "^0.3.16", features = ["async-await"] }
 hex = "0.4.2"
-hickory-proto = { version = "0.26.0" }
+hickory-proto = { version = "0.26.1" }
 integer-encoding = "3.0"
 jmt = { version = "0.11.0", features = ["mocks"] }
 lmdb-zero = "0.4.4"
@@ -62,7 +61,7 @@ rand = { workspace = true }
 randomx-rs = { version = "1.4" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_valid = "1.0.5"
+serde_valid = "2"
 sha3 = "0.10"
 sha2 = "0.10"
 strum_macros = "0.22"
@@ -77,6 +76,7 @@ url = "2.5.4"
 
 [dev-dependencies]
 criterion = { version = "0.8" }
+flate2 = "1"
 tari_p2p = { workspace = true, features = ["test-mocks"] }
 tari_test_utils = { workspace = true }
 # SQLite required for the integration tests

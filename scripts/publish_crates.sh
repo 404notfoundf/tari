@@ -35,6 +35,8 @@ PACKAGES=(
     "minotari_app_utilities"
     "minotari_wallet_grpc_client"
     "minotari_node_grpc_client"
+    "minotari_node"
+    "minotari_console_wallet"
 )
 
 for package in "${PACKAGES[@]}"; do

@@ -134,7 +134,8 @@ pub struct BaseNodeGrpcServer {
     comms: CommsNode,
     liveness: LivenessHandle,
     report_grpc_error: bool,
-    tari_pulse: TariPulseHandle,
+    /// `None` when the Tari Pulse service is disabled; consumers fall back to an inert healthy state.
+    tari_pulse: Option<TariPulseHandle>,
     config: BaseNodeConfig,
     data_cache: DataCache,
 }
@@ -567,7 +568,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             tari_rpc::UDecimalValue { units: 0, nanos: 0 }
         };
 
-        let failed_checkpoints = *self.tari_pulse.get_failed_checkpoints_notifier();
+        let failed_checkpoints = self
+            .tari_pulse
+            .as_ref()
+            .map(|handle| *handle.get_failed_checkpoints_notifier())
+            .unwrap_or(false);
         let status_watch = self.state_machine_handle.get_status_info_watch();
         let (state, network_silence, initial_sync_achieved) = {
             let status = status_watch.borrow();
@@ -582,9 +587,12 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             .await
             .map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
 
-        let liveness_results = (*self.tari_pulse.get_liveness_checks()).clone();
+        let liveness_results = self.tari_pulse.as_ref().map(|handle| handle.get_liveness_checks());
+        let empty_vec = Vec::new();
+        let liveness_results_ref = liveness_results.as_deref().unwrap_or(&empty_vec);
+
         let mut liveness = Vec::new();
-        for data in liveness_results {
+        for data in liveness_results_ref {
             let liveness_check = tari_rpc::LivenessResult {
                 peer_node_id: data.peer.to_string().into_bytes(),
                 discover_latency: data
@@ -1907,9 +1915,9 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             TxStorageResponse::NotStoredAlreadyMined => tari_rpc::SubmitTransactionResponse {
                 result: tari_rpc::SubmitTransactionResult::AlreadyMined.into(),
             },
-            TxStorageResponse::NotStored |
+            TxStorageResponse::NotStored(_) |
             TxStorageResponse::NotStoredOrphan |
-            TxStorageResponse::NotStoredConsensus |
+            TxStorageResponse::NotStoredConsensus(_) |
             TxStorageResponse::NotStoredFeeTooLow |
             TxStorageResponse::NotStoredTimeLocked => tari_rpc::SubmitTransactionResponse {
                 result: tari_rpc::SubmitTransactionResult::Rejected.into(),
@@ -1990,8 +1998,8 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                                                                             * node does not think it is. */
                 }
             },
-            TxStorageResponse::NotStored |
-            TxStorageResponse::NotStoredConsensus |
+            TxStorageResponse::NotStored(_) |
+            TxStorageResponse::NotStoredConsensus(_) |
             TxStorageResponse::NotStoredOrphan |
             TxStorageResponse::NotStoredFeeTooLow |
             TxStorageResponse::NotStoredTimeLocked |
@@ -2119,7 +2127,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         trace!(target: LOG_TARGET, "Incoming GRPC request for BN tip data");
 
         let mut handler = self.node_service.clone();
-        let failed_checkpoints = *self.tari_pulse.get_failed_checkpoints_notifier();
+        let failed_checkpoints = self
+            .tari_pulse
+            .as_ref()
+            .map(|handle| *handle.get_failed_checkpoints_notifier())
+            .unwrap_or(false);
 
         let meta = handler
             .get_metadata()

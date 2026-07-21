@@ -22,7 +22,7 @@
 
 use std::{convert::TryFrom, iter::once};
 
-use rand::{prelude::SliceRandom, rngs::OsRng, thread_rng};
+use rand::prelude::SliceRandom;
 use tari_common::configuration::Network;
 use tari_common_types::types::{
     CompressedCommitment,
@@ -739,6 +739,17 @@ pub fn get_pre_mine_items(network: Network) -> Result<Vec<PreMineItem>, String> 
     create_pre_mine_output_values(schedule)
 }
 
+pub fn get_embedded_pre_mine_json(network: Network) -> &'static str {
+    match network {
+        Network::MainNet => include_str!("mainnet_pre_mine.json"),
+        Network::StageNet => include_str!("stagenet_pre_mine.json"),
+        Network::NextNet => include_str!("nextnet_pre_mine.json"),
+        Network::LocalNet => include_str!("esmeralda_pre_mine.json"),
+        Network::Igor => include_str!("igor_pre_mine.json"),
+        Network::Esmeralda => include_str!("esmeralda_pre_mine.json"),
+    }
+}
+
 // The threshold is 1 more than half of the public keys if even, otherwise 1 more than half of 'public keys - 1'
 fn get_signature_threshold(number_of_keys: usize) -> Result<u8, String> {
     if number_of_keys < 2 {
@@ -833,7 +844,7 @@ pub fn create_pre_mine_genesis_block_info(
 
         let sender_offset = key_manager.get_random_key(None, None).map_err(|e| e.to_string())?;
         let mut public_keys = public_keys.clone();
-        public_keys.shuffle(&mut thread_rng());
+        public_keys.shuffle(&mut rand::rng());
         let script = script!(
             CheckHeight(item.fail_safe_height) LeZero
             IfThen
@@ -866,7 +877,7 @@ pub fn create_pre_mine_genesis_block_info(
         outputs.push(output.to_transaction_output().map_err(|e| e.to_string())?);
     }
     // lets create a single kernel for all the outputs
-    let r = PrivateKey::random(&mut OsRng);
+    let r = PrivateKey::random(&mut rand::rng());
     let total_public_key = CompressedPublicKey::from_secret_key(&total_private_key);
     let e = TransactionKernel::build_kernel_signature_challenge(
         TransactionKernelVersion::get_current_version(),

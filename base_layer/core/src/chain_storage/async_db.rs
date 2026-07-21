@@ -23,7 +23,7 @@ use std::{mem, ops::RangeBounds, sync::Arc, time::Instant};
 
 use log::*;
 use primitive_types::U512;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use tari_common_types::{
     chain_metadata::ChainMetadata,
     epoch::VnEpoch,
@@ -81,7 +81,7 @@ const LOG_TARGET: &str = "c::bn::async_db";
 fn trace_log<F, R>(name: &str, f: F) -> R
 where F: FnOnce() -> R {
     let start = Instant::now();
-    let trace_id = OsRng.next_u32();
+    let trace_id = rand::rng().next_u32();
     trace!(
         target: LOG_TARGET,
         "[{name}] Entered blocking thread. trace_id: {trace_id}"
@@ -164,7 +164,7 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
 
     make_async_fn!(fetch_horizon_sync_output_checkpoint() -> Option<HorizonSyncOutputCheckpoint>, "fetch_horizon_sync_output_checkpoint");
 
-    make_async_fn!(verify_horizon_sync_output_root(version: u64, expected_root: HashOutput) -> (), "verify_horizon_sync_output_root");
+    make_async_fn!(verify_horizon_sync_output_root(expected_root: HashOutput) -> (), "verify_horizon_sync_output_root");
 
     //---------------------------------- TXO --------------------------------------------//
 
@@ -378,14 +378,8 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
         self
     }
 
-    pub fn apply_horizon_state_tree_updates(
-        &mut self,
-        previous_version: u64,
-        version: u64,
-        updates: Vec<HorizonStateTreeUpdate>,
-    ) -> &mut Self {
-        self.transaction
-            .apply_horizon_state_tree_updates(previous_version, version, updates);
+    pub fn apply_horizon_state_tree_updates(&mut self, updates: Vec<HorizonStateTreeUpdate>) -> &mut Self {
+        self.transaction.apply_horizon_state_tree_updates(updates);
         self
     }
 

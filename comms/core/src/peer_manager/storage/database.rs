@@ -1131,8 +1131,22 @@ impl PeerDatabaseSql {
         }
 
         if let Some(n) = n {
+            // Weighted-random ordering that biases towards more recently-seen peers while still keeping the
+            // selection random (for network diversity / anti-eclipse). For each candidate we compute
+            //   score = age_in_days * U,  U ~ Uniform(0, 1)
+            // and pick the `n` smallest scores. A fresher peer (small age) gets a small score regardless of its
+            // random draw, so it is more likely to be served; a stale peer needs a small draw to compete. NULL
+            // `last_seen` is treated as maximally old so never-seen rows sort last. `RANDOM()` returns a signed
+            // 64-bit integer, so `RANDOM() / 2^64` is in (-0.5, 0.5) and `+ 0.5` shifts it to (0, 1).
+            // The age is clamped to >= 0 with `max(0.0, ...)`: a future-dated `last_seen` (clock skew or a peer
+            // intentionally claiming a future timestamp) would otherwise produce a negative age and hence a negative
+            // score that always sorts first, letting such peers bypass the weighted-random selection. Clamping treats
+            // any future date as "brand new" instead.
             query = query
-                .order_by(diesel::dsl::sql::<diesel::sql_types::Integer>("RANDOM()"))
+                .order_by(diesel::dsl::sql::<diesel::sql_types::Double>(
+                    "max(0.0, julianday('now') - julianday(COALESCE(multi_addresses.last_seen, '1970-01-01 \
+                     00:00:00'))) * (0.5 + RANDOM() / 18446744073709551616.0)",
+                ))
                 .limit(i64::try_from(n).unwrap_or(i64::MAX));
         }
 
@@ -1765,29 +1779,29 @@ mod tests {
         // for peer in &mut new_peers {
         //     // - new peer stats
         //     peer.ban_for(
-        //         Duration::from_secs(rand::thread_rng().gen_range(1000..9000)),
+        //         Duration::from_secs(rand::rng().random_range(1000..9000)),
         //         "Misbehave".to_string(),
         //     );
         //     peer.supported_protocols
         //         .push(ProtocolId::from_static(b"Test Protocol 1.0"));
         //     peer.metadata
-        //         .insert(1, vec![1, 2, rand::thread_rng().gen_range(1..100)]);
+        //         .insert(1, vec![1, 2, rand::rng().random_range(1..100)]);
         //     peer.metadata
-        //         .insert(2, vec![4, 5, rand::thread_rng().gen_range(1..100)]);
+        //         .insert(2, vec![4, 5, rand::rng().random_range(1..100)]);
         //     // - add another multi-address
         //     let n = [
-        //         rand::thread_rng().gen_range(1..9),
-        //         rand::thread_rng().gen_range(1..9),
-        //         rand::thread_rng().gen_range(1..9),
-        //         rand::thread_rng().gen_range(1..9),
+        //         rand::rng().random_range(1..9),
+        //         rand::rng().random_range(1..9),
+        //         rand::rng().random_range(1..9),
+        //         rand::rng().random_range(1..9),
         //     ];
         //     let new_addr_str = format!("/ip4/{}.{}.{}.{}/udt/sctp/{0}{1}{2}{3}", n[0], n[1], n[2], n[3]);
         //     peer.addresses
         //         .add_address(&new_addr_str.parse().unwrap(), &PeerAddressSource::Config);
         //     // - new stats for the first multi-address
         //     let mut address_to_update = peer.addresses.addresses().first().unwrap().clone();
-        //     address_to_update.update_latency(Duration::from_millis(rand::thread_rng().gen_range(100..1000)));
-        //     address_to_update.update_initial_dial_time(Duration::from_millis(rand::thread_rng().gen_range(100..
+        //     address_to_update.update_latency(Duration::from_millis(rand::rng().random_range(100..1000)));
+        //     address_to_update.update_initial_dial_time(Duration::from_millis(rand::rng().random_range(100..
         // 1000)));     address_to_update.mark_last_seen_now();
         //     peer.addresses
         //         .merge(&MultiaddressesWithStats::new(vec![address_to_update.clone()]));

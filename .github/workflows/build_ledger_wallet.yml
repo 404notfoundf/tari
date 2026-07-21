@@ -15,7 +15,7 @@ name: Build minotari_ledger_wallet
 env:
   TS_FILENAME: "minotari_ledger_wallet"
   SHARUN: "shasum --algorithm 256"
-  DOCKER_IMAGE: "ghcr.io/ledgerhq/ledger-app-builder/ledger-app-builder:5.1.0"
+  DOCKER_IMAGE: "ghcr.io/ledgerhq/ledger-app-builder/ledger-app-builder:5.3.10"
 
 concurrency:
   # https://docs.github.com/en/actions/examples/using-concurrency-expressions-and-a-test-matrix
@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: checkout tari
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up QEMU for Docker
         uses: docker/setup-qemu-action@v4
@@ -79,8 +79,7 @@ jobs:
           cd "${GITHUB_WORKSPACE}/dist"
           echo "Copying files for ${{ env.BINFILE }} to $(pwd)"
           ls -la ${{ github.workspace }}/applications/minotari_ledger_wallet/wallet/target/${{ matrix.ledger_target }}/release/
-          cp -vf ${GITHUB_WORKSPACE}/applications/minotari_ledger_wallet/wallet/target/${{ matrix.ledger_target }}/release/*.json .
-          cp -vf ${GITHUB_WORKSPACE}/applications/minotari_ledger_wallet/wallet/target/${{ matrix.ledger_target }}/release/key*.gif .
+          cp -vf ${GITHUB_WORKSPACE}/applications/minotari_ledger_wallet/wallet/target/${{ matrix.ledger_target }}/release/key*.gif . 2>/dev/null || true
           cp -vf ${GITHUB_WORKSPACE}/applications/minotari_ledger_wallet/wallet/target/${{ matrix.ledger_target }}/release/minotari_ledger_wallet.* .
           echo "Compute files shasum"
           ${SHARUN} * >> "${{ env.BINFILE }}.sha256"
@@ -112,15 +111,28 @@ jobs:
       contents: write
 
     steps:
+      - name: checkout tari
+        uses: actions/checkout@v7
+
       - name: Download binaries
         uses: actions/download-artifact@v8
         with:
           pattern: "${{ env.TS_FILENAME }}*"
 
+      - name: Bundle install scripts into a single release asset
+        shell: bash
+        run: |
+          SCRIPTS_ROOT="applications/minotari_ledger_wallet/wallet/install_scripts"
+          mkdir -p install-assets
+          # Bundle the unified installer, platform launchers, and docs.
+          ( cd "${SCRIPTS_ROOT}" && zip -r "${GITHUB_WORKSPACE}/install-assets/${TS_FILENAME}-install-scripts.zip" README.md install_minotari_ledger.py install_minotari_ledger.sh install_minotari_ledger.ps1 -x "test_*" "__pycache__/*" "*.pyc" )
+          echo "Bundled install scripts:"
+          unzip -l "install-assets/${TS_FILENAME}-install-scripts.zip"
+
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "${{ env.TS_FILENAME }}*/**/*"
+          artifacts: "${{ env.TS_FILENAME }}*/**/*,install-assets/${{ env.TS_FILENAME }}-install-scripts.zip"
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: true
           draft: true

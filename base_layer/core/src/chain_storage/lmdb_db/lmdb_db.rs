@@ -91,27 +91,26 @@ use std::{
     fmt,
     fs::{self, File},
     ops::Deref,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
 use fs2::FileExt;
-use jmt::{
-    JellyfishMerkleTree,
-    KeyHash,
-    storage::{NibblePath, NodeKey, TreeReader, TreeWriter},
-};
+use jmt::{JellyfishMerkleTree, KeyHash, storage::TreeWriter};
 use lmdb_zero::{
     ConstTransaction,
     Database,
+    DatabaseOptions,
     EnvBuilder,
     Environment,
+    Error as LmdbError,
     LmdbResultExt,
     ReadTransaction,
     WriteTransaction,
+    error::NOTFOUND,
     open,
-    traits::AsLmdbBytes,
+    traits::{AsLmdbBytes, CreateCursor},
 };
 use log::*;
 use primitive_types::{U256, U512};
@@ -162,7 +161,7 @@ use super::{
     lmdb::lmdb_get_prefix_cursor,
     lmdb_tree_reader::{LmdbTreeReader, OwnedLmdbTreeReader},
     lmdb_tree_writer::LmdbTreeWriter,
-    stats_collector::{DatabaseStats, LMDBStatsCollector},
+    stats_collector::{DatabaseStats, LMDBStatsCollector, MigrationPhase},
 };
 use crate::{
     PrunedKernelMmr,
@@ -176,6 +175,7 @@ use crate::{
         InputMinedInfo,
         MinedInfo,
         MmrTree,
+        Optional,
         Reorg,
         TemplateRegistrationEntry,
         ValidatorNodeEntry,
@@ -202,6 +202,7 @@ use crate::{
                 lmdb_clear,
                 lmdb_delete,
                 lmdb_delete_each_where,
+                lmdb_delete_if_exists,
                 lmdb_delete_key_value,
                 lmdb_delete_keys_starting_with,
                 lmdb_delete_typed,
@@ -255,6 +256,12 @@ impl<TKeyType: AsLmdbBytes + ?Sized, TValueType: DeserializeOwned + Serialize> T
 
 pub const LOG_TARGET: &str = "c::cs::lmdb_db::lmdb_db";
 
+/// Fixed safety margin added on top of a write transaction's estimated serialized size when pre-growing
+/// the LMDB map. Covers derived writes not present in the transaction's operations (most notably the
+/// output SMT/JMT node churn produced while applying a block) and LMDB copy-on-write page overhead, so a
+/// transaction can be applied in a single resize instead of resize-and-replaying the whole transaction.
+const TXN_RESIZE_SAFETY_MARGIN_BYTES: usize = 128 * BYTES_PER_MB;
+
 const LMDB_DB_METADATA: &str = "metadata";
 const LMDB_DB_HEADERS: &str = "headers";
 const LMDB_DB_HEADER_ACCUMULATED_DATA: &str = "header_accumulated_data";
@@ -268,6 +275,7 @@ const LMDB_DB_KERNELS: &str = "kernels";
 const LMDB_DB_KERNEL_EXCESS_INDEX: &str = "kernel_excess_index";
 const LMDB_DB_KERNEL_EXCESS_SIG_INDEX: &str = "kernel_excess_sig_index";
 const LMDB_DB_KERNEL_MMR_SIZE_INDEX: &str = "kernel_mmr_size_index";
+const LMDB_DB_BURN_COMMITMENT_INDEX: &str = "burn_commitment_index";
 const LMDB_DB_DELETED_TXO_HASH_TO_HEADER_INDEX: &str = "deleted_txo_hash_to_header_index";
 const LMDB_DB_UTXO_COMMITMENT_INDEX: &str = "utxo_commitment_index";
 const LMDB_DB_UNIQUE_ID_INDEX: &str = "unique_id_index";
@@ -287,8 +295,10 @@ const LMDB_DB_VALIDATOR_NODES_ACTIVATION: &str = "validator_nodes_activation_que
 const LMDB_DB_VALIDATOR_NODES_EXIT: &str = "validator_nodes_exit";
 const LMDB_DB_TEMPLATE_REGISTRATIONS: &str = "template_registrations";
 const LMDB_DB_UTXO_SMT: &str = "utxo_smt";
-const LMDB_DB_JMT_VALUE_DATA: &str = "jmt_value_data";
-const LMDB_DB_JMT_NODE_DATA: &str = "jmt_node_data";
+const LMDB_DB_JMT_VALUE_DATA_V1: &str = "jmt_value_data";
+const LMDB_DB_JMT_VALUE_DATA_V2: &str = "jmt_values_data";
+const LMDB_DB_JMT_NODE_DATA_V1: &str = "jmt_node_data";
+const LMDB_DB_JMT_NODE_DATA_V2: &str = "jmt_nodes_data";
 const LMDB_DB_JMT_UNIQUE_KEY_DATA: &str = "jmt_unique_key_data";
 
 /// Returns the list of all LMDB database names used by Tari.
@@ -308,6 +318,7 @@ pub fn get_all_database_names() -> Vec<&'static str> {
         LMDB_DB_KERNEL_EXCESS_INDEX,
         LMDB_DB_KERNEL_EXCESS_SIG_INDEX,
         LMDB_DB_KERNEL_MMR_SIZE_INDEX,
+        LMDB_DB_BURN_COMMITMENT_INDEX,
         LMDB_DB_UTXO_COMMITMENT_INDEX,
         LMDB_DB_CONTRACT_ID_INDEX,
         LMDB_DB_UNIQUE_ID_INDEX,
@@ -327,9 +338,8 @@ pub fn get_all_database_names() -> Vec<&'static str> {
         LMDB_DB_VALIDATOR_NODES_EXIT,
         LMDB_DB_TEMPLATE_REGISTRATIONS,
         LMDB_DB_UTXO_SMT,
-        LMDB_DB_JMT_VALUE_DATA,
-        LMDB_DB_JMT_NODE_DATA,
-        LMDB_DB_JMT_UNIQUE_KEY_DATA,
+        LMDB_DB_JMT_VALUE_DATA_V2,
+        LMDB_DB_JMT_NODE_DATA_V2,
     ]
 }
 
@@ -337,8 +347,15 @@ pub fn get_all_database_names() -> Vec<&'static str> {
 type KernelKey = CompositeKey<72>;
 /// Height(8), Hash(32)
 type CodeTemplateRegistrationKey = CompositeKey<40>;
-/// Core database creation logic shared between public functions
-fn build_lmdb_store<P: AsRef<Path>>(path: P, config: LMDBConfig) -> Result<(LMDBStore, File), ChainStorageError> {
+/// Core database creation logic shared between public functions.
+///
+/// Exposed `pub(crate)` so tests can open an LMDB at a known path with the exact same
+/// database list and flags as the production code path — used by the byte-level fixture
+/// comparison test in `chain_storage::tests::lmdb_unit_tests`.
+pub(crate) fn build_lmdb_store<P: AsRef<Path>>(
+    path: P,
+    config: LMDBConfig,
+) -> Result<(LMDBStore, File), ChainStorageError> {
     let flags = db::CREATE;
     debug!(target: LOG_TARGET, "Creating LMDB database at {:?}", path.as_ref());
     fs::create_dir_all(&path)?;
@@ -369,6 +386,7 @@ fn build_lmdb_store<P: AsRef<Path>>(path: P, config: LMDBConfig) -> Result<(LMDB
         .add_database(LMDB_DB_KERNEL_EXCESS_INDEX, flags)
         .add_database(LMDB_DB_KERNEL_EXCESS_SIG_INDEX, flags)
         .add_database(LMDB_DB_KERNEL_MMR_SIZE_INDEX, flags)
+        .add_database(LMDB_DB_BURN_COMMITMENT_INDEX, flags)
         .add_database(LMDB_DB_UTXO_COMMITMENT_INDEX, flags)
         .add_database(LMDB_DB_UNIQUE_ID_INDEX, flags)
         .add_database(LMDB_DB_CONTRACT_ID_INDEX, flags)
@@ -388,9 +406,8 @@ fn build_lmdb_store<P: AsRef<Path>>(path: P, config: LMDBConfig) -> Result<(LMDB
         .add_database(LMDB_DB_VALIDATOR_NODES_EXIT, flags)
         .add_database(LMDB_DB_TEMPLATE_REGISTRATIONS, flags | db::DUPSORT)
         .add_database(LMDB_DB_UTXO_SMT, flags)
-        .add_database(LMDB_DB_JMT_VALUE_DATA, flags )
-        .add_database(LMDB_DB_JMT_NODE_DATA, flags)
-        .add_database(LMDB_DB_JMT_UNIQUE_KEY_DATA, flags)
+        .add_database(LMDB_DB_JMT_VALUE_DATA_V2, flags)
+        .add_database(LMDB_DB_JMT_NODE_DATA_V2, flags)
         .build()
         .map_err(|err| ChainStorageError::CriticalError(format!("Could not create LMDB store:{err}")))?;
     debug!(target: LOG_TARGET, "LMDB database creation successful");
@@ -443,8 +460,7 @@ pub fn create_lmdb_database<P: AsRef<Path>>(
     config: LMDBConfig,
     consensus_manager: BaseNodeConsensusManager,
 ) -> Result<LMDBDatabase, ChainStorageError> {
-    let (lmdb_store, file_lock) = build_lmdb_store(path, config)?;
-    LMDBDatabase::new(&lmdb_store, file_lock, consensus_manager, None)
+    open_lmdb_database_with_compaction(path.as_ref(), config, consensus_manager, None)
 }
 
 pub fn create_lmdb_database_with_stats_channel<P: AsRef<Path>>(
@@ -453,9 +469,337 @@ pub fn create_lmdb_database_with_stats_channel<P: AsRef<Path>>(
     consensus_manager: BaseNodeConsensusManager,
     stats_sender: Option<watch::Sender<DatabaseStats>>,
 ) -> Result<LMDBDatabase, ChainStorageError> {
-    let (lmdb_store, file_lock) = build_lmdb_store(path, config)?;
-    LMDBDatabase::new(&lmdb_store, file_lock, consensus_manager, stats_sender)
+    open_lmdb_database_with_compaction(path.as_ref(), config, consensus_manager, stats_sender)
 }
+
+/// Open the LMDB env, run migrations, and — if the on-disk file contains enough free pages to
+/// be worth reclaiming — compact the env into a fresh file and reopen it.
+///
+/// The compaction trigger is decoupled from any specific migration: it inspects the LMDB env's
+/// own page accounting (`mdb_env_info` + per-DB `mdb_stat`) and only fires when free pages
+/// inside `data.mdb` exceed both an absolute and a fractional threshold. This means the JMT v1
+/// → v2 migration (and any future migration that drops databases) is reclaimed automatically,
+/// and so is incidental long-term fragmentation, without coupling the compaction step to a
+/// specific migration version.
+///
+/// The compaction step writes a fresh `data.mdb` next to the original via `mdb_env_copy2` with
+/// `MDB_CP_COMPACT`, then atomically swaps it in. The original is renamed to `data.mdb.bak` as a
+/// safety net: if any of the swap/reopen steps fail the operator can restore it manually.
+fn open_lmdb_database_with_compaction(
+    path: &Path,
+    config: LMDBConfig,
+    consensus_manager: BaseNodeConsensusManager,
+    stats_sender: Option<watch::Sender<DatabaseStats>>,
+) -> Result<LMDBDatabase, ChainStorageError> {
+    let env_path = path.to_path_buf();
+    let (lmdb_store, file_lock) = build_lmdb_store(&env_path, config.clone())?;
+    let db = LMDBDatabase::new(&lmdb_store, file_lock, consensus_manager.clone(), stats_sender.clone())?;
+
+    match should_compact_lmdb_env(&db, config.compaction_min_free_bytes()) {
+        Ok(false) => return Ok(db),
+        Ok(true) => {},
+        Err(e) => {
+            // Don't block startup if we can't evaluate fragmentation - just skip compaction and
+            // log so an operator can investigate.
+            warn!(
+                target: LOG_TARGET,
+                "[COMPACTION] Could not evaluate LMDB fragmentation, skipping compact step: {e}"
+            );
+            return Ok(db);
+        },
+    }
+
+    compact_and_reopen_lmdb_database(db, lmdb_store, env_path, config, consensus_manager, stats_sender)
+}
+
+/// Decide whether the LMDB env has enough free pages inside `data.mdb` to make a compact-copy
+/// worth running. The trigger threshold is configurable via
+/// [`LMDBConfig::compaction_min_free_bytes`].
+///
+/// Uses LMDB's own page accounting rather than the file size on disk: `mdb_env_info` reports the
+/// highest used page number (`last_pgno`), and `mdb_stat` for each named database reports the
+/// branch/leaf/overflow page counts it holds. The difference, minus the two fixed meta pages, is
+/// the count of pages currently in the free-list - exactly the bytes an `MDB_CP_COMPACT` copy
+/// would reclaim. This avoids the false-positive that comparing file size to live data would hit
+/// on a freshly-allocated sparse file with a large `mapsize`.
+fn should_compact_lmdb_env(db: &LMDBDatabase, min_free_bytes: u64) -> Result<bool, ChainStorageError> {
+    let env_info = db
+        .env
+        .info()
+        .map_err(|e| ChainStorageError::AccessError(format!("Could not read LMDB env info: {e}")))?;
+    let env_stat = db
+        .env
+        .stat()
+        .map_err(|e| ChainStorageError::AccessError(format!("Could not read LMDB env stat: {e}")))?;
+    let psize = u64::from(env_stat.psize);
+    // (last_pgno + 1) * psize is the high-water-mark bytes the env has allocated inside data.mdb.
+    let total_used_pages = env_info.last_pgno as u64 + 1;
+
+    let read_txn = db.read_transaction()?;
+    let mut live_pages: u64 = 0;
+    for (name, db_handle) in db.all_dbs() {
+        let stat = read_txn
+            .db_stat(db_handle)
+            .map_err(|e| ChainStorageError::AccessError(format!("Could not read db_stat for `{name}`: {e}")))?;
+        live_pages += stat.branch_pages as u64 + stat.leaf_pages as u64 + stat.overflow_pages as u64;
+    }
+    // Two fixed meta pages always exist in any LMDB env.
+    const META_PAGES: u64 = 2;
+    let free_pages = total_used_pages.saturating_sub(live_pages).saturating_sub(META_PAGES);
+    let free_bytes = free_pages.saturating_mul(psize);
+    let trigger = free_bytes >= min_free_bytes;
+    let mb = BYTES_PER_MB as u64;
+    info!(
+        target: LOG_TARGET,
+        "[COMPACTION]  free={} MB, thresholds={} MB  -> compact={}",
+        free_bytes / mb,
+        min_free_bytes / mb,
+        trigger
+    );
+    Ok(trigger)
+}
+
+/// Compact the env behind `db` into a new file and reopen the database against the compacted copy.
+#[allow(clippy::too_many_lines)]
+fn compact_and_reopen_lmdb_database(
+    db: LMDBDatabase,
+    lmdb_store: LMDBStore,
+    env_path: PathBuf,
+    config: LMDBConfig,
+    consensus_manager: BaseNodeConsensusManager,
+    stats_sender: Option<watch::Sender<DatabaseStats>>,
+) -> Result<LMDBDatabase, ChainStorageError> {
+    info!(
+        target: LOG_TARGET,
+        "[MIGRATIONS] Compacting LMDB env at {} to reclaim free pages inside data.mdb",
+        env_path.display()
+    );
+
+    // Emit a phase=LmdbCompact update through the readiness channel before the long-running
+    // env.copy call so clients can show "Compacting LMDB" instead of a stuck progress bar.
+    publish_compaction_progress(stats_sender.as_ref(), MigrationPhase::LmdbCompact, 0, 0);
+    println!(
+        "Compacting LMDB env at {} to reclaim free pages inside data.mdb",
+        env_path.display()
+    );
+
+    let original_data = env_path.join("data.mdb");
+    let original_lock = env_path.join("lock.mdb");
+    let backup_data = env_path.join("data.mdb.bak");
+    let compact_dir = env_path.join(".compact_tmp");
+
+    // Pre-flight: ensure no stale temp directory from a previous interrupted run.
+    if compact_dir.exists() {
+        fs::remove_dir_all(&compact_dir).map_err(|e| {
+            ChainStorageError::AccessError(format!(
+                "Could not remove stale compaction tempdir {}: {e}",
+                compact_dir.display()
+            ))
+        })?;
+    }
+    fs::create_dir_all(&compact_dir).map_err(|e| {
+        ChainStorageError::AccessError(format!(
+            "Could not create compaction tempdir {}: {e}",
+            compact_dir.display()
+        ))
+    })?;
+
+    // Measure the current data.mdb size: it is the upper bound on the free disk space the
+    // compacted copy can need (the free-space pre-flight below uses it as the requirement).
+    let original_size = fs::metadata(&original_data)
+        .map_err(|e| ChainStorageError::AccessError(format!("Could not stat {}: {e}", original_data.display())))?
+        .len();
+    let pre_size_mb = original_size / BYTES_PER_MB as u64;
+    info!(
+        target: LOG_TARGET,
+        "[MIGRATIONS] Pre-compaction data.mdb size: {pre_size_mb} MB"
+    );
+    println!("[MIGRATIONS] Pre-compaction data.mdb size: {pre_size_mb} MB");
+
+    // Confirm the volume has room for the compacted copy before touching anything destructive.
+    // `mdb_env_copy2(COMPACT)` writes a brand-new file at most the size of the current data.mdb,
+    // so `original_size` is the upper bound of free space we need. Compaction is a best-effort
+    // space reclaim — the original data.mdb is fully usable as-is — so running out of disk must
+    // NEVER fail node startup. Warn clearly and continue with the un-compacted database.
+    match fs2::available_space(&env_path) {
+        Ok(available) if available < original_size => {
+            let _unused = fs::remove_dir_all(&compact_dir);
+            let available_mb = available / BYTES_PER_MB as u64;
+            warn!(
+                target: LOG_TARGET,
+                "[COMPACTION] Insufficient free disk space to compact LMDB ({available_mb} MB free, \
+                 {pre_size_mb} MB required at {}); skipping compaction and continuing normally",
+                env_path.display()
+            );
+            println!(
+                "[COMPACTION] Insufficient free disk space to compact LMDB ({available_mb} MB free, {pre_size_mb} MB \
+                 required); skipping compaction and continuing normally"
+            );
+            return Ok(db);
+        },
+        Ok(_) => {},
+        Err(e) => {
+            // Couldn't read free space (unusual). Don't block startup on a diagnostic call — the
+            // copy step below is itself non-fatal on failure and will clean up after itself.
+            warn!(
+                target: LOG_TARGET,
+                "[COMPACTION] Could not determine free disk space at {}: {e}; attempting compaction anyway",
+                env_path.display()
+            );
+        },
+    }
+
+    // Write the compacted copy. This uses an internal long-lived read transaction; we run
+    // single-threaded at startup so nothing else is writing.
+    let compacted_size = match db.compact_copy_env(&compact_dir) {
+        Ok(size) => size,
+        Err(e) => {
+            // The copy failed — most often the device running out of space mid-copy (a TOCTOU
+            // race with the pre-flight check above), but any copy error lands here. The original
+            // data.mdb is untouched — the copy writes into `.compact_tmp` — so the node continues
+            // normally with the un-compacted database. Never fail startup here.
+            warn!(
+                target: LOG_TARGET,
+                "[COMPACTION] LMDB compact-copy failed (often insufficient disk space): {e}; \
+                 skipping compaction and continuing normally with the un-compacted database"
+            );
+            println!(
+                "[COMPACTION] LMDB compact-copy failed (often insufficient disk space): {e}; skipping compaction and \
+                 continuing normally with the un-compacted database"
+            );
+            let _unused = fs::remove_dir_all(&compact_dir);
+            return Ok(db);
+        },
+    };
+    let post_size_mb = compacted_size / BYTES_PER_MB as u64;
+    info!(
+        target: LOG_TARGET,
+        "[MIGRATIONS] Compacted data.mdb size: {post_size_mb} MB (reclaimed {} MB)",
+        pre_size_mb.saturating_sub(post_size_mb)
+    );
+    // The env.copy call is monolithic, so once it returns we report 100% for the
+    // LMDB-compact phase. `current_height` and `total_height` use MB as units, which
+    // matches the progress bar shown for the JMT rebuild phase (entries, not MB) - the
+    // `phase` field tells the client which unit to render.
+    publish_compaction_progress(
+        stats_sender.as_ref(),
+        MigrationPhase::LmdbCompact,
+        pre_size_mb,
+        pre_size_mb,
+    );
+    println!(
+        "[MIGRATIONS] Compacted data.mdb size: {post_size_mb} MB (reclaimed {} MB)",
+        pre_size_mb.saturating_sub(post_size_mb)
+    );
+
+    // Drop every Arc<Environment> reference so the OS lets us swap data.mdb. `LMDBDatabase`,
+    // `LMDBStore` and the chain_storage `file_lock` together hold all of them in this process.
+    drop(db);
+    drop(lmdb_store);
+
+    // Rename data.mdb -> data.mdb.bak (atomic on the same filesystem). On Windows, the
+    // pre-existing backup is removed first because rename-over is not always atomic.
+    if backup_data.exists() {
+        fs::remove_file(&backup_data).map_err(|e| {
+            ChainStorageError::AccessError(format!(
+                "Could not remove stale backup file {}: {e}",
+                backup_data.display()
+            ))
+        })?;
+    }
+    fs::rename(&original_data, &backup_data).map_err(|e| {
+        let _unused = fs::remove_dir_all(&compact_dir);
+        ChainStorageError::AccessError(format!(
+            "Could not rename {} -> {}: {e}",
+            original_data.display(),
+            backup_data.display()
+        ))
+    })?;
+
+    // Move the compacted file into place. If this fails we restore the backup so the caller can
+    // retry the migration on a subsequent startup.
+    let new_data = compact_dir.join("data.mdb");
+    if let Err(e) = fs::rename(&new_data, &original_data) {
+        warn!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] Could not move compacted data.mdb into place: {e}; restoring backup"
+        );
+        let _unused = fs::rename(&backup_data, &original_data);
+        let _unused = fs::remove_dir_all(&compact_dir);
+        return Err(ChainStorageError::AccessError(format!(
+            "Could not rename compacted file into place: {e}"
+        )));
+    }
+
+    // Stale lock.mdb from the old env confuses some platforms; LMDB recreates it on reopen.
+    let _unused = fs::remove_file(&original_lock);
+    let _unused = fs::remove_dir_all(&compact_dir);
+
+    // Reopen against the compacted file.
+    let (new_store, new_lock) = build_lmdb_store(&env_path, config).inspect_err(|_| {
+        // Best-effort restore so the operator isn't left with a missing data.mdb.
+        if !original_data.exists() {
+            let _unused = fs::rename(&backup_data, &original_data);
+        }
+    })?;
+    let new_db = LMDBDatabase::new(&new_store, new_lock, consensus_manager, stats_sender).inspect_err(|_| {
+        if !original_data.exists() {
+            let _unused = fs::rename(&backup_data, &original_data);
+        }
+    })?;
+
+    // Everything succeeded: drop the backup. If this fails it's not fatal — operators can
+    // remove the .bak manually.
+    if let Err(e) = fs::remove_file(&backup_data) {
+        warn!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] Could not remove backup file {}: {e}",
+            backup_data.display()
+        );
+    }
+
+    info!(
+        target: LOG_TARGET,
+        "[MIGRATIONS] LMDB compaction complete: {pre_size_mb} MB -> {post_size_mb} MB"
+    );
+    println!("[MIGRATIONS] LMDB compaction complete: {pre_size_mb} MB -> {post_size_mb} MB");
+    Ok(new_db)
+}
+
+/// Push a single `DatabaseStats` update for the LMDB-compaction phase through the readiness
+/// `watch::Sender`. We can't use the in-process `LMDBStatsCollector` here because the
+/// `LMDBDatabase` owning it is dropped before the swap/reopen — the readiness handler's sender
+/// is the one channel that survives across the rebuild.
+fn publish_compaction_progress(
+    stats_sender: Option<&watch::Sender<DatabaseStats>>,
+    phase: MigrationPhase,
+    current: u64,
+    total: u64,
+) {
+    let Some(sender) = stats_sender else {
+        return;
+    };
+    // Preserve current_db_version / target_db_version / metadata so the gRPC consumer still
+    // sees the migration version transition alongside the phase update.
+    let mut stats = sender.borrow().clone();
+    stats.migration_stats.phase = phase;
+    stats.migration_stats.current_height = current;
+    stats.migration_stats.total_height = total;
+    stats.migration_stats.progress_percentage = if total > 0 {
+        (current as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    stats.last_updated = Instant::now();
+    stats.timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    if let Err(e) = sender.send(stats) {
+        warn!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] Could not publish compaction phase to readiness channel: {e}"
+        );
+    }
+}
+
 /// This is a lmdb-based blockchain database for persistent storage of the chain state.
 pub struct LMDBDatabase {
     env: Arc<Environment>,
@@ -483,6 +827,10 @@ pub struct LMDBDatabase {
     kernel_excess_sig_index: DatabaseRef,
     /// Maps kernel_mmr_size -> height
     kernel_mmr_size_index: DatabaseRef,
+    /// Maps burn_commitment -> <block_hash, mmr_pos, kernel_hash> for every burn kernel on the main chain.
+    /// Used to enforce that a burn commitment may only ever appear once in the chain. Burn commitments live
+    /// on kernels, which are never pruned, so this index is identical on archival and pruned nodes.
+    burn_commitment_index: DatabaseRef,
     /// Maps commitment -> output_hash
     utxo_commitment_index: DatabaseRef,
     /// Maps unique_id -> output_hash
@@ -526,7 +874,6 @@ pub struct LMDBDatabase {
     utxo_smt: DatabaseRef,
     jmt_value_data: DatabaseRef,
     jmt_node_data: DatabaseRef,
-    jmt_unique_key_data: DatabaseRef,
     _file_lock: Arc<File>,
     consensus_manager: BaseNodeConsensusManager,
     stats_collector: LMDBStatsCollector,
@@ -560,6 +907,7 @@ impl LMDBDatabase {
             kernel_excess_index: get_database(store, LMDB_DB_KERNEL_EXCESS_INDEX)?,
             kernel_excess_sig_index: get_database(store, LMDB_DB_KERNEL_EXCESS_SIG_INDEX)?,
             kernel_mmr_size_index: get_database(store, LMDB_DB_KERNEL_MMR_SIZE_INDEX)?,
+            burn_commitment_index: get_database(store, LMDB_DB_BURN_COMMITMENT_INDEX)?,
             utxo_commitment_index: get_database(store, LMDB_DB_UTXO_COMMITMENT_INDEX)?,
             unique_id_index: get_database(store, LMDB_DB_UNIQUE_ID_INDEX)?,
             contract_index: get_database(store, LMDB_DB_CONTRACT_ID_INDEX)?,
@@ -586,9 +934,8 @@ impl LMDBDatabase {
             validator_nodes_exit_queue: get_database(store, LMDB_DB_VALIDATOR_NODES_EXIT)?,
             template_registrations: get_database(store, LMDB_DB_TEMPLATE_REGISTRATIONS)?,
             utxo_smt: get_database(store, LMDB_DB_UTXO_SMT)?,
-            jmt_value_data: get_database(store, LMDB_DB_JMT_VALUE_DATA)?,
-            jmt_node_data: get_database(store, LMDB_DB_JMT_NODE_DATA)?,
-            jmt_unique_key_data: get_database(store, LMDB_DB_JMT_UNIQUE_KEY_DATA)?,
+            jmt_value_data: get_database(store, LMDB_DB_JMT_VALUE_DATA_V2)?,
+            jmt_node_data: get_database(store, LMDB_DB_JMT_NODE_DATA_V2)?,
             env,
             env_config: store.env_config(),
             _file_lock: Arc::new(file_lock),
@@ -604,6 +951,25 @@ impl LMDBDatabase {
         run_migrations(&mut db)?;
 
         Ok(db)
+    }
+
+    /// Copy the environment to `dest_dir` with `MDB_CP_COMPACT`. The destination directory must
+    /// already exist and be empty; the env writes `data.mdb` (and optionally `lock.mdb`) into it.
+    /// Returns the size of the freshly-compacted `data.mdb` for logging.
+    pub fn compact_copy_env(&self, dest_dir: &Path) -> Result<u64, ChainStorageError> {
+        let dest_str = dest_dir
+            .to_str()
+            .ok_or_else(|| ChainStorageError::CriticalError("compact_copy_env: non-utf8 path".to_string()))?;
+        self.env
+            .copy(dest_str, lmdb_zero::copy::COMPACT)
+            .map_err(|e| ChainStorageError::AccessError(format!("env.copy(COMPACT) failed: {e}")))?;
+        let copied = dest_dir.join("data.mdb");
+        let size = fs::metadata(&copied)
+            .map_err(|e| {
+                ChainStorageError::AccessError(format!("Could not stat compacted file {}: {e}", copied.display()))
+            })?
+            .len();
+        Ok(size)
     }
 
     /// Get a reference to the stats collector
@@ -801,12 +1167,8 @@ impl LMDBDatabase {
                         &MetadataValue::HorizonData(horizon_data.clone()),
                     )?;
                 },
-                ApplyHorizonStateTreeUpdates {
-                    previous_version,
-                    version,
-                    updates,
-                } => {
-                    self.apply_horizon_state_tree_updates(&write_txn, *previous_version, *version, updates)?;
+                ApplyHorizonStateTreeUpdates { updates } => {
+                    self.apply_horizon_state_tree_updates(&write_txn, updates)?;
                 },
                 InsertBadBlock { hash, height, reason } => {
                     self.insert_bad_block_and_cleanup(&write_txn, hash, *height, reason.to_string())?;
@@ -841,7 +1203,7 @@ impl LMDBDatabase {
         Ok(())
     }
 
-    fn all_dbs(&self) -> [(&'static str, &DatabaseRef); 35] {
+    fn all_dbs(&self) -> [(&'static str, &DatabaseRef); 34] {
         [
             (LMDB_DB_METADATA, &self.metadata_db),
             (LMDB_DB_HEADERS, &self.headers_db),
@@ -890,9 +1252,8 @@ impl LMDBDatabase {
             (LMDB_DB_VALIDATOR_NODES_EXIT, &self.validator_nodes_exit_queue),
             (LMDB_DB_TEMPLATE_REGISTRATIONS, &self.template_registrations),
             (LMDB_DB_UTXO_SMT, &self.utxo_smt),
-            (LMDB_DB_JMT_VALUE_DATA, &self.jmt_value_data),
-            (LMDB_DB_JMT_NODE_DATA, &self.jmt_node_data),
-            (LMDB_DB_JMT_UNIQUE_KEY_DATA, &self.jmt_unique_key_data),
+            (LMDB_DB_JMT_VALUE_DATA_V2, &self.jmt_value_data),
+            (LMDB_DB_JMT_NODE_DATA_V2, &self.jmt_node_data),
         ]
     }
 
@@ -920,13 +1281,23 @@ impl LMDBDatabase {
 
         // Generate PayRef and add to index
         let payref = Self::generate_payment_reference_for_output(header_hash, &output_hash);
-        lmdb_insert(
-            txn,
-            &self.payref_to_output_index,
-            payref.as_slice(),
-            &output_hash,
-            "payref_to_output_index",
-        )?;
+        let payref_needs_to_be_inserted = if header_height == 0 {
+            // this is a special edge case where we are reinserting genesis outputs that where spent, their payref might
+            // already exist, so let's delete it first, then we can readd it safely
+            let exists = lmdb_exists(txn, &self.payref_to_output_index, payref.as_slice())?;
+            !exists
+        } else {
+            true
+        };
+        if payref_needs_to_be_inserted {
+            lmdb_insert(
+                txn,
+                &self.payref_to_output_index,
+                payref.as_slice(),
+                &output_hash,
+                "payref_to_output_index",
+            )?;
+        }
 
         lmdb_insert(
             txn,
@@ -1006,6 +1377,17 @@ impl LMDBDatabase {
             &(*header_hash, mmr_position, hash),
             "kernel_excess_sig_index",
         )?;
+        if kernel.is_burned() &&
+            let Some(burn_commitment) = kernel.burn_commitment.as_ref()
+        {
+            lmdb_insert(
+                txn,
+                &self.burn_commitment_index,
+                burn_commitment.as_bytes(),
+                &(*header_hash, mmr_position, hash),
+                "burn_commitment_index",
+            )?;
+        }
 
         lmdb_insert(
             txn,
@@ -1353,22 +1735,12 @@ impl LMDBDatabase {
             .fetch_height_from_hash(write_txn, block_hash)
             .or_not_found("Block", "hash", hash_hex)?;
         let next_height = height.saturating_add(1);
-        let prev_height = height.saturating_sub(1);
         if self.fetch_block_accumulated_data(write_txn, next_height)?.is_some() {
             return Err(ChainStorageError::InvalidOperation(format!(
                 "Attempted to delete block at height {height} while next block still exists"
             )));
         }
 
-        let smt_writer = LmdbTreeWriter::new(
-            write_txn,
-            self.jmt_node_data.clone(),
-            self.jmt_value_data.clone(),
-            self.jmt_unique_key_data.clone(),
-        );
-        smt_writer
-            .delete_all_for_version(height)
-            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
         lmdb_delete(
             write_txn,
             &self.block_accumulated_data_db,
@@ -1378,27 +1750,6 @@ impl LMDBDatabase {
 
         self.delete_block_inputs_outputs(write_txn, block_hash, height)?;
 
-        let new_tip_header = self.fetch_chain_header_by_height(prev_height)?;
-        let reader = LmdbTreeReader::new(write_txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
-        let jmt = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
-
-        let root = jmt
-            .get_root_hash(new_tip_header.header().height)
-            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
-
-        if root.0.as_slice() != new_tip_header.header().output_mr.as_slice() {
-            error!(
-                target: LOG_TARGET,
-                "Deleting block, new smt root(#{}) did not match expected (#{}) smt root",
-                    hex::encode(root.0.as_slice()),
-                    new_tip_header.header().output_mr.to_hex(),
-            );
-            return Err(ChainStorageError::InvalidOperation(format!(
-                "Deleting block, new smt root(#{}) did not match expected (#{}) smt root",
-                hex::encode(root.0.as_slice()),
-                new_tip_header.header().output_mr.to_hex(),
-            )));
-        }
         self.delete_block_kernels(write_txn, block_hash.as_slice())?;
 
         Ok(())
@@ -1411,13 +1762,16 @@ impl LMDBDatabase {
         block_hash: &HashOutput,
         height: u64,
     ) -> Result<(), ChainStorageError> {
+        let smt_reader = LmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_value_data.clone());
+
+        let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&smt_reader);
         let output_rows =
             lmdb_delete_keys_starting_with::<TransactionOutputRowData>(txn, &self.utxos_db, block_hash.as_slice())?;
         debug!(target: LOG_TARGET, "Deleted {} outputs...", output_rows.len());
         let inputs =
             lmdb_delete_keys_starting_with::<TransactionInputRowData>(txn, &self.inputs_db, block_hash.as_slice())?;
         debug!(target: LOG_TARGET, "Deleted {} input(s)...", inputs.len());
-
+        let mut batch = Vec::new();
         let constants = self.get_consensus_constants(height);
 
         for (_, utxo) in &output_rows {
@@ -1498,6 +1852,15 @@ impl LMDBDatabase {
                 continue;
             }
 
+            let smt_key = KeyHash(
+                utxo.output
+                    .commitment()
+                    .as_bytes()
+                    .try_into()
+                    .expect("Key hash is always 32 bytes"),
+            );
+            batch.push((smt_key, None));
+
             // Delete the output from the UTXO commitment index
             lmdb_delete(
                 txn,
@@ -1532,6 +1895,18 @@ impl LMDBDatabase {
                 }
             })?;
 
+            let smt_key = KeyHash(
+                utxo_mined_info
+                    .output
+                    .commitment
+                    .as_bytes()
+                    .try_into()
+                    .expect("Key hash is always 32 bytes"),
+            );
+
+            let smt_node = utxo_mined_info.output.smt_hash(utxo_mined_info.mined_height).to_vec();
+            batch.push((smt_key, Some(smt_node)));
+
             input.add_output_data(utxo_mined_info.output);
 
             lmdb_insert(
@@ -1543,6 +1918,43 @@ impl LMDBDatabase {
             )?;
             trace!(target: LOG_TARGET, "Input moved to UTXO set: {input}");
         }
+        let k = MetadataKey::JMTVersion;
+        let val = match lmdb_get(txn, &self.metadata_db, &k.as_u32())? {
+            Some(MetadataValue::JMTVersion(v)) => v + 1,
+            _ => 0u64,
+        };
+
+        let prev_height = height.saturating_sub(1);
+        let new_tip_header = self.fetch_chain_header_by_height(prev_height)?;
+        let (root, ops) = output_smt
+            .put_value_set(batch, val)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+        if root.0.as_slice() != new_tip_header.header().output_mr.as_slice() {
+            error!(
+                target: LOG_TARGET,
+                "Deleting block, new smt root(#{}) did not match expected (#{}) smt root",
+                    hex::encode(root.0.as_slice()),
+                    new_tip_header.header().output_mr.to_hex(),
+            );
+            return Err(ChainStorageError::InvalidOperation(format!(
+                "Deleting block, new smt root(#{}) did not match expected (#{}) smt root",
+                hex::encode(root.0.as_slice()),
+                new_tip_header.header().output_mr.to_hex(),
+            )));
+        }
+        let smt_writer = LmdbTreeWriter::new(
+            txn,
+            self.jmt_node_data.clone(),
+            self.jmt_value_data.clone(),
+            self.metadata_db.clone(),
+        );
+        smt_writer
+            .write_node_batch(&ops.node_batch)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+        smt_writer
+            .cleanup_stale(&ops.stale_node_index_batch)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+
         Ok(())
     }
 
@@ -1575,6 +1987,12 @@ impl LMDBDatabase {
                 excess_sig_key.as_slice(),
                 "kernel_excess_sig_index",
             )?;
+            // Remove the burn commitment index entry, but only if it still points at the kernel being deleted.
+            if kernel.kernel.is_burned() &&
+                let Some(burn_commitment) = kernel.kernel.burn_commitment.as_ref()
+            {
+                lmdb_delete_if_exists(txn, &self.burn_commitment_index, burn_commitment.as_bytes())?;
+            }
         }
         Ok(())
     }
@@ -1649,7 +2067,7 @@ impl LMDBDatabase {
         header: &BlockHeader,
         body: AggregateBody,
     ) -> Result<(), ChainStorageError> {
-        let smt_reader = LmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let smt_reader = LmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_value_data.clone());
         let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&smt_reader);
         if self.fetch_block_accumulated_data(txn, header.height + 1)?.is_some() {
             return Err(ChainStorageError::InvalidOperation(format!(
@@ -1681,6 +2099,32 @@ impl LMDBDatabase {
                 hash.to_hex(),
                 block_hash.to_hex()
             )));
+        }
+        // We make this 1 to circumvent networks thats dont have genesis funds, as they will only have a jmt root from
+        // height 1
+        if header.height > 1 {
+            let k = MetadataKey::JMTVersion;
+            let current_jmt_version = match lmdb_get(txn, &self.metadata_db, &k.as_u32())? {
+                Some(MetadataValue::JMTVersion(v)) => v,
+                _ => 0u64,
+            };
+            let root = output_smt
+                .get_root_hash(current_jmt_version)
+                .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+            let prev_header = lmdb_get::<_, BlockHeader>(txn, &self.headers_db, &(header.height - 1)).or_not_found(
+                "BlockHeader",
+                "height",
+                (header.height - 1).to_string(),
+            )?;
+            if prev_header.output_mr.as_slice() != root.0.as_slice() {
+                return Err(ChainStorageError::InvalidOperation(format!(
+                    "The output merkle root of the current tip header at height {} does not match the stored JMT \
+                     root. Header: {}, calculated: {}",
+                    prev_header.height,
+                    prev_header.output_mr.to_hex(),
+                    hex::encode(root.0.as_slice())
+                )));
+            }
         }
 
         let (inputs, outputs, kernels) = body.dissolve();
@@ -1777,9 +2221,13 @@ impl LMDBDatabase {
                 input_with_output_data,
             )?;
         }
-
+        let k = MetadataKey::JMTVersion;
+        let val = match lmdb_get(txn, &self.metadata_db, &k.as_u32())? {
+            Some(MetadataValue::JMTVersion(v)) => v + 1,
+            _ => 0u64,
+        };
         let (root, ops) = output_smt
-            .put_value_set(batch, header.height)
+            .put_value_set(batch, val)
             .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
         if header.output_mr.as_slice() != root.0.as_slice() {
@@ -1803,10 +2251,14 @@ impl LMDBDatabase {
             txn,
             self.jmt_node_data.clone(),
             self.jmt_value_data.clone(),
-            self.jmt_unique_key_data.clone(),
+            self.metadata_db.clone(),
         );
+
         smt_writer
             .write_node_batch(&ops.node_batch)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+        smt_writer
+            .cleanup_stale(&ops.stale_node_index_batch)
             .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
         self.insert_block_accumulated_data(
@@ -2086,7 +2538,7 @@ impl LMDBDatabase {
         output_hash: &HashOutput,
     ) -> Result<(), ChainStorageError> {
         let payref = Self::generate_payment_reference_for_output(header_hash, output_hash);
-        debug!(target: LOG_TARGET, "Pruning output from 'payref_to_output_index': key '{}'", payref.to_hex());
+        trace!(target: LOG_TARGET, "Pruning output from 'payref_to_output_index': key '{}'", payref.to_hex());
         match lmdb_delete(
             write_txn,
             &self.payref_to_output_index,
@@ -2114,7 +2566,7 @@ impl LMDBDatabase {
             let input = input_data.input;
             // From 'utxo_commitment_index::utxo_commitment_index'
             if let SpentOutput::OutputData { commitment, .. } = input.spent_output.clone() {
-                debug!(target: LOG_TARGET, "Pruning output from 'utxo_commitment_index': key '{}'", commitment.to_hex());
+                trace!(target: LOG_TARGET, "Pruning output from 'utxo_commitment_index': key '{}'", commitment.to_hex());
                 lmdb_delete(
                     write_txn,
                     &self.utxo_commitment_index,
@@ -2129,13 +2581,13 @@ impl LMDBDatabase {
             {
                 let header_hash = Self::header_hash_from_output_index_key(&key_bytes)?;
                 let key = OutputKey::new(&header_hash, &output_hash)?;
-                debug!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
+                trace!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
                 lmdb_delete(write_txn, &self.utxos_db, &key.convert_to_comp_key(), LMDB_DB_UTXOS)?;
 
                 self.delete_payref_index_entry(write_txn, &header_hash, &output_hash)?;
             };
             // From 'txos_hash_to_index_db::utxos_db'
-            debug!(
+            trace!(
                 target: LOG_TARGET,
                 "Pruning output from 'txos_hash_to_index_db': key '{}'",
                 output_hash.to_hex()
@@ -2145,6 +2597,11 @@ impl LMDBDatabase {
                 &self.txos_hash_to_index_db,
                 output_hash.as_slice(),
                 LMDB_DB_UTXOS,
+            )?;
+            lmdb_delete_if_exists(
+                write_txn,
+                &self.deleted_txo_hash_to_header_index,
+                output_hash.as_slice(),
             )?;
         }
 
@@ -2161,7 +2618,7 @@ impl LMDBDatabase {
         match lmdb_get::<_, Vec<u8>>(write_txn, &self.txos_hash_to_index_db, output_hash.as_slice())? {
             Some(key_bytes) => {
                 if !matches!(output_type, OutputType::Burn) {
-                    debug!(target: LOG_TARGET, "Pruning output from 'utxo_commitment_index': key '{}'", commitment.to_hex());
+                    trace!(target: LOG_TARGET, "Pruning output from 'utxo_commitment_index': key '{}'", commitment.to_hex());
                     lmdb_delete(
                         write_txn,
                         &self.utxo_commitment_index,
@@ -2169,19 +2626,23 @@ impl LMDBDatabase {
                         "utxo_commitment_index",
                     )?;
                 }
-                debug!(target: LOG_TARGET, "Pruning output from 'txos_hash_to_index_db': key '{}'", output_hash.to_hex());
+                trace!(target: LOG_TARGET, "Pruning output from 'txos_hash_to_index_db': key '{}'", output_hash.to_hex());
                 lmdb_delete(
                     write_txn,
                     &self.txos_hash_to_index_db,
                     output_hash.as_slice(),
                     LMDB_DB_UTXOS,
                 )?;
+                lmdb_delete_if_exists(
+                    write_txn,
+                    &self.deleted_txo_hash_to_header_index,
+                    output_hash.as_slice(),
+                )?;
 
                 let header_hash = Self::header_hash_from_output_index_key(&key_bytes)?;
                 let key = OutputKey::new(&header_hash, output_hash)?;
-                debug!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
+                trace!(target: LOG_TARGET, "Pruning output from 'utxos_db': key '{}'", key.0);
                 lmdb_delete(write_txn, &self.utxos_db, &key.convert_to_comp_key(), LMDB_DB_UTXOS)?;
-
                 self.delete_payref_index_entry(write_txn, &header_hash, output_hash)?;
             },
             None => {
@@ -2201,35 +2662,15 @@ impl LMDBDatabase {
     fn apply_horizon_state_tree_updates(
         &self,
         write_txn: &WriteTransaction<'_>,
-        previous_version: u64,
-        version: u64,
         updates: &[HorizonStateTreeUpdate],
     ) -> Result<(), ChainStorageError> {
-        let reader = LmdbTreeReader::new(write_txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let reader = LmdbTreeReader::new(write_txn, self.jmt_node_data.clone(), self.jmt_value_data.clone());
         let writer = LmdbTreeWriter::new(
             write_txn,
             self.jmt_node_data.clone(),
             self.jmt_value_data.clone(),
-            self.jmt_unique_key_data.clone(),
+            self.metadata_db.clone(),
         );
-
-        // if the previous committed version is not contiguous with the new version,
-        // write a bridge root node at (version - 1) that copies the root from previous_version
-        if version > 0 && previous_version != version.saturating_sub(1) {
-            let empty_path: NibblePath = std::iter::empty().collect();
-            let prev_root_key = NodeKey::new(previous_version, empty_path.clone());
-            let bridge_key = NodeKey::new(version - 1, empty_path);
-
-            let old_root = reader
-                .get_node_option(&prev_root_key)
-                .map_err(|e| ChainStorageError::CriticalError(e.to_string()))?;
-
-            if let Some(root_node) = old_root {
-                writer
-                    .put_node(&bridge_key, &root_node)
-                    .map_err(|e| ChainStorageError::CriticalError(e.to_string()))?;
-            }
-        }
 
         let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
         let batch = updates
@@ -2237,12 +2678,20 @@ impl LMDBDatabase {
             .map(|update| (KeyHash(update.key.into_array()), update.value.map(|v| v.to_vec())))
             .collect::<Vec<_>>();
 
+        let k = MetadataKey::JMTVersion;
+        let val = match lmdb_get(write_txn, &self.metadata_db, &k.as_u32())? {
+            Some(MetadataValue::JMTVersion(v)) => v + 1,
+            _ => 0u64,
+        };
         let (_root, ops) = output_smt
-            .put_value_set(batch, version)
+            .put_value_set(batch, val)
             .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
         writer
             .write_node_batch(&ops.node_batch)
+            .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+        writer
+            .cleanup_stale(&ops.stale_node_index_batch)
             .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
         Ok(())
@@ -2530,7 +2979,7 @@ impl LMDBDatabase {
             txn,
             self.jmt_node_data.clone(),
             self.jmt_value_data.clone(),
-            self.jmt_unique_key_data.clone(),
+            self.metadata_db.clone(),
         )
     }
 }
@@ -2565,12 +3014,16 @@ fn acquire_exclusive_file_lock(db_path: &Path) -> Result<File, ChainStorageError
 }
 
 impl BlockchainBackend for LMDBDatabase {
-    fn create_smt_reader(&self) -> Result<OwnedLmdbTreeReader<'_>, ChainStorageError> {
+    fn create_smt_reader(&self) -> Result<(OwnedLmdbTreeReader<'_>, u64), ChainStorageError> {
         let read_tx = self.read_transaction()?;
-        let smt_reader =
-            OwnedLmdbTreeReader::new(read_tx, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let k = MetadataKey::JMTVersion;
+        let val = match lmdb_get(&read_tx, &self.metadata_db, &k.as_u32())? {
+            Some(MetadataValue::JMTVersion(v)) => v,
+            _ => 0u64,
+        };
+        let smt_reader = OwnedLmdbTreeReader::new(read_tx, self.jmt_node_data.clone(), self.jmt_value_data.clone());
 
-        Ok(smt_reader)
+        Ok((smt_reader, val))
     }
 
     fn write(&mut self, txn: DbTransaction) -> Result<(), ChainStorageError> {
@@ -2578,29 +3031,29 @@ impl BlockchainBackend for LMDBDatabase {
             return Ok(());
         }
 
-        // Ensure there will be enough space in the database to insert the block and replace the SMT before it is
-        // attempted; this is more efficient than relying on an error if the LMDB environment map size was reached with
-        // the write operation, with cleanup, resize and re-try afterwards.
-        let block_operations = txn.operations().iter().filter(|op| {
-            matches!(op, WriteOperation::InsertOrphanBlock { .. }) ||
-                matches!(op, WriteOperation::InsertTipBlockBody { .. }) ||
-                matches!(op, WriteOperation::InsertChainOrphanBlock { .. })
-        });
-        let count = block_operations.count();
-        if count > 0 {
-            let (mapsize, size_used_bytes, size_left_bytes) = LMDBStore::get_stats(&self.env)?;
-            trace!(
-                target: LOG_TARGET,
-                "[apply_db_transaction] Block insert operations: {}, mapsize: {} MB, used: {} MB, remaining: {} MB",
-                count, mapsize / BYTES_PER_MB, size_used_bytes / BYTES_PER_MB, size_left_bytes / BYTES_PER_MB
-            );
-            unsafe {
-                LMDBStore::resize_if_required(
-                    &self.env,
-                    &self.env_config,
-                    Some(max(self.env_config.grow_size_bytes(), 128 * BYTES_PER_MB)),
-                )?;
-            }
+        // Ensure there will be enough space in the database to apply the whole transaction (and, for a
+        // block, replace the SMT) before it is attempted; this is more efficient than relying on an error
+        // if the LMDB environment map size was reached mid-write, with cleanup, resize and re-try
+        // afterwards. Sizing from the estimated transaction bytes plus a fixed margin lets large writes -
+        // block bodies as well as bulk output/kernel batches from blockchain/horizon sync, which carry no
+        // block-insert operation - grow the map in a single resize instead of resize-and-replaying the
+        // whole transaction several times.
+        let estimated_txn_bytes = txn.estimated_serialized_size();
+        let headroom = estimated_txn_bytes.saturating_add(TXN_RESIZE_SAFETY_MARGIN_BYTES);
+        let (mapsize, size_used_bytes, size_left_bytes) = LMDBStore::get_stats(&self.env)?;
+        trace!(
+            target: LOG_TARGET,
+            "[apply_db_transaction] {} operation(s), mapsize: {} MB, used: {} MB, remaining: {} MB, estimated txn: {} \
+             MB, headroom: {} MB",
+            txn.operations().len(),
+            mapsize / BYTES_PER_MB,
+            size_used_bytes / BYTES_PER_MB,
+            size_left_bytes / BYTES_PER_MB,
+            estimated_txn_bytes / BYTES_PER_MB,
+            headroom / BYTES_PER_MB
+        );
+        unsafe {
+            LMDBStore::resize_if_required(&self.env, &self.env_config, Some(headroom))?;
         }
 
         let mark = Instant::now();
@@ -2705,9 +3158,19 @@ impl BlockchainBackend for LMDBDatabase {
 
     fn contains(&self, key: &DbKey) -> Result<bool, ChainStorageError> {
         let txn = self.read_transaction()?;
+        let tip_height = self.fetch_chain_metadata()?.best_block_height();
         Ok(match key {
-            DbKey::HeaderHeight(k) => lmdb_exists(&txn, &self.headers_db, k)?,
-            DbKey::HeaderHash(h) => lmdb_exists(&txn, &self.block_hashes_db, h.deref())?,
+            DbKey::HeaderHeight(k) => {
+                let exist = lmdb_exists(&txn, &self.headers_db, k)?;
+                exist & (tip_height >= *k)
+            },
+            DbKey::HeaderHash(h) => {
+                let height: u64 = match lmdb_get(&txn, &self.block_hashes_db, h.deref())? {
+                    Some(height) => height,
+                    None => return Ok(false),
+                };
+                height <= tip_height
+            },
             DbKey::OrphanBlock(k) => lmdb_exists(&txn, &self.orphans_db, k.deref())?,
         })
     }
@@ -2890,6 +3353,26 @@ impl BlockchainBackend for LMDBDatabase {
         key.extend(excess_sig.get_signature().as_bytes());
         if let Some((header_hash, mmr_position, hash)) =
             lmdb_get::<_, (HashOutput, u64, HashOutput)>(&txn, &self.kernel_excess_sig_index, key.as_slice())?
+        {
+            let key = KernelKey::try_from_parts(&[
+                header_hash.as_slice(),
+                mmr_position.to_be_bytes().as_slice(),
+                hash.as_slice(),
+            ])?;
+            Ok(lmdb_get(&txn, &self.kernels_db, &key)?
+                .map(|kernel: TransactionKernelRowData| (kernel.kernel, header_hash)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn fetch_kernel_by_burn_commitment(
+        &self,
+        burn_commitment: &CompressedCommitment,
+    ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError> {
+        let txn = self.read_transaction()?;
+        if let Some((header_hash, mmr_position, hash)) =
+            lmdb_get::<_, (HashOutput, u64, HashOutput)>(&txn, &self.burn_commitment_index, burn_commitment.as_bytes())?
         {
             let key = KernelKey::try_from_parts(&[
                 header_hash.as_slice(),
@@ -3101,6 +3584,21 @@ impl BlockchainBackend for LMDBDatabase {
         }
     }
 
+    // Returns the burn commitment index rebuild status.
+    fn fetch_burn_commitment_rebuild_status(&self) -> Result<BurnCommitmentRebuildStatus, ChainStorageError> {
+        let txn = self.read_transaction()?;
+
+        let val: Option<MetadataValue> = lmdb_get(
+            &txn,
+            &self.metadata_db,
+            &MetadataKey::BurnCommitmentRebuildStatus.as_u32(),
+        )?;
+        match val {
+            Some(MetadataValue::BurnCommitmentRebuildStatus(status)) => Ok(status),
+            _ => Ok(BurnCommitmentRebuildStatus::default()),
+        }
+    }
+
     // Updates the stored blockchain consistency check status, maintaining currently active values where applicable, or
     // creating a default set if it does not exist yet.
     fn update_accumulated_data_check_status(
@@ -3186,6 +3684,63 @@ impl BlockchainBackend for LMDBDatabase {
         if height.is_multiple_of(50) {
             self.update_stats_progress(height);
         }
+
+        write_txn.commit()?;
+
+        Ok(status)
+    }
+
+    // Builds the burn commitment index entries for all burn kernels in the block at the given height, and persists the
+    // rebuild status. Mirrors `build_payref_indexes_for_height` but keyed on kernels rather than outputs.
+    fn build_burn_commitment_index_for_height(
+        &self,
+        height: u64,
+        finalize: bool,
+    ) -> Result<BurnCommitmentRebuildStatus, ChainStorageError> {
+        unsafe {
+            LMDBStore::resize_if_required(&self.env, &self.env_config, None)?;
+        }
+        let write_txn = self.write_transaction()?;
+        let best_block_height = self.fetch_chain_metadata()?.best_block_height();
+        if height > best_block_height {
+            return Err(ChainStorageError::InvalidOperation(format!(
+                "Cannot build burn commitment index for height {height} which is greater than the current best block \
+                 height {best_block_height}"
+            )));
+        }
+
+        // Fetch the kernel rows for this block (the row carries the mmr_position needed for the index value).
+        let binding = self.fetch_chain_header_by_height(height)?;
+        let block_hash = binding.header().hash();
+        let kernels: Vec<(Vec<u8>, TransactionKernelRowData)> =
+            lmdb_fetch_matching_after(&write_txn, &self.kernels_db, block_hash.as_slice())?;
+
+        for (_, row) in &kernels {
+            // Mirror the live insert predicate: only burn kernels are indexed.
+            if row.kernel.is_burned() &&
+                let Some(burn_commitment) = row.kernel.burn_commitment.as_ref()
+            {
+                lmdb_replace(
+                    &write_txn,
+                    &self.burn_commitment_index,
+                    burn_commitment.as_bytes(),
+                    &(row.header_hash, row.mmr_position, row.hash),
+                    None,
+                )?;
+            }
+        }
+
+        let status = BurnCommitmentRebuildStatus {
+            is_rebuilt: finalize || height == best_block_height,
+            last_rebuild_height: Some(height),
+        };
+        lmdb_replace(
+            &write_txn,
+            &self.metadata_db,
+            &MetadataKey::BurnCommitmentRebuildStatus.as_u32(),
+            &MetadataValue::BurnCommitmentRebuildStatus(status.clone()),
+            None,
+        )?;
 
         write_txn.commit()?;
 
@@ -3450,20 +4005,22 @@ impl BlockchainBackend for LMDBDatabase {
         }
     }
 
-    fn verify_horizon_sync_output_root(
-        &self,
-        version: u64,
-        expected_root: HashOutput,
-    ) -> Result<(), ChainStorageError> {
+    fn verify_horizon_sync_output_root(&self, expected_root: HashOutput) -> Result<(), ChainStorageError> {
         let txn = self.read_transaction()?;
-        let reader = OwnedLmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_unique_key_data.clone());
+        let k = MetadataKey::JMTVersion;
+        let val = match lmdb_get(&txn, &self.metadata_db, &k.as_u32())? {
+            Some(MetadataValue::JMTVersion(v)) => v,
+            _ => 0u64,
+        };
+
+        let reader = OwnedLmdbTreeReader::new(txn, self.jmt_node_data.clone(), self.jmt_value_data.clone());
         let output_smt = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
         let root = output_smt
-            .get_root_hash(version)
+            .get_root_hash(val)
             .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
         if root.0.as_slice() != expected_root.as_slice() {
             return Err(ChainStorageError::InvalidOperation(format!(
-                "Horizon sync output root mismatch at version {version}. Expected {}, got {}",
+                "Horizon sync output root mismatch at version {val}. Expected {}, got {}",
                 expected_root.to_hex(),
                 root.0.to_hex()
             )));
@@ -4094,6 +4651,8 @@ pub enum MetadataKey {
     AccumulatedDataCheckStatus,
     BlockchainConsistencyCheckStatus,
     HorizonSyncOutputCheckpoint,
+    JMTVersion,
+    BurnCommitmentRebuildStatus,
 }
 
 impl MetadataKey {
@@ -4119,6 +4678,8 @@ impl fmt::Display for MetadataKey {
             MetadataKey::AccumulatedDataCheckStatus => write!(f, "Accumulated data check status"),
             MetadataKey::BlockchainConsistencyCheckStatus => write!(f, "Blockchain check status"),
             MetadataKey::HorizonSyncOutputCheckpoint => write!(f, "Horizon sync output checkpoint"),
+            MetadataKey::JMTVersion => write!(f, "JMT written version"),
+            MetadataKey::BurnCommitmentRebuildStatus => write!(f, "Burn commitment index rebuild status"),
         }
     }
 }
@@ -4140,6 +4701,18 @@ pub struct PayrefRebuildStatus {
 pub struct AccumulatedDataRebuildStatus {
     /// Whether accumulated data has been rebuilt fully - it only need to be rebuilt once
     /// and up to the current chain height. This will automatically be added to new blocks.
+    pub is_rebuilt: bool,
+    /// The height of the block at which the last rebuild was done
+    pub last_rebuild_height: Option<u64>,
+}
+
+/// Burn commitment index rebuild status - for new base nodes or once rebuilt, this will be set to true.
+/// The burn commitment index is built in a background task from existing kernels so that node startup is not blocked;
+/// new blocks populate the index automatically via the live insert path.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct BurnCommitmentRebuildStatus {
+    /// Whether the burn commitment index has been rebuilt fully - it only needs to be rebuilt once and up to the
+    /// current chain height.
     pub is_rebuilt: bool,
     /// The height of the block at which the last rebuild was done
     pub last_rebuild_height: Option<u64>,
@@ -4310,6 +4883,8 @@ pub enum MetadataValue {
     AccumulatedDataRebuildStatus(AccumulatedDataRebuildStatus),
     BlockchainCheckStatus(BlockchainCheckStatus),
     HorizonSyncOutputCheckpoint(HorizonSyncOutputCheckpoint),
+    JMTVersion(u64),
+    BurnCommitmentRebuildStatus(BurnCommitmentRebuildStatus),
 }
 
 impl fmt::Display for MetadataValue {
@@ -4337,6 +4912,10 @@ impl fmt::Display for MetadataValue {
                 "Horizon sync output checkpoint at height {} targeting height {}",
                 cp.checkpoint_height, cp.sync_target_height
             ),
+            MetadataValue::JMTVersion(version) => write!(f, "JMT version is {version}"),
+            MetadataValue::BurnCommitmentRebuildStatus(status) => {
+                write!(f, "Burn commitment index has been rebuilt - {}", status.is_rebuilt)
+            },
         }
     }
 }
@@ -4345,7 +4924,7 @@ impl fmt::Display for MetadataValue {
 fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
     let _unused = verify_metadata_keys(db);
 
-    const MIGRATION_VERSION: u64 = 6;
+    const MIGRATION_VERSION: u64 = 8;
     db.stats_collector().set_target_db_version(MIGRATION_VERSION);
     let txn = db.read_transaction()?;
     let k = MetadataKey::MigrationVersion;
@@ -4655,6 +5234,64 @@ fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
             write_txn.commit()?;
         }
 
+        // MIGRATION: Rebuild the JMT on disk. The v1 layout used three databases
+        // (jmt_value_data, jmt_node_data, jmt_unique_key_data) with key encodings and stored
+        // payloads that are incompatible with v2 (which uses jmt_values_data + jmt_nodes_data).
+        // Rather than translating the old data, we re-derive the JMT from the canonical UTXO set:
+        // insert every unspent UTXO into a fresh tree, write it to the v2 tables, then drop the
+        // legacy tables entirely so their pages return to disk. The pages freed by dropping the
+        // legacy tables stay inside data.mdb until the env is compact-copied, which is now
+        // handled by the file-fragmentation check in `open_lmdb_database_with_compaction` rather
+        // than a migration-side flag.
+        if migrate_from_version == 6 {
+            migrate_jmt_v1_to_v2(db)?;
+        }
+
+        // MIGRATION: Populate the burn commitment index from the existing kernels. The unique-burn-commitment consensus
+        // rule looks up new burns in this index, so already-synced databases must have it populated from their
+        // historical kernels before the rule can be enforced. To avoid blocking node startup we do not build it inline
+        // here; instead we (re)set the rebuild status so the `rebuild_burn_commitment_index_background_task`
+        // repopulates it asynchronously. Kernels (and therefore burn commitments) are retained permanently even
+        // by pruned nodes, so this produces an identical index on archival and pruned nodes.
+        if migrate_from_version == 7 {
+            let write_txn = db.write_transaction()?;
+            match fetch_chain_height(&write_txn, &db.metadata_db) {
+                Ok(_) => {
+                    // Existing database: reset the status to the default so the background task runs and backfills the
+                    // index from the historical kernels.
+                    info!(
+                        target: LOG_TARGET,
+                        "[MIGRATIONS] v{migrate_from_version}: Resetting burn commitment index rebuild status to enable the background task to run"
+                    );
+                    lmdb_replace(
+                        &write_txn,
+                        &db.metadata_db,
+                        &MetadataKey::BurnCommitmentRebuildStatus.as_u32(),
+                        &MetadataValue::BurnCommitmentRebuildStatus(BurnCommitmentRebuildStatus::default()),
+                        None,
+                    )?;
+                },
+                Err(_) => {
+                    // New database: there is nothing to backfill, so mark the index as already rebuilt.
+                    info!(
+                        target: LOG_TARGET,
+                        "[MIGRATIONS] v{migrate_from_version}: Setting burn commitment index rebuild status as rebuilt for new blockchains"
+                    );
+                    lmdb_replace(
+                        &write_txn,
+                        &db.metadata_db,
+                        &MetadataKey::BurnCommitmentRebuildStatus.as_u32(),
+                        &MetadataValue::BurnCommitmentRebuildStatus(BurnCommitmentRebuildStatus {
+                            is_rebuilt: true,
+                            last_rebuild_height: None,
+                        }),
+                        None,
+                    )?;
+                },
+            }
+            write_txn.commit()?;
+        }
+
         // Let's update the migration version
         {
             let migrated_to_version = migrate_from_version + 1;
@@ -4673,6 +5310,461 @@ fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
         }
     }
     Ok(())
+}
+
+/// Rebuild the JMT from the canonical UTXO set under the new v2 layout and drop the legacy
+/// v1 databases.
+///
+/// The v1 (`jmt_value_data`, `jmt_node_data`, `jmt_unique_key_data`) and v2
+/// (`jmt_values_data`, `jmt_nodes_data`) tables differ in both key encoding *and* stored payload,
+/// so the rows cannot be copied across. Instead this migration:
+///
+/// 1. Walks `utxo_commitment_index` to enumerate every unspent UTXO commitment.
+/// 2. Splits the commitments into fixed-size chunks. For each chunk we resolve the mined output, compute
+///    `output.smt_hash(mined_height)`, and apply the chunk as one JMT version in its own write transaction so the LMDB
+///    env can resize between commits.
+/// 3. The chunked write transactions are wrapped in a retry loop that reacts to `DbResizeRequired` by growing the LMDB
+///    map and reapplying the failed chunk.
+/// 4. Deletes the three legacy v1 tables with `Database::delete` so their pages are reclaimed.
+///
+/// On a fresh database (no v1 tables present) the function is a no-op.
+///
+/// Number of LMDB rows written per write transaction when flushing the rebuilt JMT to disk.
+/// Smaller chunks bound the LMDB map growth per commit; the migration runs single-threaded so no
+/// other writers are blocked on these commits.
+const JMT_MIGRATION_LMDB_WRITE_CHUNK: usize = 50_000;
+
+#[allow(clippy::too_many_lines)]
+fn migrate_jmt_v1_to_v2(db: &mut LMDBDatabase) -> Result<bool, ChainStorageError> {
+    info!(target: LOG_TARGET, "[MIGRATIONS] v6: Starting JMT v1 → v2 rebuild");
+
+    // Open the legacy v1 databases by name. We deliberately avoid registering these in
+    // `build_lmdb_store` so that fresh nodes don't create them and migrated nodes can drop them
+    // permanently.
+    let open_v1 = |name: &'static str| -> Result<Option<Database<'static>>, ChainStorageError> {
+        match Database::open(db.env.clone(), Some(name), &DatabaseOptions::defaults()) {
+            Ok(opened) => Ok(Some(opened)),
+            Err(LmdbError::Code(code)) if code == NOTFOUND => Ok(None),
+            Err(e) => Err(ChainStorageError::AccessError(format!(
+                "Could not open legacy database `{name}`: {e}"
+            ))),
+        }
+    };
+
+    let v1_value_data = open_v1(LMDB_DB_JMT_VALUE_DATA_V1)?;
+    let v1_node_data = open_v1(LMDB_DB_JMT_NODE_DATA_V1)?;
+    let v1_unique_key_data = open_v1(LMDB_DB_JMT_UNIQUE_KEY_DATA)?;
+
+    if v1_value_data.is_none() && v1_node_data.is_none() && v1_unique_key_data.is_none() {
+        info!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] v6: No v1 JMT tables present, nothing to migrate"
+        );
+        return Ok(false);
+    }
+
+    println!("Starting JMT v1 → v2 rebuild");
+
+    // Snapshot and resolve every unspent UTXO to a JMT `(KeyHash, smt_hash)` entry in a single
+    // long-lived read transaction. The original implementation opened a fresh read transaction
+    // per chunk and re-looked-up the output_hash from `utxo_commitment_index` even though the
+    // cursor had already yielded it - both costs are eliminated here.
+    let entries = collect_jmt_migration_entries(db)?;
+    let total = entries.len();
+    db.stats_collector().set_migration_phase(MigrationPhase::JmtRebuild);
+    db.set_stats_total_height(total as u64);
+    info!(
+        target: LOG_TARGET,
+        "[MIGRATIONS] v6: {total} unspent UTXOs will be inserted into the new JMT as a single bulk build"
+    );
+
+    // Safety: clear the v2 JMT tables and reset the JMTVersion counter before applying any
+    // batches. This protects against a previous migration attempt that crashed partway through
+    // and left stale node/value rows behind - replaying batches over those would produce a
+    // corrupt tree or trip the duplicate-key check in `LmdbTreeWriter`.
+    {
+        let write_txn = db.write_transaction()?;
+        let cleared_nodes = lmdb_clear(&write_txn, &db.jmt_node_data)?;
+        let cleared_values = lmdb_clear(&write_txn, &db.jmt_value_data)?;
+        if cleared_nodes > 0 || cleared_values > 0 {
+            warn!(
+                target: LOG_TARGET,
+                "[MIGRATIONS] v6: Cleared {cleared_nodes} stale JMT nodes and {cleared_values} stale JMT values \
+                 from the v2 tables (likely a partially-completed prior migration)"
+            );
+        }
+        lmdb_delete(
+            &write_txn,
+            &db.metadata_db,
+            &MetadataKey::JMTVersion.as_u32(),
+            "metadata",
+        )
+        .optional()?;
+        write_txn.commit()?;
+    }
+
+    if total == 0 {
+        info!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] v6: utxo_commitment_index is empty; skipping JMT bulk build"
+        );
+    } else {
+        // Build the entire JMT in memory in a single `batch_put_value_sets` call at version 0.
+        // The previous implementation inserted one chunk per JMT version (0, 1, 2, …) which
+        // forced the tree to re-traverse the on-disk state via `LmdbTreeReader` for every chunk
+        // and emit a stale-node entry for every internal node it had to copy - an O(T·log T)
+        // write-amplification across the whole migration. With one version against a freshly
+        // cleared tree the reader is consulted only for the pre-genesis root, no stale nodes are
+        // produced, and the cache-friendly `batch_insert_at` path is used.
+        println!("Building rebuilt JMT in memory for {total} entries...");
+        let ops = {
+            let read_txn = db.read_transaction()?;
+            let reader = LmdbTreeReader::new(&read_txn, db.jmt_node_data.clone(), db.jmt_value_data.clone());
+            let tree = JellyfishMerkleTree::<_, SmtHasher>::new(&reader);
+            let (_root_hashes, ops) = tree
+                .batch_put_value_sets(vec![entries], None, 0)
+                .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
+            ops
+        };
+        let node_count = ops.node_batch.nodes().len();
+        let value_count = ops.node_batch.values().len();
+        info!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] v6: in-memory JMT built ({node_count} nodes, {value_count} values); flushing to LMDB"
+        );
+        println!("JMT built in memory: {node_count} nodes, {value_count} values. Flushing to LMDB.");
+
+        flush_migration_node_batch_chunked(db, &ops.node_batch, JMT_MIGRATION_LMDB_WRITE_CHUNK, total as u64)?;
+    }
+
+    // Persist the final JMTVersion. We just inserted at version 0, so 0 is also the highest
+    // stored version - on-line writers read this value and pass `version + 1` to the next
+    // `put_value_set`.
+    {
+        let write_txn = db.write_transaction()?;
+        // SAFETY: this migration runs single-threaded on startup, before any other
+        // BlockchainBackend traffic, so there are no concurrent write transactions.
+        unsafe {
+            LMDBStore::resize_if_required(&db.env, &db.env_config, None)?;
+        }
+        lmdb_replace(
+            &write_txn,
+            &db.metadata_db,
+            &MetadataKey::JMTVersion.as_u32(),
+            &MetadataValue::JMTVersion(0),
+            None,
+        )?;
+        write_txn.commit()?;
+    }
+
+    println!("deleting old jmt database tables");
+    // Drop each legacy v1 database. `Database::delete` consumes the handle and calls
+    // `mdb_drop` with the delete flag, returning the pages to the LMDB free list.
+    let delete_legacy = |name: &'static str, opt: Option<Database<'static>>| -> Result<(), ChainStorageError> {
+        if let Some(legacy) = opt {
+            legacy.delete().map_err(|e| {
+                ChainStorageError::AccessError(format!("Failed to delete legacy database `{name}`: {e}"))
+            })?;
+            info!(target: LOG_TARGET, "[MIGRATIONS] v6: Dropped legacy database `{name}`");
+        }
+        Ok(())
+    };
+    delete_legacy(LMDB_DB_JMT_VALUE_DATA_V1, v1_value_data)?;
+    println!("deleted old jmt value data");
+    delete_legacy(LMDB_DB_JMT_NODE_DATA_V1, v1_node_data)?;
+    println!("deleted old jmt node data");
+    delete_legacy(LMDB_DB_JMT_UNIQUE_KEY_DATA, v1_unique_key_data)?;
+    println!("deleted old jmt unique key data");
+    println!("JMT rebuild complete");
+
+    info!(target: LOG_TARGET, "[MIGRATIONS] v6: JMT v1 → v2 rebuild complete");
+    Ok(true)
+}
+
+/// Snapshot every entry of `utxo_commitment_index`, resolve each commitment to its UTXO data and
+/// compute the JMT payload (`smt_hash(mined_height)`), all within a single LMDB read transaction.
+///
+/// Walks the index in fixed-size chunks rather than buffering the whole snapshot up front, then
+/// resolves and hashes each chunk inline before pulling the next one. lmdb-zero only permits one
+/// live `ConstAccessor` per transaction, so the cursor and the per-output `fetch_output_in_txn`
+/// lookups cannot share an accessor — closing the cursor after each chunk releases it without
+/// closing the read transaction, and `MDB_SET_RANGE` on the next iteration restores cursor
+/// position past the last drained key.
+fn collect_jmt_migration_entries(db: &LMDBDatabase) -> Result<Vec<(KeyHash, Vec<u8>)>, ChainStorageError> {
+    // Sized to amortise cursor/accessor open-close (a handful of µs each) over a meaningful batch
+    // without holding more than a few hundred KB of `(commitment, output_hash)` pairs in memory at
+    // once. With ~5M UTXOs this caps the peak chunk buffer at ~512 KB instead of ~320 MB.
+    const CHUNK_SIZE: usize = 8192;
+
+    let read_txn = db.read_transaction()?;
+    let expected = lmdb_len(&read_txn, &db.utxo_commitment_index)?;
+    let mut entries: Vec<(KeyHash, Vec<u8>)> = Vec::with_capacity(expected);
+    let mut chunk: Vec<([u8; 32], HashOutput)> = Vec::with_capacity(CHUNK_SIZE);
+    // Log progress at ~5% intervals so an operator can see the migration is making forward
+    // progress on chains with millions of UTXOs - this loop is dominated by Blake2b over each
+    // output and can take many seconds end-to-end.
+    let log_every = max(1, expected / 20);
+    let mut next_log = log_every;
+    // Cursor position is restored each chunk by seeking to the last drained commitment and
+    // stepping one past it. `None` means start from `MDB_FIRST`.
+    let mut resume_after: Option<[u8; 32]> = None;
+
+    loop {
+        chunk.clear();
+        let drained_to_end = {
+            let mut cursor = (&read_txn).cursor(db.utxo_commitment_index.clone()).map_err(|e| {
+                ChainStorageError::AccessError(format!("Could not open cursor on utxo_commitment_index: {e}"))
+            })?;
+            let access = read_txn.access();
+            let mut entry = match resume_after.as_ref() {
+                None => cursor.first::<[u8], [u8]>(&access).to_opt().map_err(|e| {
+                    ChainStorageError::AccessError(format!("Failed to read first utxo_commitment_index entry: {e}"))
+                })?,
+                Some(key) => {
+                    // `seek_range_k` lands on the first key >= seek key; since `key` is still in
+                    // this read txn's snapshot it lands on exactly that key, and we step past it.
+                    let landed = cursor
+                        .seek_range_k::<[u8], [u8]>(&access, key.as_slice())
+                        .to_opt()
+                        .map_err(|e| {
+                            ChainStorageError::AccessError(format!(
+                                "Failed to seek cursor on utxo_commitment_index: {e}"
+                            ))
+                        })?;
+                    if landed.is_some() {
+                        cursor.next::<[u8], [u8]>(&access).to_opt().map_err(|e| {
+                            ChainStorageError::AccessError(format!(
+                                "Failed to advance cursor on utxo_commitment_index: {e}"
+                            ))
+                        })?
+                    } else {
+                        None
+                    }
+                },
+            };
+            while let Some((commitment, output_hash_bytes)) = entry {
+                if commitment.len() != 32 {
+                    return Err(ChainStorageError::CriticalError(format!(
+                        "utxo_commitment_index key has unexpected length {}",
+                        commitment.len()
+                    )));
+                }
+                let mut commitment_bytes = [0u8; 32];
+                commitment_bytes.copy_from_slice(commitment);
+                let output_hash: HashOutput = deserialize(output_hash_bytes).map_err(|e| {
+                    ChainStorageError::AccessError(format!(
+                        "Failed to deserialize HashOutput from utxo_commitment_index: {e}"
+                    ))
+                })?;
+                chunk.push((commitment_bytes, output_hash));
+                if chunk.len() == CHUNK_SIZE {
+                    break;
+                }
+                entry = cursor.next::<[u8], [u8]>(&access).to_opt().map_err(|e| {
+                    ChainStorageError::AccessError(format!("Failed to advance cursor on utxo_commitment_index: {e}"))
+                })?;
+            }
+            chunk.len() < CHUNK_SIZE
+        };
+
+        for (commitment, output_hash) in &chunk {
+            let utxo_info = db
+                .fetch_output_in_txn(&read_txn, output_hash.as_slice())?
+                .ok_or_else(|| ChainStorageError::ValueNotFound {
+                    entity: "TransactionOutput",
+                    field: "output_hash",
+                    value: output_hash.to_hex(),
+                })?;
+            let smt_node = utxo_info.output.smt_hash(utxo_info.mined_height).to_vec();
+            entries.push((KeyHash(*commitment), smt_node));
+
+            if entries.len() >= next_log {
+                info!(
+                    target: LOG_TARGET,
+                    "[MIGRATIONS] v6: collected {}/{} JMT entries",
+                    entries.len(),
+                    expected,
+                );
+                next_log = next_log.saturating_add(log_every);
+            }
+        }
+
+        if drained_to_end {
+            break;
+        }
+        resume_after = chunk.last().map(|(c, _)| *c);
+    }
+
+    Ok(entries)
+}
+
+/// Flush a pre-computed `NodeBatch` to the v2 JMT tables in chunked write transactions.
+///
+/// The destination tables are freshly cleared before this is called, so each row is written with
+/// a single `lmdb_replace` rather than the `get`/`delete`/`insert` sequence in
+/// [`LmdbTreeWriter::write_node_batch`]. Each chunk commits in its own transaction so the LMDB
+/// map can be resized between commits.
+fn flush_migration_node_batch_chunked(
+    db: &LMDBDatabase,
+    node_batch: &jmt::storage::NodeBatch,
+    chunk_size: usize,
+    total_entries: u64,
+) -> Result<(), ChainStorageError> {
+    let max_resizes = max(8, 1024 * BYTES_PER_MB / db.env_config.grow_size_bytes());
+    let mut resize_attempts = 0usize;
+
+    let total_nodes = node_batch.nodes().len();
+    let mut written_nodes = 0usize;
+    let mut nodes_iter = node_batch.nodes().iter();
+    loop {
+        // Pre-serialise the next chunk of (lmdb_key, node) pairs so we can replay the whole chunk
+        // on a `MapFull` retry without rerunning borsh.
+        let mut chunk: Vec<(Vec<u8>, &jmt::storage::Node)> = Vec::with_capacity(chunk_size);
+        for (node_key, node) in nodes_iter.by_ref().take(chunk_size) {
+            if matches!(node, jmt::storage::Node::Null) {
+                // The pre-genesis null root is not persisted; `LmdbTreeReader` returns None for
+                // missing keys which is semantically equivalent.
+                continue;
+            }
+            let mut lmdb_key: Vec<u8> = Vec::with_capacity(64);
+            borsh::BorshSerialize::serialize(node_key, &mut lmdb_key)
+                .map_err(|e| ChainStorageError::AccessError(format!("Could not serialise JMT node key: {e}")))?;
+            chunk.push((lmdb_key, node));
+        }
+        if chunk.is_empty() {
+            break;
+        }
+
+        flush_jmt_chunk(
+            db,
+            &chunk,
+            "jmt node",
+            &mut resize_attempts,
+            max_resizes,
+            |txn, key, node| lmdb_replace(txn, &db.jmt_node_data, key, *node, None),
+        )?;
+
+        written_nodes += chunk.len();
+        info!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] v6: Wrote {written_nodes}/{total_nodes} JMT nodes"
+        );
+    }
+
+    let total_values = node_batch.values().len();
+    let mut written_values = 0usize;
+    let mut values_iter = node_batch.values().iter();
+    loop {
+        let mut chunk: Vec<(Vec<u8>, &Option<Vec<u8>>)> = Vec::with_capacity(chunk_size);
+        for (value_key, value) in values_iter.by_ref().take(chunk_size) {
+            if value.is_none() {
+                // Defensive: a fresh bulk build never produces deletions, but skip them if any.
+                continue;
+            }
+            chunk.push((value_key.1.0.to_vec(), value));
+        }
+        if chunk.is_empty() {
+            break;
+        }
+
+        flush_jmt_chunk(
+            db,
+            &chunk,
+            "jmt value",
+            &mut resize_attempts,
+            max_resizes,
+            |txn, key, value| {
+                let val_bytes = bincode::serialize::<Option<Vec<u8>>>(*value)
+                    .map_err(|e| ChainStorageError::AccessError(format!("Could not serialise JMT value: {e}")))?;
+                lmdb_replace(txn, &db.jmt_value_data, key, &val_bytes, None)
+            },
+        )?;
+
+        written_values += chunk.len();
+        let progress = (written_values as u64).min(total_entries);
+        db.update_stats_progress(progress);
+        info!(
+            target: LOG_TARGET,
+            "[MIGRATIONS] v6: Wrote {written_values}/{total_values} JMT values"
+        );
+        println!("Wrote {written_values}/{total_values} JMT values to disk");
+    }
+
+    Ok(())
+}
+
+/// Commit a single chunk of rows to one of the JMT tables, retrying with an LMDB resize on
+/// `MapFull`. Used by [`flush_migration_node_batch_chunked`] for both the node and value tables.
+fn flush_jmt_chunk<T, F>(
+    db: &LMDBDatabase,
+    chunk: &[(Vec<u8>, T)],
+    label: &str,
+    resize_attempts: &mut usize,
+    max_resizes: usize,
+    mut write_one: F,
+) -> Result<(), ChainStorageError>
+where
+    F: FnMut(&WriteTransaction<'_>, &[u8], &T) -> Result<(), ChainStorageError>,
+{
+    loop {
+        // SAFETY: the migration runs single-threaded on startup before any other
+        // BlockchainBackend traffic, so there are no concurrent write transactions.
+        unsafe {
+            LMDBStore::resize_if_required(
+                &db.env,
+                &db.env_config,
+                Some(max(db.env_config.grow_size_bytes(), TXN_RESIZE_SAFETY_MARGIN_BYTES)),
+            )?;
+        }
+        let write_txn = db.write_transaction()?;
+        let mut chunk_err: Option<ChainStorageError> = None;
+        for (lmdb_key, value) in chunk {
+            if let Err(e) = write_one(&write_txn, lmdb_key.as_slice(), value) {
+                chunk_err = Some(e);
+                break;
+            }
+        }
+        match chunk_err {
+            None => match write_txn.commit() {
+                Ok(()) => return Ok(()),
+                Err(lmdb_zero::Error::Code(code)) if code == lmdb_zero::error::MAP_FULL => {
+                    *resize_attempts += 1;
+                    if *resize_attempts >= max_resizes {
+                        return Err(ChainStorageError::DbTransactionTooLarge(chunk.len()));
+                    }
+                    info!(
+                        target: LOG_TARGET,
+                        "[MIGRATIONS] v6: LMDB map full while committing {label} chunk ({} entries), resizing (attempt {})",
+                        chunk.len(), *resize_attempts
+                    );
+                    unsafe {
+                        LMDBStore::resize(&db.env, &db.env_config, None)?;
+                    }
+                },
+                Err(e) => {
+                    return Err(ChainStorageError::AccessError(format!(
+                        "Failed to commit {label} chunk: {e}"
+                    )));
+                },
+            },
+            Some(ChainStorageError::DbResizeRequired(size_hint)) => {
+                drop(write_txn);
+                *resize_attempts += 1;
+                if *resize_attempts >= max_resizes {
+                    return Err(ChainStorageError::DbTransactionTooLarge(chunk.len()));
+                }
+                info!(
+                    target: LOG_TARGET,
+                    "[MIGRATIONS] v6: LMDB map full while writing {label} chunk, resizing (attempt {})",
+                    *resize_attempts
+                );
+                unsafe {
+                    LMDBStore::resize(&db.env, &db.env_config, size_hint)?;
+                }
+            },
+            Some(e) => return Err(e),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
@@ -4910,7 +6002,9 @@ fn verify_metadata_keys(db: &LMDBDatabase) -> Result<(), ChainStorageError> {
                 Some(MetadataKey::AccumulatedDataRebuildStatus) |
                 Some(MetadataKey::AccumulatedDataCheckStatus) |
                 Some(MetadataKey::BlockchainConsistencyCheckStatus) |
-                Some(MetadataKey::HorizonSyncOutputCheckpoint) => {
+                Some(MetadataKey::HorizonSyncOutputCheckpoint) |
+                Some(MetadataKey::JMTVersion) |
+                Some(MetadataKey::BurnCommitmentRebuildStatus) => {
                     warn!(
                         target: LOG_TARGET,
                         "Removed corrupt metadata entry {metadata_key:?} with key bytes: 0x{hex_key}",
@@ -4965,6 +6059,8 @@ fn num_to_key(n: u32) -> Option<MetadataKey> {
         10 => Some(MetadataKey::AccumulatedDataCheckStatus),
         11 => Some(MetadataKey::BlockchainConsistencyCheckStatus),
         12 => Some(MetadataKey::HorizonSyncOutputCheckpoint),
+        13 => Some(MetadataKey::JMTVersion),
+        14 => Some(MetadataKey::BurnCommitmentRebuildStatus),
         _ => None,
     }
 }
@@ -4983,6 +6079,8 @@ fn variant_name(v: &MetadataValue) -> &'static str {
         MetadataValue::AccumulatedDataRebuildStatus(_) => "AccumulatedDataRebuildStatus",
         MetadataValue::BlockchainCheckStatus(_) => "BlockchainCheckStatus",
         MetadataValue::HorizonSyncOutputCheckpoint(_) => "HorizonSyncOutputCheckpoint",
+        MetadataValue::JMTVersion(_) => "JMTVersion",
+        MetadataValue::BurnCommitmentRebuildStatus(_) => "BurnCommitmentRebuildStatus",
     }
 }
 
@@ -5002,5 +6100,7 @@ fn summarize_value(v: &MetadataValue) -> String {
         MetadataValue::HorizonSyncOutputCheckpoint(cp) => {
             format!("{} targeting {}", cp.checkpoint_height, cp.sync_target_height)
         },
+        MetadataValue::JMTVersion(v) => format!("{v}"),
+        MetadataValue::BurnCommitmentRebuildStatus(s) => format!("{s:?}"),
     }
 }

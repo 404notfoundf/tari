@@ -13,6 +13,7 @@ use tari_transaction_components::transaction_components::{TransactionInput, Tran
 use super::{
     AccumulatedDataRebuildStatus,
     BlockchainCheckRequest,
+    BurnCommitmentRebuildStatus,
     MinedInfo,
     PayrefRebuildStatus,
     TemplateRegistrationEntry,
@@ -105,6 +106,14 @@ pub trait BlockchainBackend: Send + Sync + 'static {
         excess_sig: &CompressedSignature,
     ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError>;
 
+    /// Fetch the burn kernel that carries this burn commitment, along with the hash of the block it is in, if any.
+    /// Backed by the burn commitment index, this is used to enforce that a burn commitment appears at most once in the
+    /// chain.
+    fn fetch_kernel_by_burn_commitment(
+        &self,
+        burn_commitment: &CompressedCommitment,
+    ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError>;
+
     /// Fetch all UTXOs and spends in the block
     fn fetch_outputs_in_block_with_spend_state(
         &self,
@@ -158,6 +167,8 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     fn fetch_payref_rebuild_status(&self) -> Result<PayrefRebuildStatus, ChainStorageError>;
     /// Returns the stored accumulated data rebuild status.
     fn fetch_accumulated_data_rebuild_status(&self) -> Result<AccumulatedDataRebuildStatus, ChainStorageError>;
+    /// Returns the stored burn commitment index rebuild status.
+    fn fetch_burn_commitment_rebuild_status(&self) -> Result<BurnCommitmentRebuildStatus, ChainStorageError>;
     /// Resets the stored blockchain consistency check status.
     fn update_blockchain_consistency_check_status(
         &self,
@@ -180,6 +191,12 @@ pub trait BlockchainBackend: Send + Sync + 'static {
         initialize_stats: Option<u64>,
         finalize: bool,
     ) -> Result<PayrefRebuildStatus, ChainStorageError>;
+    /// Builds the burn commitment index entries for the block at the given height, updating the rebuild status.
+    fn build_burn_commitment_index_for_height(
+        &self,
+        height: u64,
+        finalize: bool,
+    ) -> Result<BurnCommitmentRebuildStatus, ChainStorageError>;
     /// Builds the payref indexes for a given block height, with stats.
     fn update_accumulated_difficulty(
         &self,
@@ -221,8 +238,7 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     fn fetch_horizon_sync_output_checkpoint(&self) -> Result<Option<HorizonSyncOutputCheckpoint>, ChainStorageError>;
 
     /// Verify that the JMT output root at the given version matches the expected root.
-    fn verify_horizon_sync_output_root(&self, version: u64, expected_root: HashOutput)
-    -> Result<(), ChainStorageError>;
+    fn verify_horizon_sync_output_root(&self, expected_root: HashOutput) -> Result<(), ChainStorageError>;
 
     /// Returns basic database stats for each internal database, such as number of entries and page sizes. This call may
     /// not apply to every database implementation.
@@ -305,7 +321,7 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     ) -> Result<Vec<TemplateRegistrationEntry>, ChainStorageError>;
 
     /// Creates a reader to construct a JMT
-    fn create_smt_reader(&self) -> Result<OwnedLmdbTreeReader<'_>, ChainStorageError>;
+    fn create_smt_reader(&self) -> Result<(OwnedLmdbTreeReader<'_>, u64), ChainStorageError>;
 
     /// Stats reporting methods for long-running operations
     /// Set the total number of steps for progress tracking

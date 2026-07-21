@@ -142,8 +142,9 @@ impl BaseNodeContext {
         self.base_node_handles.expect_handle()
     }
 
-    pub fn tari_pulse(&self) -> TariPulseHandle {
-        self.base_node_handles.expect_handle()
+    /// Returns the Tari Pulse handle, or `None` when the Tari Pulse service is disabled and was never started.
+    pub fn tari_pulse(&self) -> Option<TariPulseHandle> {
+        self.base_node_handles.get_handle()
     }
 
     /// Returns a handle to the comms RPC server
@@ -239,7 +240,7 @@ async fn build_node_context(
     let randomx_factory = RandomXFactory::new(app_config.base_node.max_randomx_vms);
     let difficulty_calculator = DifficultyCalculator::new(rules.clone(), randomx_factory.clone());
     let validators = Validators::new(
-        BlockBodyFullValidator::new(rules.clone(), true),
+        BlockBodyFullValidator::new(rules.clone(), app_config.base_node.bypass_range_proof_verification),
         HeaderFullValidator::new(rules.clone(), difficulty_calculator.clone()),
         BlockBodyInternalConsistencyValidator::new(
             rules.clone(),

@@ -84,6 +84,7 @@ impl AggregateBodyChainLinkedValidator {
 
     fn validate_consensus<B: BlockchainBackend>(&self, body: &AggregateBody, db: &B) -> Result<(), ValidationError> {
         validate_excess_sig_not_in_db(body, db)?;
+        validate_burn_commitment_not_in_db(body, db)?;
         Ok(())
     }
 
@@ -104,6 +105,7 @@ impl AggregateBodyChainLinkedValidator {
         check_inputs_are_spendable(db, constants, header.height, &body)?;
         check_outputs(db, constants, &body, header.height)?;
         verify_no_duplicated_inputs_outputs(&body)?;
+        verify_no_duplicate_validator_node_registrations(&body)?;
         check_total_burned(&body)?;
         verify_timelocks(&body, header.height)?;
 
@@ -178,6 +180,48 @@ fn validate_excess_sig_not_in_db<B: BlockchainBackend>(body: &AggregateBody, db:
     Ok(())
 }
 
+/// Ensures that no burn kernel reuses a burn commitment that already exists in the chain, and that a single block does
+/// not contain two burns sharing a commitment.
+///
+/// Burn commitments are not part of the UTXO set (burned outputs are deliberately excluded from the UTXO commitment
+/// uniqueness check), so without this rule the same burn commitment could be committed to the chain more than once and
+/// then claimed multiple times on a sidechain. Burn commitments are carried on kernels, which are retained permanently
+/// even by pruned nodes, so this check behaves identically on archival and pruned nodes.
+// The `mutable_key_type` lint fires because `CompressedCommitment` caches its decompressed form. That interior
+// mutability does not affect the `Hash`/`Eq` used here, so the set behaves correctly.
+#[allow(clippy::mutable_key_type)]
+fn validate_burn_commitment_not_in_db<B: BlockchainBackend>(
+    body: &AggregateBody,
+    db: &B,
+) -> Result<(), ValidationError> {
+    let mut seen_in_block = HashSet::new();
+    for kernel in body.kernels() {
+        if !kernel.is_burned() {
+            continue;
+        }
+        let burn_commitment = kernel.get_burn_commitment()?;
+
+        // Reject two burns in the same block that share a commitment; the database check below only sees committed
+        // blocks, not the block currently being validated.
+        if !seen_in_block.insert(burn_commitment.clone()) {
+            return Err(ValidationError::InvalidBurnError(format!(
+                "Block contains more than one burn kernel with burn commitment: {}",
+                burn_commitment.to_hex()
+            )));
+        }
+
+        // Reject a burn whose commitment already exists in a previously committed block.
+        if let Some((_, header_hash)) = db.fetch_kernel_by_burn_commitment(burn_commitment)? {
+            return Err(ValidationError::InvalidBurnError(format!(
+                "Aggregate body contains burn commitment: {} which already exists in chain database block hash: {}",
+                burn_commitment.to_hex(),
+                header_hash.to_hex(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 // This function checks that all inputs in the blocks are valid UTXO's to be spent
 fn check_inputs_are_spendable<B: BlockchainBackend>(
     db: &B,
@@ -189,6 +233,7 @@ fn check_inputs_are_spendable<B: BlockchainBackend>(
     let mut output_hashes = None;
 
     for input in body.inputs() {
+        check_output_feature_rules_for_input(db, constants, current_height, input)?;
         // If spending a unique_id, a new output must contain the unique id
         match check_input_is_utxo(db, input) {
             Ok(_) => continue,
@@ -214,8 +259,6 @@ fn check_inputs_are_spendable<B: BlockchainBackend>(
                 return Err(err);
             },
         }
-
-        check_output_feature_rules_for_input(db, constants, current_height, input)?;
     }
 
     if !not_found_inputs.is_empty() {
@@ -264,6 +307,40 @@ pub fn verify_no_duplicated_inputs_outputs(body: &AggregateBody) -> Result<(), V
             "AggregateBody validation failed due to double output"
         );
         return Err(ValidationError::UnsortedOrDuplicateOutput);
+    }
+    Ok(())
+}
+
+/// Ensures the body does not contain more than one validator node registration for the same validator node (scoped by
+/// sidechain id).
+///
+/// `check_validator_node_registration` only rejects a registration that duplicates one already in the validator node
+/// set as of the *parent* block. It cannot see other registrations in the same body. Without this check, a single block
+/// carrying two registrations for the same validator node would pass validation and then fail when the second
+/// registration is applied to the validator node set (the set is keyed by sidechain id + public key and inserted with
+/// `NO_OVERWRITE`), aborting the block at commit time rather than rejecting it cleanly during validation.
+// The `mutable_key_type` lint fires because `CompressedPublicKey` caches its decompressed form in a `OnceLock`. That
+// interior mutability does not affect the `Hash`/`Eq` used here, so the set behaves correctly.
+#[allow(clippy::mutable_key_type)]
+pub fn verify_no_duplicate_validator_node_registrations(body: &AggregateBody) -> Result<(), ValidationError> {
+    let mut seen = HashSet::new();
+    for output in body.outputs() {
+        let Some(sidechain_features) = output.features.sidechain_feature.as_ref() else {
+            continue;
+        };
+        let Some(vn_reg) = sidechain_features.validator_node_registration() else {
+            continue;
+        };
+        if !seen.insert((sidechain_features.sidechain_public_key(), vn_reg.public_key())) {
+            warn!(
+                target: LOG_TARGET,
+                "AggregateBody validation failed due to duplicate validator node registration for {}",
+                vn_reg.public_key()
+            );
+            return Err(ValidationError::DuplicateValidatorNodeRegistration {
+                public_key: vn_reg.public_key().to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -387,4 +464,99 @@ fn check_validator_node_registration_spend<B: BlockchainBackend>(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use tari_common_types::types::{CompressedCommitment, CompressedPublicKey, PrivateKey};
+    use tari_crypto::keys::SecretKey;
+    use tari_transaction_components::transaction_components::{
+        KernelFeatures,
+        OutputFeatures,
+        TransactionKernel,
+        TransactionOutput,
+        ValidatorNodeSignature,
+    };
+
+    use super::*;
+    use crate::test_helpers::blockchain::TempDatabase;
+
+    fn registration_output(vn_secret_key: &PrivateKey) -> TransactionOutput {
+        let claim_public_key = CompressedPublicKey::from_secret_key(vn_secret_key);
+        let max_epoch = VnEpoch(10);
+        let signature =
+            ValidatorNodeSignature::sign_for_registration(vn_secret_key, None, &claim_public_key, max_epoch);
+        TransactionOutput {
+            features: OutputFeatures::for_validator_node_registration(signature, claim_public_key, None, max_epoch),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn it_allows_distinct_validator_node_registrations() {
+        let outputs = vec![
+            registration_output(&PrivateKey::random(&mut rand::rng())),
+            registration_output(&PrivateKey::random(&mut rand::rng())),
+            // A non-registration output should be ignored.
+            TransactionOutput::default(),
+        ];
+        let body = AggregateBody::new(vec![], outputs, vec![]);
+        assert!(verify_no_duplicate_validator_node_registrations(&body).is_ok());
+    }
+
+    #[test]
+    fn it_rejects_two_registrations_for_the_same_validator_node() {
+        // Two distinct outputs (different commitments) registering the same validator node public key. Each passes the
+        // chain-state check individually but they collide when applied to the validator node set.
+        let vn_secret_key = PrivateKey::random(&mut rand::rng());
+        let outputs = vec![registration_output(&vn_secret_key), registration_output(&vn_secret_key)];
+        let body = AggregateBody::new(vec![], outputs, vec![]);
+        let err = verify_no_duplicate_validator_node_registrations(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::DuplicateValidatorNodeRegistration { .. }
+        ));
+    }
+
+    fn random_commitment() -> CompressedCommitment {
+        let public_key = CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng()));
+        CompressedCommitment::from_public_key(public_key.to_public_key().unwrap())
+    }
+
+    fn burn_kernel(burn_commitment: CompressedCommitment) -> TransactionKernel {
+        TransactionKernel {
+            features: KernelFeatures::BURN_KERNEL,
+            burn_commitment: Some(burn_commitment),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn it_allows_a_single_burn_commitment_not_in_the_db() {
+        let db = TempDatabase::new();
+        let body = AggregateBody::new(vec![], vec![], vec![burn_kernel(random_commitment())]);
+        assert!(validate_burn_commitment_not_in_db(&body, &db).is_ok());
+    }
+
+    #[test]
+    fn it_allows_distinct_burn_commitments_in_one_block() {
+        let db = TempDatabase::new();
+        let body = AggregateBody::new(vec![], vec![], vec![
+            burn_kernel(random_commitment()),
+            burn_kernel(random_commitment()),
+        ]);
+        assert!(validate_burn_commitment_not_in_db(&body, &db).is_ok());
+    }
+
+    #[test]
+    fn it_rejects_two_burns_with_the_same_commitment_in_one_block() {
+        let db = TempDatabase::new();
+        let commitment = random_commitment();
+        let body = AggregateBody::new(vec![], vec![], vec![
+            burn_kernel(commitment.clone()),
+            burn_kernel(commitment),
+        ]);
+        let err = validate_burn_commitment_not_in_db(&body, &db).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidBurnError(_)));
+    }
 }

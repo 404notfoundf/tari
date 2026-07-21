@@ -33,7 +33,6 @@ use futures::{StreamExt, pin_mut, stream::FuturesUnordered};
 use log::*;
 use minotari_ledger_wallet_common::common_types::LedgerKeyBranch;
 use minotari_node_wallet_client::BaseNodeWalletClient;
-use rand::rngs::OsRng;
 use sha2::Sha256;
 use tari_common::configuration::Network;
 use tari_common_types::{
@@ -1715,6 +1714,34 @@ where
                     proof: proof.map(Box::new),
                 })
                 .map_err(TransactionServiceError::TransactionStorageError),
+            TransactionServiceRequest::SetTransactionMinedHeight {
+                tx_id,
+                mined_height,
+                mined_in_block,
+                mined_timestamp,
+                status,
+                tip_height,
+            } => {
+                let num_confirmations = tip_height.saturating_sub(mined_height);
+                let must_be_confirmed = num_confirmations >= self.resources.config.num_confirmations_required;
+                self.db
+                    .set_transaction_mined_height(
+                        tx_id,
+                        mined_height,
+                        mined_in_block,
+                        mined_timestamp,
+                        must_be_confirmed,
+                        status,
+                        tip_height,
+                    )
+                    .map(|()| TransactionServiceResponse::TransactionStatusUpdated)
+                    .map_err(TransactionServiceError::TransactionStorageError)
+            },
+            TransactionServiceRequest::SetTransactionAsUnmined { tx_id } => self
+                .db
+                .set_transaction_as_unmined(tx_id)
+                .map(|()| TransactionServiceResponse::TransactionStatusUpdated)
+                .map_err(TransactionServiceError::TransactionStorageError),
         };
 
         // If the individual handlers did not already send the API response then do it here.
@@ -2161,7 +2188,7 @@ where
         let temp_tx_id = TxId::new_random();
         self.verify_send(&destination, TariAddressFeatures::create_one_sided_only())?;
         // this can be anything, so lets generate a random private key
-        let pre_image = CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng));
+        let pre_image = CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng()));
         let hash: [u8; 32] = Sha256::digest(pre_image.as_bytes()).into();
 
         // lets make the unlock height a day from now, 2 min blocks which gives us 30 blocks per hour * 24 hours
@@ -3052,11 +3079,48 @@ where
                 "A sidechain deployment key was provided without a claim public key".to_string(),
             ));
         }
-        let output_features = claim_public_key
-            .as_ref()
-            .cloned()
-            .map(|c| OutputFeatures::create_burn_confidential_output(c, sidechain_deployment_key.as_ref()))
-            .unwrap_or_else(OutputFeatures::create_burn_output);
+
+        // Derive the commitment mask and sender-offset key up front so we can place the stealth
+        // claim key C = H(r·P)·G + P on chain (rather than the recipient's P). C looks like a
+        // random nonce — unlinkable to P across burns — and gives L2 wallets that scan the chain
+        // a discoverability signal (the L2 can compute expected C from R + p and match). The L2
+        // claim does not require C to be on chain: the off-chain burn proof carries C and binds
+        // the mask-key ownership signature to it, so a wallet may also choose to emit burns with
+        // a default-valued on-chain claim key without breaking claim validity.
+        //
+        // For L2-bound burns r is seed-deterministic so the L1 wallet can regenerate the burn
+        // proof from seed alone after recovery; for plain burns (no L2 recipient) r remains a
+        // random key — there is no proof to regenerate later.
+        let (commitment_mask_key, _) = self
+            .resources
+            .transaction_key_manager_service
+            .get_next_commitment_mask_and_script_key()?;
+        let (sender_offset_private_key, stealth_claim_public_key) =
+            if let Some(ref account_public_key) = claim_public_key {
+                let r = self
+                    .resources
+                    .transaction_key_manager_service
+                    .derive_burn_sender_offset_key(&commitment_mask_key.key_id)?;
+                let c = self
+                    .resources
+                    .transaction_key_manager_service
+                    .compute_stealth_claim_public_key(&r.key_id, account_public_key)?;
+                (r, Some(c))
+            } else {
+                let r = self
+                    .resources
+                    .transaction_key_manager_service
+                    .get_random_key(None, None)?;
+                (r, None)
+            };
+
+        let output_features = match stealth_claim_public_key.as_ref() {
+            // L2-bound burn: on-chain claim_public_key carries the stealth address C, unlinkable
+            // to the recipient P. sidechain_deployment_key (if provided) identifies the target L2
+            // network via the sidechain_id Schnorr signature over the (now-stealth) claim key.
+            Some(c) => OutputFeatures::create_burn_confidential_output(c.clone(), sidechain_deployment_key.as_ref()),
+            None => OutputFeatures::create_burn_output(),
+        };
 
         // Prepare sender part of the transaction
         let covenant = Covenant::default();
@@ -3103,17 +3167,12 @@ where
 
         tx_builder.with_tx_type(TxType::Burn);
         tx_builder.with_kernel_features(KernelFeatures::create_burn());
-        // This call is needed to advance the state from `SingleRoundMessageReady` to `SingleRoundMessageReady`,
-        // but the returned value is not used
-        let (commitment_mask_key, _) = self
-            .resources
-            .transaction_key_manager_service
-            .get_next_commitment_mask_and_script_key()?;
 
-        let sender_offset_private_key = self
-            .resources
-            .transaction_key_manager_service
-            .get_random_key(None, None)?;
+        // For L2-bound burns, encrypt the recovery payload with DH(P, r) so the L2 wallet can
+        // decrypt with DH(R, p) (where R = sender_offset_public_key on chain, p = L2 account
+        // secret). The L1 wallet does not rely on decrypting `encrypted_data` to recover its own
+        // burns on a seed-only rescan — it traces them via the spent input outputs it owns. For
+        // plain burns there is no L2 to decrypt, so fall back to the L1 view key.
         let recovery_key_id = if let Some(ref cp) = claim_public_key {
             TariKeyId::DHEncryptedData {
                 public_key: cp.clone(),
@@ -3146,7 +3205,7 @@ where
         tx_builder.add_recipient(
             Default::default(),
             output.clone(),
-            Some(sender_offset_private_key.key_id),
+            Some(sender_offset_private_key.key_id.clone()),
             Some(recovery_key_id),
         )?;
 
@@ -3211,7 +3270,7 @@ where
 
         // Generate claim proof if needed
         let mut burn_proof = None;
-        if let Some(claim_public_key) = claim_public_key {
+        if let (Some(claim_public_key), Some(stealth_claim_public_key)) = (claim_public_key, stealth_claim_public_key) {
             let tx_output = finalized
                 .sent_outputs
                 .first()
@@ -3219,12 +3278,28 @@ where
             let output_hash = tx_output.output.output_hash();
             let commitment = tx_output.output.commitment().clone();
 
+            // The ownership proof commits to C (the stealth claim key), not P. A third party
+            // holding the proof cannot construct an L2 claim — only the L2 wallet holding p can
+            // derive the spend secret s = H(R·p) + p against C. C is not carried in the proof:
+            // both ends recompute it from (R, P, p) and the on-chain ConfidentialOutputData
+            // echoes it for the wallets that want chain-side discoverability.
+            //
+            // The proof is also bound to the target sidechain (the deployment key's public key,
+            // which is what `SideChainId::sign` records on-chain) so it cannot be replayed to claim
+            // the burn on a different sidechain/application (tari-ootle#445).
+            let sidechain_id = sidechain_deployment_key
+                .as_ref()
+                .map(CompressedPublicKey::from_secret_key);
             let ownership_proof = self
                 .resources
                 .transaction_key_manager_service
-                .generate_burn_claim_signature(&commitment_mask_key.key_id, amount.as_u64(), &claim_public_key)?;
+                .generate_burn_claim_signature(
+                    &commitment_mask_key.key_id,
+                    amount.as_u64(),
+                    &stealth_claim_public_key,
+                    sidechain_id.as_ref(),
+                )?;
             let proof = PartialBurnClaimProof {
-                // Nonce part of the DH key exchange to derive the shared secret and decryption key
                 claim_public_key,
                 commitment,
                 ownership_proof,
@@ -3707,6 +3782,7 @@ where
             .send(Arc::new(TransactionEvent::TransactionCancelled(
                 tx_id,
                 TxCancellationReason::UserCancelled,
+                "User cancelled".to_string(),
             )))
             .inspect_err(|e| {
                 trace!(
@@ -3735,7 +3811,7 @@ where
 
         let _unused = self
             .db
-            .reject_completed_transaction(tx_id, TxCancellationReason::UserCancelled)
+            .reject_completed_transaction(tx_id, TxCancellationReason::UserCancelled, None)
             .inspect_err(|e| {
                 warn!(
                     target: LOG_TARGET,
@@ -3769,6 +3845,7 @@ where
             .send(Arc::new(TransactionEvent::TransactionCancelled(
                 tx_id,
                 TxCancellationReason::UserCancelled,
+                "User cancelled".to_string(),
             )))
             .inspect_err(|e| {
                 trace!(
@@ -4385,7 +4462,7 @@ where
                 "Failed to Cancel outputs for TxId: {tx_id} after failed sending attempt with error {e:?}"
             );
         }
-        if let Err(e) = self.resources.db.reject_completed_transaction(tx_id, reason) {
+        if let Err(e) = self.resources.db.reject_completed_transaction(tx_id, reason, None) {
             warn!(
                 target: LOG_TARGET,
                 "Failed to Cancel TxId: {tx_id} after failed sending attempt with error {e:?}"

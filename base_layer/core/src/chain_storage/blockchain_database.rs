@@ -85,6 +85,7 @@ use tari_utilities::{ByteArray, epoch_time::EpochTime, hex::Hex};
 use super::{
     AccumulatedDataRebuildStatus,
     BlockchainCheckRequest,
+    BurnCommitmentRebuildStatus,
     CheckFailure,
     MinedInfo,
     PayrefRebuildStatus,
@@ -393,6 +394,7 @@ where B: BlockchainBackend
 
         self.rebuild_payref_indexes_background_task()?;
         self.rebuild_accumulated_data_background_task()?;
+        self.rebuild_burn_commitment_index_background_task()?;
         self.initialize_blockchain_check_tasks()?;
         self.prune_database_background_task()?;
 
@@ -576,6 +578,92 @@ where B: BlockchainBackend
                     break;
                 }
                 height = height.saturating_add(1);
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Rebuilds the burn commitment index in the background so that node startup is not blocked. New databases (and
+    /// ones that have already finished) short-circuit immediately; otherwise a tokio task walks the blocks from the
+    /// last rebuilt height to the chain tip, indexing the burn kernels in each block. Blocks added or re-orged in
+    /// after this process starts already populate the index via the live insert path, so they do not need to be
+    /// processed here.
+    pub fn rebuild_burn_commitment_index_background_task(&self) -> Result<(), ChainStorageError> {
+        let initial_status = {
+            let db = self.db_read_access()?;
+            db.fetch_burn_commitment_rebuild_status()?
+        };
+        debug!(target: LOG_TARGET, "[BurnIndex] Burn commitment index rebuild status: {initial_status:?}");
+        if initial_status.is_rebuilt {
+            debug!(target: LOG_TARGET, "[BurnIndex] Burn commitment index has already been rebuilt.");
+            return Ok(());
+        }
+
+        // The rebuild runs on a tokio task. When the database is constructed outside a runtime (e.g. tooling or tests),
+        // there is nothing to spawn onto; the rebuild status is left as-is so it runs on the next startup under a
+        // runtime (a base node always runs under tokio).
+        if tokio::runtime::Handle::try_current().is_err() {
+            debug!(
+                target: LOG_TARGET,
+                "[BurnIndex] No tokio runtime available; deferring burn commitment index rebuild to the next startup."
+            );
+            return Ok(());
+        }
+
+        // Fix the target height at the tip as of now. Blocks beyond this are populated by the live insert path.
+        let target_height = {
+            let db = self.db_read_access()?;
+            db.fetch_chain_metadata()?.best_block_height()
+        };
+        let db_rw_lock = self.db.clone();
+
+        tokio::task::spawn(async move {
+            let start_height = initial_status.last_rebuild_height.unwrap_or_default();
+            let mut last_status = initial_status.clone();
+            debug!(
+                target: LOG_TARGET,
+                "[BurnIndex] Starting burn commitment index rebuild for heights {start_height} to {target_height}"
+            );
+
+            for height in start_height..=target_height {
+                // Add a small tokio sleep to allow other tasks to run more freely, mirroring the other rebuild tasks.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let finalize = height == target_height;
+                let db = db_rw_lock.clone();
+                // We use `spawn_blocking` with `.await` here to ensure that the async spawned task will be able to
+                // shut down when base node shutdown is triggered.
+                let res =
+                    tokio::task::spawn_blocking(move || process_burn_commitment_index_for_height(db, height, finalize))
+                        .await;
+                match res {
+                    Ok(Ok(current_status)) => {
+                        last_status = current_status;
+                    },
+                    Ok(Err(e)) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[BurnIndex] Burn commitment index rebuild failed. Initial status: {initial_status:?}. \
+                            Last updated status: {last_status:?} ({e})"
+                        );
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            target: LOG_TARGET,
+                            "[BurnIndex] Burn commitment index rebuild failed. Initial status: {initial_status:?}. \
+                            Last updated status: {last_status:?} ({e})"
+                        );
+                        break;
+                    },
+                }
+                if finalize || last_status.is_rebuilt {
+                    debug!(
+                        target: LOG_TARGET,
+                        "[BurnIndex] Burn commitment index rebuild completed, Final status: {last_status:?}"
+                    );
+                    break;
+                }
             }
         });
 
@@ -1290,9 +1378,8 @@ where B: BlockchainBackend
         hashes: Vec<HashOutput>,
     ) -> Result<Vec<Option<(TransactionOutput, bool)>>, ChainStorageError> {
         let db = self.db_read_access()?;
-        let tip = db.fetch_chain_metadata()?.best_block_height();
 
-        let smt_reader = db.create_smt_reader()?;
+        let (smt_reader, current_version) = db.create_smt_reader()?;
 
         let smt = JellyfishMerkleTree::<_, SmtHasher>::new(&smt_reader);
         let mut result = Vec::with_capacity(hashes.len());
@@ -1316,7 +1403,7 @@ where B: BlockchainBackend
                 );
 
                 let spent = smt
-                    .get(smt_key, tip)
+                    .get(smt_key, current_version)
                     .map_err(ChainStorageError::JellyfishMerkleTreeError)?
                     .is_none();
                 trace!(
@@ -2158,13 +2245,9 @@ where B: BlockchainBackend
         db.fetch_horizon_sync_output_checkpoint()
     }
 
-    pub fn verify_horizon_sync_output_root(
-        &self,
-        version: u64,
-        expected_root: HashOutput,
-    ) -> Result<(), ChainStorageError> {
+    pub fn verify_horizon_sync_output_root(&self, expected_root: HashOutput) -> Result<(), ChainStorageError> {
         let db = self.db_read_access()?;
-        db.verify_horizon_sync_output_root(version, expected_root)
+        db.verify_horizon_sync_output_root(expected_root)
     }
 
     pub fn get_stats(&self) -> Result<DbBasicStats, ChainStorageError> {
@@ -2310,6 +2393,7 @@ where B: BlockchainBackend
             leaf_index,
             kernel_hash,
             block_hash,
+            block_height: block.header().height,
         })
     }
 }
@@ -2357,7 +2441,7 @@ pub fn calculate_mmr_roots<T: BlockchainBackend>(
     let header = &block.header;
     let body = &block.body;
 
-    let smt_reader = db.create_smt_reader()?;
+    let (smt_reader, current_version) = db.create_smt_reader()?;
     let metadata = db.fetch_chain_metadata()?;
     if header.prev_hash != *metadata.best_block_hash() {
         return Err(ChainStorageError::CannotCalculateNonTipMmr(format!(
@@ -2432,7 +2516,7 @@ pub fn calculate_mmr_roots<T: BlockchainBackend>(
     let block_output_mr = block_output_mr_hash_from_pruned_mmr(&block_output_mmr)?;
 
     let (output_smt_root, changes) = output_smt
-        .put_value_set(batch, header.height)
+        .put_value_set(batch, current_version + 1)
         .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
     let mut size = tip_header.output_smt_size;
@@ -3429,8 +3513,8 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
         debug!(
             target: LOG_TARGET,
             "Found new orphan tip {} ({})",
-            &prev_chain_header.height(),
-            &prev_chain_header.hash(),
+            prev_chain_header.height(),
+            prev_chain_header.hash(),
         );
         return Ok(vec![prev_chain_header]);
     }
@@ -3439,8 +3523,8 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
         target: LOG_TARGET,
         "Found {} children of orphan {} ({})",
         children.len(),
-        &prev_chain_header.height(),
-        &prev_chain_header.hash()
+        prev_chain_header.height(),
+        prev_chain_header.hash()
     );
 
     let mut res = vec![];
@@ -3746,6 +3830,30 @@ fn process_payref_for_height<B: BlockchainBackend>(
             target: LOG_TARGET,
             "[PayRef] Finalized index rebuilding for heights {} to {}",
             metadata_at_start.best_block_height(), height
+        );
+    }
+
+    Ok(status)
+}
+
+// Process the burn commitment index rebuild for a single block height.
+fn process_burn_commitment_index_for_height<B: BlockchainBackend>(
+    db: Arc<RwLock<B>>,
+    height: u64,
+    finalize: bool,
+) -> Result<BurnCommitmentRebuildStatus, ChainStorageError> {
+    debug!(target: LOG_TARGET, "[BurnIndex] Processing burn commitment index rebuild for height {height}");
+
+    let write_lock = db
+        .write()
+        .map_err(|_e| ChainStorageError::AccessError("Write lock on blockchain backend failed".into()))?;
+
+    let status = write_lock.build_burn_commitment_index_for_height(height, finalize)?;
+
+    if finalize || status.is_rebuilt {
+        debug!(
+            target: LOG_TARGET,
+            "[BurnIndex] Finalized burn commitment index rebuild at height {height}"
         );
     }
 
@@ -4378,7 +4486,7 @@ mod test {
 
             // Add orphans out of height order
             let mut unordered = vec!["3b", "4b", "5b", "6b", "7b", "8b", "9b", "10b", "11b", "12b"];
-            unordered.shuffle(&mut rand::thread_rng());
+            unordered.shuffle(&mut rand::rng());
             for name in unordered {
                 let block = orphan_chain_b.get(name).unwrap().clone();
                 let result = test.handle_possible_reorg(block.to_arc_block()).unwrap();

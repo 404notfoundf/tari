@@ -29,10 +29,11 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt, stream};
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use tari_comms::{
     CommsNode,
     PeerConnection,
+    RefKind,
     Substream,
     framing,
     message::{InboundMessage, OutboundMessage},
@@ -228,7 +229,7 @@ impl StressTestService {
         self.comms_node.peer_manager().add_or_update_peer(peer).await?;
         println!("Dialing peer `{}`...", node_id.short_str());
         let start = Instant::now();
-        let conn = self.comms_node.connectivity().dial_peer(node_id).await?;
+        let conn = self.comms_node.connectivity().dial_peer(node_id, RefKind::Weak).await?;
         println!("Dial completed successfully in {:.2?}", start.elapsed());
         let outbound_tx = self.outbound_tx.clone();
         let inbound_rx = self.inbound_rx.clone();
@@ -496,7 +497,7 @@ fn generate_message(n: u32, size: usize) -> Bytes {
     let mut bytes = BytesMut::with_capacity(size);
     bytes.resize(size, 0);
     bytes[..4].copy_from_slice(&counter_bytes);
-    OsRng.fill_bytes(&mut bytes[4..size]);
+    rand::rng().fill_bytes(&mut bytes[4..size]);
     bytes.freeze()
 }
 

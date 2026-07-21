@@ -29,6 +29,7 @@ use rand::prelude::SliceRandom;
 use tari_comms::{
     Minimized,
     PeerConnection,
+    RefKind,
     peer_manager::{NodeId, Peer},
 };
 use tari_utilities::hex::Hex;
@@ -164,7 +165,7 @@ impl SeedStrap {
         );
 
         let mut seed_peers = seed_peers_available.clone();
-        seed_peers.shuffle(&mut rand::thread_rng());
+        seed_peers.shuffle(&mut rand::rng());
         let mut seed_peers_iter = seed_peers.iter();
 
         let max_peers_to_sync_per_round = self.config().network_discovery.max_peers_to_sync_per_round;
@@ -421,7 +422,9 @@ async fn get_peers(
     for attempt in 1..=NUM_RETRIES {
         let dial_result = tokio::time::timeout(
             dial_peer_timeout,
-            context.connectivity.dial_peer(seed_peer_candidate.node_id.clone()),
+            context
+                .connectivity
+                .dial_peer(seed_peer_candidate.node_id.clone(), RefKind::Weak),
         )
         .await;
         let mut conn = match dial_result {

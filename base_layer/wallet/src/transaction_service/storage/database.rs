@@ -113,6 +113,7 @@ pub trait TransactionBackend: Send + Sync + Clone {
         &self,
         tx_id: TxId,
         reason: TxCancellationReason,
+        details: Option<String>,
     ) -> Result<(), TransactionStorageError>;
     /// Set cancellation on Pending transaction, this will update the transaction status
     fn set_pending_transaction_cancellation_status(
@@ -214,6 +215,7 @@ pub trait TransactionBackend: Send + Sync + Clone {
         &self,
         output_hash: &FixedHash,
         merkle_proof: &EncodedMerkleProof,
+        mined_in_height: Option<u64>,
     ) -> Result<(), TransactionStorageError>;
 
     fn fetch_burn_proof(&self, output_hash: &FixedHash) -> Result<Option<DbBurnProof>, TransactionStorageError>;
@@ -795,8 +797,9 @@ where T: TransactionBackend + 'static
         &self,
         tx_id: TxId,
         reason: TxCancellationReason,
+        details: Option<String>,
     ) -> Result<(), TransactionStorageError> {
-        self.db.reject_completed_transaction(tx_id, reason)
+        self.db.reject_completed_transaction(tx_id, reason, details)
     }
 
     pub fn cancel_pending_transaction(&self, tx_id: TxId) -> Result<(), TransactionStorageError> {
@@ -961,8 +964,10 @@ where T: TransactionBackend + 'static
         &self,
         output_hash: &FixedHash,
         merkle_proof: &EncodedMerkleProof,
+        mined_in_height: Option<u64>,
     ) -> Result<(), TransactionStorageError> {
-        self.db.update_burn_proof_set_merkle_proof(output_hash, merkle_proof)
+        self.db
+            .update_burn_proof_set_merkle_proof(output_hash, merkle_proof, mined_in_height)
     }
 
     pub fn fetch_burn_proof(&self, output_hash: &FixedHash) -> Result<Option<DbBurnProof>, TransactionStorageError> {

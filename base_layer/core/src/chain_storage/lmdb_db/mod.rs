@@ -20,6 +20,10 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// Re-exported for the byte-level fixture comparison test in
+// `chain_storage::tests::lmdb_unit_tests`. Not used by production code paths.
+#[cfg(test)]
+pub(crate) use lmdb_db::build_lmdb_store;
 pub use lmdb_db::{
     LMDBDatabase,
     create_lmdb_database,
@@ -29,7 +33,7 @@ pub use lmdb_db::{
     get_all_database_names,
 };
 use serde::{Deserialize, Serialize};
-pub use stats_collector::DatabaseStats;
+pub use stats_collector::{DatabaseStats, MigrationPhase};
 use tari_common_types::types::HashOutput;
 use tari_crypto::hash_domain;
 use tari_transaction_components::transaction_components::{TransactionInput, TransactionKernel, TransactionOutput};
@@ -47,6 +51,7 @@ pub use lmdb_db::{
     BREATHING_TIME_MS_MIN,
     BlockchainCheckRequest,
     BlockchainCheckStatus,
+    BurnCommitmentRebuildStatus,
     CheckFailure,
     PayrefRebuildStatus,
 };

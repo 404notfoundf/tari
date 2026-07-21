@@ -62,7 +62,7 @@ use tari_common_types::{
     epoch::VnEpoch,
     seeds::{cipher_seed::CipherSeed, seed_words::SeedWords},
     tari_address::TariAddress,
-    transaction::TxId,
+    transaction::{LegacyTransactionStatus, TxId},
     types::{
         CompressedCommitment,
         CompressedPublicKey,
@@ -73,7 +73,7 @@ use tari_common_types::{
         UncompressedSignature,
     },
 };
-use tari_core::blocks::pre_mine::get_pre_mine_items;
+use tari_core::blocks::pre_mine::{get_embedded_pre_mine_json, get_pre_mine_items};
 use tari_crypto::ristretto::RistrettoSecretKey;
 use tari_p2p::{PeerSeedsConfig, auto_update::AutoUpdateConfig};
 use tari_script::{CompressedCheckSigSchnorrSignature, push_pubkey_script};
@@ -1739,10 +1739,64 @@ pub async fn command_runner(
                             target: LOG_TARGET,
                             "send-one-sided-to-stealth-address concluded with tx_id {tx_id}"
                         );
-                        println!("Transaction ID: {tx_id}");
+                        println!("Transaction completed. ID: {tx_id}");
+                        println!("Waiting for broadcast confirmation...");
                         tx_ids.push(tx_id);
+                        // Wait for broadcast confirmation
+                        let broadcast_timeout = Duration::from_millis(config.grpc_broadcast_confirmation);
+                        match timeout(broadcast_timeout, async {
+                            loop {
+                                if let Ok(Some(tx)) = transaction_service.get_any_transaction(tx_id).await {
+                                    match tx.status() {
+                                        LegacyTransactionStatus::Broadcast |
+                                        LegacyTransactionStatus::MinedUnconfirmed |
+                                        LegacyTransactionStatus::MinedConfirmed |
+                                        LegacyTransactionStatus::OneSidedUnconfirmed |
+                                        LegacyTransactionStatus::OneSidedConfirmed |
+                                        LegacyTransactionStatus::MinedConfirmedLocked |
+                                        LegacyTransactionStatus::OneSidedConfirmedLocked |
+                                        LegacyTransactionStatus::CoinbaseConfirmedLocked |
+                                        LegacyTransactionStatus::Imported => {
+                                            break Ok(tx.status());
+                                        },
+                                        LegacyTransactionStatus::Rejected => {
+                                            let reason = tx
+                                                .cancelled_reason()
+                                                .map(|r| format!("{r}"))
+                                                .unwrap_or_else(|| "Unknown reason".to_string());
+                                            break Err(reason);
+                                        },
+                                        _ => {
+                                            sleep(Duration::from_millis(100)).await;
+                                        },
+                                    }
+                                } else {
+                                    sleep(Duration::from_millis(100)).await;
+                                }
+                            }
+                        })
+                        .await
+                        {
+                            Ok(Ok(status)) => {
+                                println!(
+                                    "Transaction {tx_id} successfully broadcast to the network (status: {status})."
+                                );
+                            },
+                            Ok(Err(reason)) => {
+                                eprintln!(
+                                    "Transaction {tx_id} was completed but rejected during submission: {reason}. \
+                                     Transaction is saved and can be retried."
+                                );
+                            },
+                            Err(_) => {
+                                println!(
+                                    "Transaction {tx_id} completed but broadcast is still pending. Transaction is \
+                                     saved and will be broadcast when possible."
+                                );
+                            },
+                        }
                     },
-                    Err(e) => eprintln!("SendOneSidedToStealthAddress error! {e}"),
+                    Err(e) => eprintln!("Transaction abandoned: {e}"),
                 }
             },
             MakeItRain(args) => {
@@ -2885,7 +2939,10 @@ pub async fn command_runner(
                 match transaction_service.get_completed_transaction(tx_id).await {
                     Ok(completed_tx) => {
                         let has_signature = completed_tx.transaction_signature != CompressedSignature::default();
+                        let num_confirmations_required = config.transaction_service_config.num_confirmations_required;
                         println!("--- Validate Transaction {} ---", tx_id);
+                        println!("Current status: {}", completed_tx.status);
+                        println!("Lock height: {}", completed_tx.lock_height);
                         if has_signature {
                             println!("Transaction has a signature, validating via base node query...");
                             let client = wallet.wallet_connectivity.obtain_base_node_wallet_rpc_client().await;
@@ -2907,17 +2964,74 @@ pub async fn command_runner(
                                                     let num_confirmations = tip.saturating_sub(mined_height);
                                                     println!("Transaction is MINED at height {}", mined_height);
                                                     println!("Confirmations: {}", num_confirmations);
-                                                    if let Some(hash) = response.mined_header_hash {
+                                                    if let Some(ref hash) = response.mined_header_hash {
                                                         println!("Mined in block: {}", hash.to_hex());
                                                     }
                                                     if let Some(ts) = response.mined_timestamp {
                                                         println!("Mined timestamp: {}", ts);
+                                                    }
+
+                                                    let is_confirmed = num_confirmations >= num_confirmations_required;
+                                                    let is_locked = completed_tx.lock_height > tip;
+                                                    let expected_status = if is_confirmed {
+                                                        if is_locked {
+                                                            completed_tx.status.mined_confirm_locked()
+                                                        } else {
+                                                            completed_tx.status.mined_confirm()
+                                                        }
+                                                    } else {
+                                                        completed_tx.status.mined_unconfirm()
+                                                    };
+
+                                                    println!("Locked: {}", is_locked);
+                                                    println!("Confirmed: {}", is_confirmed);
+
+                                                    if completed_tx.status == expected_status {
+                                                        println!("OK: Status '{}' is correct", completed_tx.status);
+                                                    } else {
+                                                        println!(
+                                                            "FIX: Status mismatch! Wallet has '{}', expected '{}'. \
+                                                             Updating...",
+                                                            completed_tx.status, expected_status
+                                                        );
+                                                        let mined_in_block = response
+                                                            .mined_header_hash
+                                                            .and_then(|h| FixedHash::try_from(h.as_slice()).ok())
+                                                            .unwrap_or_default();
+                                                        let mined_ts = response.mined_timestamp.unwrap_or(0);
+                                                        match transaction_service
+                                                            .set_transaction_mined_height(
+                                                                tx_id,
+                                                                mined_height,
+                                                                mined_in_block,
+                                                                mined_ts,
+                                                                expected_status,
+                                                                tip,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(()) => println!("Status updated successfully"),
+                                                            Err(e) => {
+                                                                eprintln!("Error updating status: {e}")
+                                                            },
+                                                        }
                                                     }
                                                 } else {
                                                     println!("Transaction is reported as mined but has no height");
                                                 }
                                             } else {
                                                 println!("Transaction is UNMINED (not found on chain)");
+                                                if completed_tx.status.is_mined() {
+                                                    println!(
+                                                        "FIX: Wallet has status '{}' but chain says unmined. \
+                                                         Updating...",
+                                                        completed_tx.status
+                                                    );
+                                                    match transaction_service.set_transaction_as_unmined(tx_id).await {
+                                                        Ok(()) => println!("Status updated to unmined"),
+                                                        Err(e) => eprintln!("Error updating status: {e}"),
+                                                    }
+                                                }
                                             }
                                         },
                                         Err(e) => eprintln!("Error querying base node: {e}"),
@@ -2951,10 +3065,56 @@ pub async fn command_runner(
                                         println!("Mined in block: {}", block_hash.to_hex());
                                         println!("Confirmations: {}", num_confirmations);
                                         println!("Current tip: {}", tip);
-                                        let is_confirmed = num_confirmations >= 3;
+
+                                        let is_confirmed = num_confirmations >= num_confirmations_required;
+                                        let is_locked = completed_tx.lock_height > tip;
+                                        let expected_status = if is_confirmed {
+                                            if is_locked {
+                                                completed_tx.status.mined_confirm_locked()
+                                            } else {
+                                                completed_tx.status.mined_confirm()
+                                            }
+                                        } else {
+                                            completed_tx.status.mined_unconfirm()
+                                        };
+
+                                        println!("Locked: {}", is_locked);
                                         println!("Confirmed: {}", is_confirmed);
+
+                                        if completed_tx.status == expected_status {
+                                            println!("OK: Status '{}' is correct", completed_tx.status);
+                                        } else {
+                                            println!(
+                                                "FIX: Status mismatch! Wallet has '{}', expected '{}'. Updating...",
+                                                completed_tx.status, expected_status
+                                            );
+                                            match transaction_service
+                                                .set_transaction_mined_height(
+                                                    tx_id,
+                                                    mined_height,
+                                                    block_hash,
+                                                    0,
+                                                    expected_status,
+                                                    tip,
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => println!("Status updated successfully"),
+                                                Err(e) => eprintln!("Error updating status: {e}"),
+                                            }
+                                        }
                                     } else {
                                         println!("Transaction outputs are NOT mined (not detected on chain)");
+                                        if completed_tx.status.is_mined() {
+                                            println!(
+                                                "FIX: Wallet has status '{}' but outputs not mined. Updating...",
+                                                completed_tx.status
+                                            );
+                                            match transaction_service.set_transaction_as_unmined(tx_id).await {
+                                                Ok(()) => println!("Status updated to unmined"),
+                                                Err(e) => eprintln!("Error updating status: {e}"),
+                                            }
+                                        }
                                     }
                                 },
                                 Err(e) => eprintln!("Error getting output info: {e}"),
@@ -3391,26 +3551,7 @@ fn get_embedded_pre_mine_outputs(
 }
 
 fn get_all_embedded_pre_mine_outputs() -> Result<Vec<TransactionOutput>, CommandError> {
-    let pre_mine_contents = match Network::get_current_or_user_setting_or_default() {
-        Network::MainNet => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/mainnet_pre_mine.json")
-        },
-        Network::StageNet => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/stagenet_pre_mine.json")
-        },
-        Network::NextNet => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/nextnet_pre_mine.json")
-        },
-        Network::LocalNet => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/esmeralda_pre_mine.json")
-        },
-        Network::Igor => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/igor_pre_mine.json")
-        },
-        Network::Esmeralda => {
-            include_str!("../../../../base_layer/core/src/blocks/pre_mine/esmeralda_pre_mine.json")
-        },
-    };
+    let pre_mine_contents = get_embedded_pre_mine_json(Network::get_current_or_user_setting_or_default());
     let mut utxos = Vec::new();
     let lines_count = pre_mine_contents.lines().count();
     for (counter, line) in (1..).zip(pre_mine_contents.lines()) {

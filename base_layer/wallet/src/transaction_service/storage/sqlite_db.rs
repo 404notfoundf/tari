@@ -726,11 +726,12 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
         &self,
         tx_id: TxId,
         reason: TxCancellationReason,
+        details: Option<String>,
     ) -> Result<(), TransactionStorageError> {
         let start = Instant::now();
         let mut conn = self.database_connection.get_pooled_connection()?;
         let acquire_lock = start.elapsed();
-        match CompletedTransactionSql::reject_completed_transaction(tx_id, reason, &mut conn) {
+        match CompletedTransactionSql::reject_completed_transaction(tx_id, reason, details, &mut conn) {
             Ok(_) => {},
             Err(TransactionStorageError::DieselError(DieselError::NotFound)) => {
                 return Err(TransactionStorageError::ValueNotFound(DbKey::CompletedTransaction(
@@ -966,14 +967,10 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
         let mut conn = self.database_connection.get_pooled_connection()?;
         let acquire_lock = start.elapsed();
         let mut tx_info: Vec<UnconfirmedTransactionInfo> = vec![];
-        match UnconfirmedTransactionInfoSql::fetch_unconfirmed_transactions_info(&mut conn) {
-            Ok(info) => {
-                for item in info {
-                    let item = item.decrypt(&self.cipher)?;
-                    tx_info.push(UnconfirmedTransactionInfo::try_from(item)?);
-                }
-            },
-            Err(e) => return Err(e),
+        let info = UnconfirmedTransactionInfoSql::fetch_unconfirmed_transactions_info(&mut conn)?;
+        for item in info {
+            let item = item.decrypt(&self.cipher)?;
+            tx_info.push(UnconfirmedTransactionInfo::try_from(item)?);
         }
         if start.elapsed().as_millis() > 0 {
             trace!(
@@ -1124,13 +1121,9 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
         let mut conn = self.database_connection.get_pooled_connection()?;
         let acquire_lock = start.elapsed();
         let mut sender_info: Vec<InboundTransactionSenderInfo> = vec![];
-        match InboundTransactionSenderInfoSql::get_pending_inbound_transaction_sender_info(&mut conn) {
-            Ok(info) => {
-                for item in info {
-                    sender_info.push(InboundTransactionSenderInfo::try_from(item)?);
-                }
-            },
-            Err(e) => return Err(e),
+        let info = InboundTransactionSenderInfoSql::get_pending_inbound_transaction_sender_info(&mut conn)?;
+        for item in info {
+            sender_info.push(InboundTransactionSenderInfo::try_from(item)?);
         }
         if start.elapsed().as_millis() > 0 {
             trace!(
@@ -1478,6 +1471,7 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
         &self,
         output_hash: &FixedHash,
         merkle_proof: &EncodedMerkleProof,
+        mined_in_height: Option<u64>,
     ) -> Result<(), TransactionStorageError> {
         use crate::schema::burn_proofs;
 
@@ -1485,6 +1479,7 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
         let num_updated = diesel::update(burn_proofs::table)
             .set((
                 burn_proofs::kernel_merkle_proof.eq(Some(serializers::bincode_encode(merkle_proof)?)),
+                burn_proofs::mined_in_height.eq(mined_in_height.map(|h| h as i64)),
                 burn_proofs::updated_at.eq(now()),
             ))
             .filter(burn_proofs::output_hash.eq(output_hash.as_bytes()))
@@ -1572,16 +1567,16 @@ impl TransactionBackend for TransactionServiceSqliteDatabase {
             )
             .load::<CompletedTransactionSql>(&mut conn)?;
 
-        if txs.is_empty() {
-            return Ok(());
-        }
-
         info!(
             target: LOG_TARGET,
             "check_lock_height_status: Found {} confirmed transactions with lock_height > tip ({}), updating to locked",
             txs.len(),
             tip_height
         );
+
+        if txs.is_empty() {
+            return Ok(());
+        }
 
         for tx in txs {
             let status =
@@ -2223,6 +2218,7 @@ pub struct CompletedTransactionSql {
     pub change_output_hashes: Option<Vec<u8>>,
     user_payment_id: Option<Vec<u8>>,
     lock_height: Option<i64>,
+    rejection_reason: Option<String>,
 }
 
 impl CompletedTransactionSql {
@@ -2380,6 +2376,7 @@ impl CompletedTransactionSql {
     pub fn reject_completed_transaction(
         tx_id: TxId,
         reason: TxCancellationReason,
+        details: Option<String>,
         conn: &mut SqliteConnection,
     ) -> Result<(), TransactionStorageError> {
         diesel::update(
@@ -2390,6 +2387,7 @@ impl CompletedTransactionSql {
         .set(UpdateCompletedTransactionSql {
             cancelled: Some(Some(reason as i32)),
             status: Some(LegacyTransactionStatus::Rejected as i32),
+            rejection_reason: Some(details),
             ..Default::default()
         })
         .execute(conn)
@@ -2664,6 +2662,7 @@ impl CompletedTransactionSql {
             received_output_hashes: Some(fixedhash_vec_to_bytes(&c.received_output_hashes)),
             change_output_hashes: Some(fixedhash_vec_to_bytes(&c.change_output_hashes)),
             lock_height: Some(c.lock_height as i64),
+            rejection_reason: c.rejection_reason.clone(),
         };
 
         output.encrypt(cipher).map_err(TransactionStorageError::AeadError)
@@ -2803,6 +2802,7 @@ impl CompletedTransaction {
             received_output_hashes: bytes_to_fixedhash_vec(&c.received_output_hashes.unwrap_or_default()),
             change_output_hashes: bytes_to_fixedhash_vec(&c.change_output_hashes.unwrap_or_default()),
             lock_height,
+            rejection_reason: c.rejection_reason.clone(),
         };
 
         // zeroize sensitive data
@@ -2832,6 +2832,7 @@ pub struct UpdateCompletedTransactionSql {
     received_output_hashes: Option<Option<Vec<u8>>>,
     change_output_hashes: Option<Option<Vec<u8>>>,
     lock_height: Option<Option<i64>>,
+    rejection_reason: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3054,7 +3055,7 @@ mod test {
     use chrono::Utc;
     use diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
-    use rand::{RngCore, rngs::OsRng};
+    use rand::Rng;
     use tari_common::configuration::Network;
     use tari_common_sqlite::{PRAGMA_BUSY_TIMEOUT, sqlite_connection_pool::SqliteConnectionPool};
     use tari_common_types::{
@@ -3112,7 +3113,7 @@ mod test {
             SqliteConnection::establish(&db_path).unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         let mut key = [0u8; size_of::<Key>()];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         let key_ga = Key::from_slice(&key);
         let cipher = XChaCha20Poly1305::new(key_ga);
 
@@ -3149,7 +3150,7 @@ mod test {
             .unwrap();
 
         let address = TariAddress::new_single_address_with_interactive_only(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3170,7 +3171,7 @@ mod test {
             sent_output_hashes: vec![],
         };
         let address = TariAddress::new_single_address_with_interactive_only(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3232,8 +3233,8 @@ mod test {
         .unwrap();
 
         let source_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3306,18 +3307,18 @@ mod test {
             vec![],
             vec![],
             vec![],
-            PrivateKey::random(&mut OsRng),
-            PrivateKey::random(&mut OsRng),
+            PrivateKey::random(&mut rand::rng()),
+            PrivateKey::random(&mut rand::rng()),
         );
         let source_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
         let destination_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3346,16 +3347,17 @@ mod test {
             mined_timestamp: None,
             payment_id: MemoField::new_open_from_string("Yo!", TxType::PaymentToOther).unwrap(),
             lock_height: 0,
+            rejection_reason: None,
         };
         let source_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
         let destination_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3384,6 +3386,7 @@ mod test {
             mined_timestamp: None,
             payment_id: MemoField::new_open_from_string("Yo!", TxType::PaymentToOther).unwrap(),
             lock_height: 0,
+            rejection_reason: None,
         };
 
         CompletedTransactionSql::try_from(completed_tx1.clone(), &cipher)
@@ -3534,13 +3537,13 @@ mod test {
         sql_query("PRAGMA foreign_keys = ON").execute(&mut conn).unwrap();
 
         let mut key = [0u8; size_of::<Key>()];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         let key_ga = Key::from_slice(&key);
         let cipher = XChaCha20Poly1305::new(key_ga);
 
         let source_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3568,8 +3571,8 @@ mod test {
         assert_eq!(inbound_tx, decrypted_inbound_tx);
 
         let destination_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3599,14 +3602,14 @@ mod test {
         assert_eq!(outbound_tx, decrypted_outbound_tx);
 
         let source_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
         let destination_address = TariAddress::new_dual_address_with_default_features(
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+            CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
             Network::LocalNet,
         )
         .unwrap();
@@ -3620,8 +3623,8 @@ mod test {
                 vec![],
                 vec![],
                 vec![],
-                PrivateKey::random(&mut OsRng),
-                PrivateKey::random(&mut OsRng),
+                PrivateKey::random(&mut rand::rng()),
+                PrivateKey::random(&mut rand::rng()),
             ),
             status: LegacyTransactionStatus::MinedUnconfirmed,
             timestamp: Utc::now(),
@@ -3638,6 +3641,7 @@ mod test {
             mined_timestamp: None,
             payment_id: MemoField::new_open_from_string("Yo!", TxType::PaymentToOther).unwrap(),
             lock_height: 0,
+            rejection_reason: None,
         };
 
         let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx.clone(), &cipher).unwrap();
@@ -3665,7 +3669,7 @@ mod test {
             .unwrap_or_else(|_| panic!("Error connecting to {db_path}"));
 
         let mut key = [0u8; size_of::<Key>()];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         let key_ga = Key::from_slice(&key);
         let cipher = XChaCha20Poly1305::new(key_ga);
 
@@ -3688,8 +3692,8 @@ mod test {
                 .expect("Migrations failed");
 
             let source_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
@@ -3712,8 +3716,8 @@ mod test {
             inbound_tx_sql.commit(&mut conn).unwrap();
 
             let destination_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
@@ -3737,14 +3741,14 @@ mod test {
             outbound_tx_sql.commit(&mut conn).unwrap();
 
             let source_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
             let destination_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
@@ -3758,8 +3762,8 @@ mod test {
                     vec![],
                     vec![],
                     vec![],
-                    PrivateKey::random(&mut OsRng),
-                    PrivateKey::random(&mut OsRng),
+                    PrivateKey::random(&mut rand::rng()),
+                    PrivateKey::random(&mut rand::rng()),
                 ),
                 status: LegacyTransactionStatus::MinedUnconfirmed,
                 timestamp: Utc::now(),
@@ -3776,6 +3780,7 @@ mod test {
                 mined_timestamp: None,
                 payment_id: MemoField::new_open_from_string("Yo!", TxType::PaymentToOther).unwrap(),
                 lock_height: 0,
+                rejection_reason: None,
             };
             let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx, &cipher).unwrap();
 
@@ -3793,7 +3798,7 @@ mod test {
         assert!(db2.fetch(&DbKey::CompletedTransactions(0)).is_ok());
 
         let mut key = [0u8; size_of::<Key>()];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         let key_ga = Key::from_slice(&key);
         let new_cipher = XChaCha20Poly1305::new(key_ga);
 
@@ -3834,7 +3839,7 @@ mod test {
             .expect("Migrations failed");
 
         let mut key = [0u8; size_of::<Key>()];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         let key_ga = Key::from_slice(&key);
         let cipher = XChaCha20Poly1305::new(key_ga);
 
@@ -3882,14 +3887,14 @@ mod test {
                 _ => (None, LegacyTransactionStatus::Completed),
             };
             let source_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
             let destination_address = TariAddress::new_dual_address_with_default_features(
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
-                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
+                CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng())),
                 Network::LocalNet,
             )
             .unwrap();
@@ -3903,8 +3908,8 @@ mod test {
                     vec![],
                     vec![],
                     vec![],
-                    PrivateKey::random(&mut OsRng),
-                    PrivateKey::random(&mut OsRng),
+                    PrivateKey::random(&mut rand::rng()),
+                    PrivateKey::random(&mut rand::rng()),
                 ),
                 status,
                 timestamp: Utc::now(),
@@ -3921,6 +3926,7 @@ mod test {
                 mined_timestamp: None,
                 payment_id: MemoField::new_open_from_string("Yo!", TxType::PaymentToOther).unwrap(),
                 lock_height: 0,
+                rejection_reason: None,
             };
             let completed_tx_sql = CompletedTransactionSql::try_from(completed_tx.clone(), &cipher).unwrap();
 
