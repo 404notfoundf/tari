@@ -191,6 +191,27 @@ listener_self_liveness_check_interval = 15
 # with a new session. If false, the RPC server will reject the new session and preserve the older session.
 # (default value = true).
 #cull_oldest_peer_rpc_connection_on_full = true
+# How long, in seconds, an RPC session may sit without receiving a request before the server closes it and reclaims its
+# slot in `rpc_max_simultaneous_sessions`. Time spent servicing a request does not count towards this. A peer that
+# disappears without closing its substream would otherwise hold its session forever. (default value = 600).
+#rpc_idle_session_timeout = 600
+# The longest deadline, in seconds, the RPC server will honour from a client. The deadline bounds a single service call
+# and the gap between two messages of a streaming response, so without a ceiling a peer can switch off those timeouts
+# entirely. Requests asking for more are clamped to this, not rejected; a request that then runs past it gets a Timeout
+# status. Values below the 1 second minimum client deadline are floored at it. (default value = 600).
+#rpc_maximum_client_deadline = 600
+
+# Enable proactive (recovery) dialing in the comms connectivity manager. The DHT peer pool owns the steady-state
+# connection count; the proactive dialer only runs when this node has fewer than `proactive_dialing_floor`
+# connections, i.e. when the pool cannot recover unaided (cold start, total isolation, seed re-dial). Setting this
+# to false is the kill switch for that subsystem. (default value = true)
+#proactive_dialing_enabled = true
+# The connection count below which the proactive dialer is allowed to run. This is a floor, not a target: it must
+# stay strictly below the DHT peer pool size (`dht.num_neighbouring_nodes` + `dht.num_random_nodes`, 12 by
+# default) or the dialer becomes a second steady-state connection-count controller fighting the pool on the same
+# refresh tick. A floor set at or above the pool size is clamped below it at startup, with a warning.
+# (default value = 8)
+#proactive_dialing_floor = 8
 
 [base_node.p2p.transport]
 # -------------- Transport configuration --------------

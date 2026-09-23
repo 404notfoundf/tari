@@ -161,11 +161,13 @@ async fn added_pool_peers() {
 
     dht_connectivity.spawn();
 
-    // Wait for calls to add peers
+    // Wait for the dials themselves rather than for *a* call: `call_count` counts every recorded call, and
+    // `DhtConnectivity` makes others before it gets to dialling, so waiting on it can return before the dial
+    // request has been processed - leaving the exact-count assertion below looking at a partial list.
     async_assert!(
-        connectivity.call_count().await >= 1,
-        max_attempts = 20,
-        interval = Duration::from_millis(10),
+        connectivity.get_dialed_peers().await.len() >= 5,
+        max_attempts = 50,
+        interval = Duration::from_millis(20),
     );
 
     let _calls = connectivity.take_calls().await;
@@ -183,6 +185,50 @@ async fn added_pool_peers() {
 
     // 1 for this test, 1 for the connectivity manager [FLAKY test, sometimes it is 3]
     assert!(conn.handle_count() == 2 || conn.handle_count() == 3);
+}
+
+/// Dials that never resolve must back off rather than be reissued every refresh cycle.
+///
+/// A pool that never becomes healthy re-selects the same unreachable peers on every cycle, and every
+/// failed dial writes the peer back through `PeerManager::add_or_update_peer`. That write load is
+/// what saturates the peer database and, ultimately, wedges the comms actors.
+#[tokio::test]
+async fn failed_dials_are_backed_off_instead_of_reissued() {
+    let peers = repeat_with(|| create_good_standing_peer(&make_node_identity()))
+        .take(4)
+        .collect::<Vec<_>>();
+    let node_ids = peers.iter().map(|p| p.node_id.clone()).collect::<Vec<_>>();
+    let (mut dht_connectivity, _, _connectivity, _peer_manager, _node_identity, _shutdown) =
+        setup(DhtConfig::default(), make_node_identity(), peers).await;
+
+    // Every peer is a candidate to begin with.
+    let selected = dht_connectivity.fetch_random_peers(4, &[], false).await.unwrap();
+    assert_eq!(selected.len(), 4);
+
+    // Fail a dial to each of them.
+    for node_id in &node_ids {
+        dht_connectivity.record_dial_failure(node_id);
+    }
+    let selected = dht_connectivity.fetch_random_peers(4, &[], false).await.unwrap();
+    assert!(
+        selected.is_empty(),
+        "peers whose dials just failed were selected for another dial immediately: {selected:?}"
+    );
+
+    // Consecutive failures push the next attempt further out.
+    let first = *dht_connectivity.dial_backoff.get(&node_ids[0]).unwrap();
+    assert_eq!(first.failures, 1);
+    dht_connectivity.record_dial_failure(&node_ids[0]);
+    let second = *dht_connectivity.dial_backoff.get(&node_ids[0]).unwrap();
+    assert_eq!(second.failures, 2);
+    assert!(second.retry_after > first.retry_after);
+
+    // Connecting clears the backoff: the peer is reachable after all.
+    let (conn, _) = create_dummy_peer_connection(node_ids[0].clone());
+    dht_connectivity.handle_new_peer_connected(conn).await.unwrap();
+    assert!(!dht_connectivity.dial_backoff.contains_key(&node_ids[0]));
+    let selected = dht_connectivity.fetch_random_peers(4, &[], false).await.unwrap();
+    assert_eq!(selected, vec![node_ids[0].clone()]);
 }
 
 mod metrics {

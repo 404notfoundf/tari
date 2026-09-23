@@ -32,7 +32,7 @@ use tari_node_components::blocks::{BlockHeader, BlockHeaderValidationError, Bloc
 use tari_sidechain::SidechainProofValidationError;
 use tari_transaction_components::{
     consensus::consensus_constants::ConsensusConstants,
-    tari_proof_of_work::{Difficulty, PowAlgorithm, PowError},
+    tari_proof_of_work::{PowAlgorithm, PowError},
     transaction_components::{TransactionInput, TransactionOutput},
 };
 
@@ -41,6 +41,7 @@ use crate::{
     consensus::BaseNodeConsensusManager,
     proof_of_work::{
         AchievedTargetDifficulty,
+        AdjustedTarget,
         cuckaroo_pow::cuckaroo_difficulty,
         monero_randomx_difficulty,
         randomx_factory::RandomXFactory,
@@ -74,7 +75,7 @@ pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> Result<EpochTime, Vali
         trace!(
             target: LOG_TARGET,
             "No median timestamp available, estimating median as avg of [{}] and [{}]",
-            timestamps.get(mid_index - 1).expect("Already checked"),
+            timestamps.get(mid_index.saturating_sub(1)).expect("Already checked"),
             timestamps.get(mid_index).expect("Already checked"),
         );
         // To compute this mean, we use `u128` to avoid overflow with the internal `u64` typing
@@ -82,8 +83,13 @@ pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> Result<EpochTime, Vali
         // To make the linter happy, we use `u64::MAX` in the impossible case that the cast fails
         EpochTime::from(
             u64::try_from(
-                (u128::from(timestamps.get(mid_index - 1).expect("Already checked").as_u64()) +
-                    u128::from(timestamps.get(mid_index).expect("Already checked").as_u64())) /
+                u128::from(
+                    timestamps
+                        .get(mid_index.saturating_sub(1))
+                        .expect("Already checked")
+                        .as_u64(),
+                )
+                .saturating_add(u128::from(timestamps.get(mid_index).expect("Already checked").as_u64())) /
                     2,
             )
             .unwrap_or(u64::MAX),
@@ -126,7 +132,7 @@ pub fn check_header_timestamp_greater_than_median(
 }
 pub fn check_target_difficulty(
     block_header: &BlockHeader,
-    target: Difficulty,
+    target: AdjustedTarget,
     randomx_factory: &RandomXFactory,
     gen_hash: &FixedHash,
     consensus: &BaseNodeConsensusManager,
@@ -137,26 +143,32 @@ pub fn check_target_difficulty(
         PowAlgorithm::RandomXT => tari_randomx_difficulty(block_header, randomx_factory, &tari_vm_key)?,
         PowAlgorithm::Sha3x => sha3x_difficulty(block_header)?,
         PowAlgorithm::Cuckaroo => {
-            let cuckaroo_cycle_length = consensus
-                .consensus_constants(block_header.height)
-                .cuckaroo_cycle_length();
-            let cuckaroo_bits = consensus.consensus_constants(block_header.height).cuckaroo_edge_bits();
-            cuckaroo_difficulty(block_header, cuckaroo_cycle_length, cuckaroo_bits)?
+            let constants = consensus.consensus_constants(block_header.height);
+            cuckaroo_difficulty(
+                block_header,
+                constants.cuckaroo_cycle_length(),
+                constants.cuckaroo_edge_bits(),
+                constants.bipartite_cuckaroo_verification(),
+            )?
         },
     };
-    match AchievedTargetDifficulty::try_construct(block_header.pow_algo(), target, achieved) {
+    match AchievedTargetDifficulty::try_construct(block_header.pow_algo(), target.base, target.adjusted, achieved) {
         Some(achieved_target) => Ok(achieved_target),
         None => {
             warn!(
                 target: LOG_TARGET,
-                "Proof of work for {} at height {} was below the target difficulty. Achieved: {}, Target: {}",
+                "Proof of work for {} at height {} was below the target difficulty. Achieved: {}, Target: {} (adjusted: {})",
                 block_header.hash().to_hex(),
                 block_header.height,
                 achieved,
-                target
+                target.base,
+                target.adjusted
             );
             Err(ValidationError::BlockHeaderError(
-                BlockHeaderValidationError::ProofOfWorkError(PowError::AchievedDifficultyTooLow { achieved, target }),
+                BlockHeaderValidationError::ProofOfWorkError(PowError::AchievedDifficultyTooLow {
+                    achieved,
+                    target: target.adjusted,
+                }),
             ))
         },
     }
@@ -175,7 +187,8 @@ pub fn check_input_is_utxo<B: BlockchainBackend>(db: &B, input: &TransactionInpu
             return Ok(());
         }
 
-        let output = db.fetch_output(&utxo_hash)?;
+        // Diagnostic logging only; any of the (content-identical) entries for this hash is fine.
+        let output = db.fetch_outputs(&utxo_hash)?.into_iter().next();
         warn!(
             target: LOG_TARGET,
             "Input spends a UTXO but does not produce the same hash as the output it spends: Expected hash: {}, \
@@ -191,13 +204,13 @@ pub fn check_input_is_utxo<B: BlockchainBackend>(db: &B, input: &TransactionInpu
     }
 
     // Wallet needs to know if a transaction has already been mined and uses this error variant to do so.
-    if db.fetch_output(&output_hash)?.is_some() {
+    if !db.fetch_outputs(&output_hash)?.is_empty() {
         warn!(
             target: LOG_TARGET,
             "Validation failed due to already spent input: {input}"
         );
-        // We know that the output here must be spent because `fetch_unspent_output_hash_by_commitment` would have
-        // been Some
+        // The commitment is not in the unspent set (checked above) but the output exists in the index,
+        // so it must already be spent.
         return Err(ValidationError::ContainsSTxO);
     }
 
@@ -343,7 +356,8 @@ pub fn check_eviction_proof<B: BlockchainBackend>(
             shard_group
         )));
     }
-    let quorum_threshold = committee_size - (committee_size - 1) / 3;
+    // The `committee_size == 0` guard above proves neither of these can underflow.
+    let quorum_threshold = committee_size.saturating_sub(committee_size.saturating_sub(1) / 3);
 
     let sidechain_pk = sidechain_features.sidechain_public_key();
 
@@ -569,7 +583,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
@@ -596,7 +610,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
@@ -624,7 +638,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
 

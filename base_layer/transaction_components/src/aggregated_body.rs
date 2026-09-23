@@ -73,7 +73,7 @@ impl AggregateBody {
     }
 
     /// Create a new aggregate body from provided inputs, outputs and kernels
-    pub fn new(
+    pub fn new_unsorted(
         inputs: Vec<TransactionInput>,
         outputs: Vec<TransactionOutput>,
         kernels: Vec<TransactionKernel>,
@@ -99,6 +99,15 @@ impl AggregateBody {
             outputs,
             kernels,
         }
+    }
+
+    /// Provide mutable access to the input list alongside read-only access to the output list.
+    ///
+    /// This exists so that compact inputs can be hydrated in place against the outputs created in the same body.
+    /// Hydrating an input does not change its output hash, which is what the input ordering is based on, so the
+    /// `sorted` flag remains valid.
+    pub fn inputs_mut_with_outputs(&mut self) -> (&mut [TransactionInput], &[TransactionOutput]) {
+        (&mut self.inputs, &self.outputs)
     }
 
     /// Provide read-only access to the input list
@@ -196,7 +205,8 @@ impl AggregateBody {
         // If the body is sorted, can do a linear check instead of n^2
         if self.sorted {
             for i in 1..self.inputs().len() {
-                if self.inputs().get(i).expect("Already checked") == self.inputs().get(i - 1).expect("Already checked")
+                if self.inputs().get(i).expect("Already checked") ==
+                    self.inputs().get(i.saturating_sub(1)).expect("Already checked")
                 {
                     return true;
                 }
@@ -204,7 +214,7 @@ impl AggregateBody {
             return false;
         }
         for i in 0..self.inputs().len() {
-            for j in (i + 1)..self.inputs().len() {
+            for j in i.saturating_add(1)..self.inputs().len() {
                 if self.inputs().get(i).expect("Already checked") == self.inputs().get(j).expect("Already checked") {
                     return true;
                 }
@@ -218,7 +228,7 @@ impl AggregateBody {
         if self.sorted {
             for i in 1..self.outputs().len() {
                 if self.outputs().get(i).expect("Already checked") ==
-                    self.outputs().get(i - 1).expect("Already checked")
+                    self.outputs().get(i.saturating_sub(1)).expect("Already checked")
                 {
                     return true;
                 }
@@ -226,7 +236,7 @@ impl AggregateBody {
             return false;
         }
         for i in 0..self.outputs().len() {
-            for j in (i + 1)..self.outputs().len() {
+            for j in i.saturating_add(1)..self.outputs().len() {
                 if self.outputs().get(i).expect("Already checked") == self.outputs().get(j).expect("Already checked") {
                     return true;
                 }
@@ -283,6 +293,8 @@ impl AggregateBody {
     /// 1. There is exactly ONE coinbase output
     /// 1. The coinbase output's maturity is correctly set
     /// 1. The reward amount is correct.
+    // Ristretto point/scalar arithmetic, not integer arithmetic: these operators cannot overflow.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn check_coinbase_output(
         &self,
         reward: MicroMinotari,
@@ -293,11 +305,11 @@ impl AggregateBody {
     ) -> Result<(), TransactionError> {
         let mut coinbase_utxo_sum = UncompressedCommitment::default();
         let mut coinbase_kernel = None;
-        let mut coinbase_counter = 0;
+        let mut coinbase_counter = 0u64;
         for utxo in self.outputs() {
             if utxo.features.output_type == OutputType::Coinbase {
-                coinbase_counter += 1;
-                if utxo.features.maturity < (height + coinbase_min_maturity) {
+                coinbase_counter = coinbase_counter.saturating_add(1);
+                if utxo.features.maturity < height.saturating_add(coinbase_min_maturity) {
                     warn!(target: LOG_TARGET, "Coinbase {utxo} found with maturity set too low");
                     return Err(TransactionError::InvalidCoinbaseMaturity);
                 }
@@ -324,7 +336,7 @@ impl AggregateBody {
             });
         }
 
-        let mut coinbase_kernel_counter = 0; // there should be exactly 1 coinbase kernel as well
+        let mut coinbase_kernel_counter = 0u64; // there should be exactly 1 coinbase kernel as well
         for kernel in self.kernels() {
             if kernel.features.contains(KernelFeatures::COINBASE_KERNEL) {
                 if kernel.fee != 0.into() {
@@ -334,7 +346,7 @@ impl AggregateBody {
                     );
                     return Err(TransactionError::InvalidCoinbase);
                 }
-                coinbase_kernel_counter += 1;
+                coinbase_kernel_counter = coinbase_kernel_counter.saturating_add(1);
                 coinbase_kernel = Some(kernel);
             }
         }

@@ -22,7 +22,7 @@
 use std::{
     cmp,
     cmp::{Ordering, max, min},
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::TryFrom,
     mem,
     ops::{Bound, RangeBounds},
@@ -77,7 +77,7 @@ use tari_node_components::blocks::{
 use tari_transaction_components::{
     BanPeriod,
     consensus::{ConsensusConstants, DomainSeparatedConsensusHasher},
-    tari_proof_of_work::PowAlgorithm,
+    tari_proof_of_work::{Difficulty, PowAlgorithm},
     transaction_components::{TransactionInput, TransactionKernel, TransactionOutput},
 };
 use tari_utilities::{ByteArray, epoch_time::EpochTime, hex::Hex};
@@ -134,10 +134,17 @@ use crate::{
     consensus::{BaseNodeConsensusManager, chain_strength_comparer::ChainStrengthComparer},
     input_mr_hash_from_pruned_mmr,
     kernel_mr_hash_from_pruned_mmr,
-    proof_of_work::{TargetDifficultyWindow, randomx_factory::RandomXFactory},
+    proof_of_work::{
+        MAX_BACKOFF_RUN_LOOKBACK,
+        PowBackoffTracker,
+        TargetDifficultyWindow,
+        adjust_target,
+        randomx_factory::RandomXFactory,
+    },
     validation::{
         CandidateBlockValidator,
         DifficultyCalculator,
+        HeaderChainContext,
         HeaderChainLinkedValidator,
         InternalConsistencyValidator,
         ValidationError,
@@ -299,6 +306,8 @@ where B: BlockchainBackend
         Ok(blockchain_db)
     }
 
+    // Ristretto point arithmetic on commitments, not integer arithmetic: cannot overflow.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn start(&self) -> Result<(), ChainStorageError> {
         let (is_empty, config) = {
             let db = self.db_read_access()?;
@@ -465,7 +474,10 @@ where B: BlockchainBackend
                     if blocks_remaining <= BACKGROUND_PRUNING_THRESHOLD {
                         return Ok(true);
                     }
-                    let chunk_end = (metadata.pruned_height() + BACKGROUND_PRUNING_CHUNK_SIZE).min(target);
+                    let chunk_end = metadata
+                        .pruned_height()
+                        .saturating_add(BACKGROUND_PRUNING_CHUNK_SIZE)
+                        .min(target);
                     prune_to_height(&mut *db, chunk_end)?;
                     info!(
                         target: LOG_TARGET,
@@ -935,7 +947,7 @@ where B: BlockchainBackend
                             let db_rw_lock = db_rw_lock.clone();
                             let res = tokio::task::spawn_blocking(move || {
                                 if let Ok(mut db) = db_rw_lock.write() {
-                                    rewind_to_height(&mut *db, height - 1)
+                                    rewind_to_height(&mut *db, height.saturating_sub(1))
                                 } else {
                                     Err(ChainStorageError::AccessError(
                                         "Write lock on blockchain backend failed".into(),
@@ -948,7 +960,7 @@ where B: BlockchainBackend
                                     info!(target: LOG_TARGET,
                                         "[Blockchain check] Rewound the blockchain to height {} after unrecoverable \
                                         corruption at height {}.",
-                                        height - 1, height
+                                        height.saturating_sub(1), height
                                     );
                                 },
                                 Ok(Err(e)) => {
@@ -968,7 +980,7 @@ where B: BlockchainBackend
                             info!(
                                 target: LOG_TARGET,
                                 "[Blockchain check] Autocorrect flag is disabled - manually rewind to height {}",
-                                height - 1,
+                                height.saturating_sub(1),
                             );
                         }
                         clear_flags(
@@ -1339,16 +1351,18 @@ where B: BlockchainBackend
         db.fetch_chain_metadata()
     }
 
-    /// Returns a copy of the current output mined info
-    pub fn fetch_output(&self, output_hash: HashOutput) -> Result<Option<OutputMinedInfo>, ChainStorageError> {
+    /// Returns the mined info for every output with this hash, one entry per header it is indexed under. A hash can be
+    /// indexed under more than one header, for example across reorg history.
+    pub fn fetch_outputs(&self, output_hash: HashOutput) -> Result<Vec<OutputMinedInfo>, ChainStorageError> {
         let db = self.db_read_access()?;
-        db.fetch_output(&output_hash)
+        db.fetch_outputs(&output_hash)
     }
 
-    /// Returns optional input mined info for the given output hash
-    pub fn fetch_input(&self, output_hash: HashOutput) -> Result<Option<InputMinedInfo>, ChainStorageError> {
+    /// Returns the mined info for every input spending this output hash, one entry per header it is indexed under. A
+    /// hash can be indexed under more than one header, for example across reorg history.
+    pub fn fetch_inputs(&self, output_hash: HashOutput) -> Result<Vec<InputMinedInfo>, ChainStorageError> {
         let db = self.db_read_access()?;
-        db.fetch_input(&output_hash)
+        db.fetch_inputs(&output_hash)
     }
 
     /// Returns the mined info for the given payment reference
@@ -1357,8 +1371,11 @@ where B: BlockchainBackend
         db.fetch_mined_info_by_payref(&payref)
     }
 
-    /// Returns the mined info for the given output hash
-    pub fn fetch_mined_info_by_output_hash(&self, output_hash: HashOutput) -> Result<MinedInfo, ChainStorageError> {
+    /// Returns the mined info for the given output hash, one entry per header it is indexed under.
+    pub fn fetch_mined_info_by_output_hash(
+        &self,
+        output_hash: HashOutput,
+    ) -> Result<Vec<MinedInfo>, ChainStorageError> {
         let db = self.db_read_access()?;
         db.fetch_mined_info_by_output_hash(&output_hash)
     }
@@ -1384,7 +1401,10 @@ where B: BlockchainBackend
         let smt = JellyfishMerkleTree::<_, SmtHasher>::new(&smt_reader);
         let mut result = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            let output = db.fetch_output(&hash)?;
+            // Take the last-mined entry if the hash is indexed under several headers.
+            let mut outputs = db.fetch_outputs(&hash)?;
+            outputs.sort_by_key(|o| o.mined_height);
+            let output = outputs.into_iter().next_back();
 
             trace!(
                 target: LOG_TARGET,
@@ -1426,8 +1446,10 @@ where B: BlockchainBackend
 
         let mut result = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            let output = db.fetch_output(&hash)?;
-            result.push(output);
+            // Take the last-mined entry if the hash is indexed under several headers.
+            let mut outputs = db.fetch_outputs(&hash)?;
+            outputs.sort_by_key(|o| o.mined_height);
+            result.push(outputs.into_iter().next_back());
         }
         Ok(result)
     }
@@ -1440,8 +1462,10 @@ where B: BlockchainBackend
 
         let mut result = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            let input = db.fetch_input(&hash)?;
-            result.push(input);
+            // Take the last-spent entry if the hash is indexed under several headers.
+            let mut inputs = db.fetch_inputs(&hash)?;
+            inputs.sort_by_key(|i| i.spent_height);
+            result.push(inputs.into_iter().next_back());
         }
         Ok(result)
     }
@@ -1552,7 +1576,7 @@ where B: BlockchainBackend
                                 arg: "count",
                                 message: "count + block height will overflow u64".into(),
                             })?;
-                    let headers = fetch_headers(&*db, header.height + 1, end_height)?;
+                    let headers = fetch_headers(&*db, header.height.saturating_add(1), end_height)?;
                     return Ok(Some((i, headers)));
                 },
                 None => continue,
@@ -1708,7 +1732,7 @@ where B: BlockchainBackend
                 return Ok(Vec::new());
             },
         };
-        let start = end_height.saturating_sub(n as u64 - 1);
+        let start = end_height.saturating_sub((n as u64).saturating_sub(1));
         let headers = fetch_headers(&*db, start, end_height)?;
         Ok(headers.into_iter().map(|h| h.hash()).rev().collect())
     }
@@ -1763,36 +1787,7 @@ where B: BlockchainBackend
         current_block_hash: HashOutput,
     ) -> Result<TargetDifficulties, ChainStorageError> {
         let db = self.db_read_access()?;
-        let mut current_header = db.fetch_chain_header_in_all_chains(&current_block_hash)?;
-
-        let mut targets = TargetDifficulties::new(&self.consensus_manager, current_header.height().saturating_add(1))
-            .map_err(ChainStorageError::UnexpectedResult)?;
-        // Add start header since we have it on hand
-        targets
-            .add_front(
-                current_header.header(),
-                current_header.accumulated_data().target_difficulty,
-            )
-            .map_err(ChainStorageError::UnexpectedResult)?;
-
-        while current_header.height() > 0 && !targets.is_full() {
-            current_header = db.fetch_chain_header_in_all_chains(&current_header.header().prev_hash)?;
-            if !targets
-                .is_algo_full(current_header.header().pow_algo())
-                .map_err(ChainStorageError::UnexpectedResult)?
-            {
-                targets
-                    .add_front(
-                        current_header.header(),
-                        current_header.accumulated_data().target_difficulty,
-                    )
-                    .map_err(ChainStorageError::UnexpectedResult)?;
-            }
-            if targets.is_full() {
-                break;
-            }
-        }
-        Ok(targets)
+        fetch_target_difficulties_for_next_block(&*db, &self.consensus_manager, &current_block_hash)
     }
 
     pub fn prepare_new_block(&self, template: NewBlockTemplate) -> Result<Block, ChainStorageError> {
@@ -1807,7 +1802,7 @@ where B: BlockchainBackend
 
         body.sort();
         let mut header = BlockHeader::from(header);
-        let prev_block_height = header.height - 1;
+        let prev_block_height = header.height.saturating_sub(1);
         let min_height = header.height.saturating_sub(
             self.consensus_manager
                 .consensus_constants(header.height)
@@ -1816,13 +1811,13 @@ where B: BlockchainBackend
 
         let db = self.db_read_access()?;
         let tip_header = db.fetch_tip_header()?;
-        if header.height != tip_header.height() + 1 {
+        if header.height != tip_header.height().saturating_add(1) {
             return Err(ChainStorageError::InvalidArguments {
                 func: "prepare_new_block",
                 arg: "template",
                 message: format!(
                     "Expected new block template height to be {} but was {}",
-                    tip_header.height() + 1,
+                    tip_header.height().saturating_add(1),
                     header.height
                 ),
             });
@@ -1979,7 +1974,7 @@ where B: BlockchainBackend
             "[add_block] acquired write access db lock for block #{} '{}' in {:.2?}",
             new_height,
             block_hash.to_hex(),
-            after_lock - before_lock,
+            after_lock.saturating_sub(before_lock),
         );
 
         // If this is true, we already got the header in our database due to header-sync, between us starting the
@@ -2039,7 +2034,7 @@ where B: BlockchainBackend
         debug!(
             target: LOG_TARGET,
             "[add_block] released write access db lock for block #{} in {:.2?}, `add_block` result: {}",
-            new_height, timer.elapsed() - after_lock, block_add_result
+            new_height, timer.elapsed().saturating_sub(after_lock), block_add_result
         );
         Ok(block_add_result)
     }
@@ -2227,6 +2222,7 @@ where B: BlockchainBackend
         swap_to_highest_pow_chain(
             &mut *db,
             &self.config,
+            &self.consensus_manager,
             &*self.validators.block,
             self.consensus_manager.chain_strength_comparer(),
         )?;
@@ -2471,7 +2467,7 @@ pub fn calculate_mmr_roots<T: BlockchainBackend>(
         kernel_mmr.push(kernel.hash().to_vec())?;
     }
 
-    let mut batch = Vec::with_capacity(body.outputs().len() + body.inputs().len());
+    let mut batch = Vec::with_capacity(body.outputs().len().saturating_add(body.inputs().len()));
     for output in body.outputs() {
         if output.features.is_coinbase() {
             block_output_mmr.push(output.hash().to_vec())?;
@@ -2516,11 +2512,11 @@ pub fn calculate_mmr_roots<T: BlockchainBackend>(
     let block_output_mr = block_output_mr_hash_from_pruned_mmr(&block_output_mmr)?;
 
     let (output_smt_root, changes) = output_smt
-        .put_value_set(batch, current_version + 1)
+        .put_value_set(batch, current_version.saturating_add(1))
         .map_err(ChainStorageError::JellyfishMerkleTreeError)?;
 
     let mut size = tip_header.output_smt_size;
-    size += changes.node_stats.first().map(|s| s.new_leaves).unwrap_or(0) as u64;
+    size = size.saturating_add(changes.node_stats.first().map(|s| s.new_leaves).unwrap_or(0) as u64);
     size = size.saturating_sub(changes.node_stats.first().map(|s| s.stale_leaves).unwrap_or(0) as u64);
 
     let mmr_roots = MmrRoots {
@@ -2667,7 +2663,7 @@ pub fn fetch_chain_headers<T: BlockchainBackend>(
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let mut headers = Vec::with_capacity((end_inclusive - start) as usize);
+    let mut headers = Vec::with_capacity(end_inclusive.saturating_sub(start) as usize);
     for h in start..=end_inclusive {
         match db.fetch_chain_header_by_height(h) {
             Ok(header) => {
@@ -2754,6 +2750,122 @@ fn store_pruning_horizon<T: BlockchainBackend>(db: &mut T, pruning_horizon: u64)
     db.write(txn)
 }
 
+/// One header that belongs in a difficulty window, plus its position in the walk so that the backoff run can be
+/// replayed over it in the right order.
+struct WindowHeader {
+    /// Index into [`DifficultyWindowWalk::algos`]
+    index: usize,
+    height: u64,
+    algo: PowAlgorithm,
+    timestamp: EpochTime,
+    target_difficulty: Difficulty,
+}
+
+/// The result of walking the chain backwards far enough to fill the difficulty window(s).
+///
+/// Only the PoW algorithm of each walked header is retained (one byte each), because that is all the backoff run
+/// needs; the full headers are deliberately *not* buffered. The walk can run all the way to genesis when one
+/// permitted algorithm is under-mined, so buffering whole headers would make this a memory amplification vector for
+/// any caller reachable over gRPC.
+struct DifficultyWindowWalk {
+    /// PoW algorithm of every walked header, newest first.
+    algos: Vec<PowAlgorithm>,
+    /// The headers that belong in a difficulty window, newest first. Bounded by `algo count * window capacity`.
+    window: Vec<WindowHeader>,
+}
+
+/// The single database operation the difficulty window walk needs. Factored into its own trait so that the walk and
+/// its replay - which are consensus critical and must agree with the incremental header sync path - can be tested
+/// against an in-memory chain.
+pub(crate) trait ChainHeaderSource {
+    fn fetch_chain_header(&self, hash: &HashOutput) -> Result<ChainHeader, ChainStorageError>;
+}
+
+impl<T: BlockchainBackend> ChainHeaderSource for T {
+    fn fetch_chain_header(&self, hash: &HashOutput) -> Result<ChainHeader, ChainStorageError> {
+        // The block may be in the chained orphan pool or in the main chain
+        self.fetch_chain_header_in_all_chains(hash)
+    }
+}
+
+/// Walks the chain backwards from `start_header`, recording the PoW algorithm of every header and the data of the
+/// headers that belong in a difficulty window, plus [`MAX_BACKOFF_RUN_LOOKBACK`] further headers of lookback.
+///
+/// The lookback is what makes the TIP-RFC-MT-0004 backoff modifier of the *oldest* window entry exact: if the whole
+/// lookback is a single algorithm, the run is at least `MAX_BACKOFF_RUN_LOOKBACK + 1` long and the modifier is capped
+/// anyway, so no deeper walk is ever required.
+fn walk_difficulty_window<T, F>(
+    db: &T,
+    start_header: ChainHeader,
+    mut take: F,
+) -> Result<DifficultyWindowWalk, ChainStorageError>
+where
+    T: ChainHeaderSource + ?Sized,
+    // Returns (belongs in a window, all windows are now full)
+    F: FnMut(PowAlgorithm) -> (bool, bool),
+{
+    let mut walk = DifficultyWindowWalk {
+        algos: Vec::new(),
+        window: Vec::new(),
+    };
+    let mut header = start_header;
+    let mut prev_hash;
+    loop {
+        let algo = header.header().pow_algo();
+        let (in_window, is_full) = take(algo);
+        if in_window {
+            walk.window.push(WindowHeader {
+                index: walk.algos.len(),
+                height: header.height(),
+                algo,
+                timestamp: header.header().timestamp(),
+                target_difficulty: header.accumulated_data().target_difficulty,
+            });
+        }
+        walk.algos.push(algo);
+        let height = header.height();
+        prev_hash = header.header().prev_hash;
+        if height == 0 || is_full {
+            break;
+        }
+        header = db.fetch_chain_header(&prev_hash)?;
+    }
+
+    let mut height = header.height();
+    for _ in 0..MAX_BACKOFF_RUN_LOOKBACK {
+        if height == 0 {
+            break;
+        }
+        header = db.fetch_chain_header(&prev_hash)?;
+        walk.algos.push(header.header().pow_algo());
+        height = header.height();
+        prev_hash = header.header().prev_hash;
+    }
+
+    Ok(walk)
+}
+
+/// Replays a backward walk oldest -> newest, so that each window entry's backoff modifier is derived from its own
+/// predecessors, and hands each window entry to `add`. Returns the seeded tracker.
+fn replay_difficulty_window<F>(
+    walk: &DifficultyWindowWalk,
+    mut add: F,
+) -> Result<PowBackoffTracker, ChainStorageError>
+where
+    F: FnMut(&WindowHeader, &PowBackoffTracker) -> Result<(), ChainStorageError>,
+{
+    let mut tracker = PowBackoffTracker::new();
+    let mut window = walk.window.iter().rev().peekable();
+    for (index, algo) in walk.algos.iter().enumerate().rev() {
+        if window.peek().is_some_and(|entry| entry.index == index) {
+            let entry = window.next().expect("just peeked");
+            add(entry, &tracker)?;
+        }
+        tracker.push(*algo);
+    }
+    Ok(tracker)
+}
+
 #[allow(clippy::ptr_arg)]
 pub fn fetch_target_difficulty_for_next_block<T: BlockchainBackend>(
     db: &T,
@@ -2761,25 +2873,119 @@ pub fn fetch_target_difficulty_for_next_block<T: BlockchainBackend>(
     pow_algo: PowAlgorithm,
     current_block_hash: &HashOutput,
 ) -> Result<TargetDifficultyWindow, ChainStorageError> {
-    // The block may be in the chained orphan pool or in the main chain
-    let mut header = db.fetch_chain_header_in_all_chains(current_block_hash)?;
-    let mut target_difficulties = consensus_manager
-        .new_target_difficulty(pow_algo, header.height() + 1)
-        .map_err(ChainStorageError::UnexpectedResult)?;
-    if header.header().pow.pow_algo == pow_algo {
-        target_difficulties.add_front(header.header().timestamp(), header.accumulated_data().target_difficulty);
-    }
-    while header.height() > 0 && !target_difficulties.is_full() {
-        header = db.fetch_chain_header_in_all_chains(&header.header().prev_hash)?;
+    target_difficulty_for_next_block(db, consensus_manager, pow_algo, current_block_hash)
+}
 
-        // LWMA works with the "newest" value being at the back of the array, so we need to keep pushing to the front as
-        // we keep adding "older" values
-        if header.header().pow.pow_algo == pow_algo {
-            target_difficulties.add_front(header.header().timestamp(), header.accumulated_data().target_difficulty);
+pub(crate) fn target_difficulty_for_next_block<T: ChainHeaderSource + ?Sized>(
+    db: &T,
+    consensus_manager: &BaseNodeConsensusManager,
+    pow_algo: PowAlgorithm,
+    current_block_hash: &HashOutput,
+) -> Result<TargetDifficultyWindow, ChainStorageError> {
+    let start_header = db.fetch_chain_header(current_block_hash)?;
+    let next_height = start_header.height().saturating_add(1);
+    let constants = consensus_manager.consensus_constants(next_height);
+    let capacity = difficulty_window_capacity(constants)?;
+    let mut target_difficulties = consensus_manager
+        .new_target_difficulty(pow_algo, next_height)
+        .map_err(ChainStorageError::UnexpectedResult)?;
+
+    // Pass 1: walk backwards, marking the headers of this algorithm that belong in the window.
+    let mut count = 0usize;
+    let walk = walk_difficulty_window(db, start_header, |algo| {
+        let in_window = algo == pow_algo && count < capacity;
+        if in_window {
+            count = count.saturating_add(1);
         }
-    }
+        (in_window, count >= capacity)
+    })?;
+
+    // Pass 2: replay oldest -> newest so that each block's backoff modifier is derived from its own predecessors.
+    let tracker = replay_difficulty_window(&walk, |entry, tracker| {
+        let header_constants = consensus_manager.consensus_constants(entry.height);
+        let modifier = tracker.modifier_for(entry.algo, header_constants.pow_backoff_cap());
+        let adjusted_target = adjust_target(
+            entry.target_difficulty,
+            modifier,
+            header_constants.min_pow_difficulty(entry.algo),
+            header_constants.max_pow_difficulty(entry.algo),
+        );
+        // LWMA works with the "newest" value being at the back of the array
+        target_difficulties.add_back(entry.timestamp, entry.target_difficulty, adjusted_target);
+        Ok(())
+    })?;
+    target_difficulties.set_next_modifier(tracker.modifier_for(pow_algo, constants.pow_backoff_cap()));
 
     Ok(target_difficulties)
+}
+
+#[allow(clippy::ptr_arg)]
+pub fn fetch_target_difficulties_for_next_block<T: BlockchainBackend>(
+    db: &T,
+    consensus_manager: &BaseNodeConsensusManager,
+    current_block_hash: &HashOutput,
+) -> Result<TargetDifficulties, ChainStorageError> {
+    target_difficulties_for_next_block(db, consensus_manager, current_block_hash)
+}
+
+pub(crate) fn target_difficulties_for_next_block<T: ChainHeaderSource + ?Sized>(
+    db: &T,
+    consensus_manager: &BaseNodeConsensusManager,
+    current_block_hash: &HashOutput,
+) -> Result<TargetDifficulties, ChainStorageError> {
+    let start_header = db.fetch_chain_header(current_block_hash)?;
+    let next_height = start_header.height().saturating_add(1);
+    let constants = consensus_manager.consensus_constants(next_height);
+    let capacity = difficulty_window_capacity(constants)?;
+    let mut targets =
+        TargetDifficulties::new(consensus_manager, next_height).map_err(ChainStorageError::UnexpectedResult)?;
+
+    // Pass 1: walk backwards, marking the headers that belong in one of the per-algorithm windows.
+    let mut counts: HashMap<PowAlgorithm, usize> = constants
+        .current_permitted_pow_algos()
+        .into_iter()
+        .map(|algo| (algo, 0usize))
+        .collect();
+    let walk = walk_difficulty_window(db, start_header, |algo| {
+        let in_window = match counts.get_mut(&algo) {
+            Some(count) if *count < capacity => {
+                *count = count.saturating_add(1);
+                true
+            },
+            _ => false,
+        };
+        (in_window, counts.values().all(|count| *count >= capacity))
+    })?;
+
+    // Pass 2: replay oldest -> newest so that each block's backoff modifier is derived from its own predecessors.
+    // `TargetDifficulties` owns an equivalent tracker, so the window entries are pushed through it and the headers
+    // that are not in any window only advance the run.
+    let mut next_index = walk.algos.len();
+    for entry in walk.window.iter().rev() {
+        for index in (entry.index.saturating_add(1)..next_index).rev() {
+            targets.push_algo(*walk.algos.get(index).expect("index is in range"));
+        }
+        targets
+            .add_back_parts(
+                entry.algo,
+                entry.timestamp,
+                entry.target_difficulty,
+                consensus_manager.consensus_constants(entry.height),
+            )
+            .map_err(ChainStorageError::UnexpectedResult)?;
+        next_index = entry.index;
+    }
+    for index in (0..next_index).rev() {
+        targets.push_algo(*walk.algos.get(index).expect("index is in range"));
+    }
+
+    Ok(targets)
+}
+
+fn difficulty_window_capacity(constants: &ConsensusConstants) -> Result<usize, ChainStorageError> {
+    Ok(usize::try_from(constants.difficulty_block_window())
+        .map_err(|e| ChainStorageError::UnexpectedResult(format!("difficulty block window exceeds usize::MAX: {e}")))?
+        .saturating_add(1))
 }
 
 fn fetch_block<T: BlockchainBackend>(db: &T, height: u64, compact: bool) -> Result<HistoricalBlock, ChainStorageError> {
@@ -2797,7 +3003,12 @@ fn fetch_block<T: BlockchainBackend>(db: &T, height: u64, compact: bool) -> Resu
             if compact {
                 return Ok(compact_input);
             }
-            let utxo_mined_info = match db.fetch_output(&compact_input.output_hash()) {
+            // Only the output's contents are used to hydrate the input, and those are identical for
+            // every index entry of the same output hash, so taking any entry is equivalent.
+            let utxo_mined_info = match db
+                .fetch_outputs(&compact_input.output_hash())
+                .map(|o| o.into_iter().next())
+            {
                 Ok(Some(o)) => o,
                 Ok(None) => {
                     return Err(ChainStorageError::InvalidBlock(
@@ -2824,7 +3035,11 @@ fn fetch_block<T: BlockchainBackend>(db: &T, height: u64, compact: bool) -> Resu
         height,
         mark.elapsed()
     );
-    Ok(HistoricalBlock::new(block, tip_height - height + 1, accumulated_data))
+    Ok(HistoricalBlock::new(
+        block,
+        tip_height.saturating_sub(height).saturating_add(1),
+        accumulated_data,
+    ))
 }
 
 fn fetch_blocks<T: BlockchainBackend>(
@@ -2859,9 +3074,15 @@ fn fetch_block_by_utxo_commitment<T: BlockchainBackend>(
 ) -> Result<Option<HistoricalBlock>, ChainStorageError> {
     let output = db.fetch_unspent_output_hash_by_commitment(commitment)?;
     match output {
-        Some(hash) => match db.fetch_output(&hash)? {
-            Some(mined_info) => fetch_block_by_hash(db, mined_info.header_hash, false),
-            None => Ok(None),
+        // The hash came from the commitment index; if it is indexed under several headers, take the
+        // last-mined entry.
+        Some(hash) => {
+            let mut outputs = db.fetch_outputs(&hash)?;
+            outputs.sort_by_key(|o| o.mined_height);
+            match outputs.into_iter().next_back() {
+                Some(mined_info) => fetch_block_by_hash(db, mined_info.header_hash, false),
+                None => Ok(None),
+            }
         },
         None => Ok(None),
     }
@@ -2923,13 +3144,13 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
             target: LOG_TARGET,
             "Rewinding headers from height {} to {}",
             last_header_height,
-            last_header_height - steps_back
+            last_header_height.saturating_sub(steps_back)
         );
     }
     // We might have more headers than blocks, so we first see if we need to delete the extra headers.
     let mut txn = DbTransaction::new();
     for h in 0..steps_back {
-        let height = last_header_height - h;
+        let height = last_header_height.saturating_sub(h);
         info!(
             target: LOG_TARGET,
             "Rewinding headers at height {}",
@@ -2976,12 +3197,13 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
             db.update_stats_progress(h);
         }
         let mut txn = DbTransaction::new();
-        info!(target: LOG_TARGET, "Deleting block {}", last_block_height - h,);
-        let block = fetch_block(db, last_block_height - h, false)?;
+        let block_height = last_block_height.saturating_sub(h);
+        info!(target: LOG_TARGET, "Deleting block {block_height}");
+        let block = fetch_block(db, block_height, false)?;
         let block = Arc::new(block.try_into_chain_block()?);
         let block_hash = *block.hash();
         txn.delete_tip_block(block_hash);
-        txn.delete_header(last_block_height - h);
+        txn.delete_header(block_height);
         if !prune_past_horizon && !db.contains(&DbKey::OrphanBlock(*block.hash()))? {
             // Because we know we will remove blocks we can't recover, this will be a destructive rewind, so we
             // can't recover from this apart from resync from another peer. Failure here
@@ -2992,10 +3214,11 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
         removed_blocks.push(block);
         // Set best block to one before, to keep DB consistent, or, if we reached pruned horizon, set best block to 0 as
         // we have run out of headers.
-        let chain_header = db.fetch_chain_header_by_height(if prune_past_horizon && h + 1 == steps_back {
+        let is_last_step = h.saturating_add(1) == steps_back;
+        let chain_header = db.fetch_chain_header_by_height(if prune_past_horizon && is_last_step {
             0
         } else {
-            last_block_height - h - 1
+            block_height.saturating_sub(1)
         })?;
         let metadata = db.fetch_chain_metadata()?;
         let expected_block_hash = *metadata.best_block_hash();
@@ -3008,7 +3231,7 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
         );
         // When rewinding past the pruning horizon to height 0, reset pruned_height in the same
         // transaction to maintain the invariant that pruned_height <= best_block_height.
-        if prune_past_horizon && h + 1 == steps_back {
+        if prune_past_horizon && is_last_step {
             txn.set_pruned_height(0);
         }
         if h == 0 {
@@ -3033,8 +3256,8 @@ pub(crate) fn rewind_to_height<T: BlockchainBackend>(
         // We also delete headers above the target height since they belong to the old chain and will be
         // replaced during re-sync. The header at target_height is preserved as it is the chain split point.
         // We don't have these complete blocks, so we don't push them to the removed blocks.
-        for h in 0..(last_block_height - steps_back) {
-            let height = last_block_height - h - steps_back;
+        for h in 0..last_block_height.saturating_sub(steps_back) {
+            let height = last_block_height.saturating_sub(h).saturating_sub(steps_back);
             debug!(
                 target: LOG_TARGET,
                 "Deleting pruned block data at height {}",
@@ -3072,6 +3295,108 @@ fn rewind_to_hash<T: BlockchainBackend>(
     rewind_to_height(db, target_header.height)
 }
 
+/// How far above the GHSA-3qmx-q9pv-f3m4 activation height a node's own tip has to be before the deep reorg
+/// anchor ([`reorg_reintroduces_pre_ghsa_blocks`]) engages.
+///
+/// The anchor is the only rule in the advisory's set that is not a function of the candidate blocks alone: it
+/// asks where *our* tip is. Two honest nodes are never at the same height, so any such rule can make them decide
+/// the same fork differently, and this one decides it permanently - the loser discards the fork, long-bans the
+/// peers serving it and needs a resync. The window is what confines that disagreement to forks no honest chain
+/// produces: a refusal requires the refusing node's tip to be at least `WINDOW` blocks above the activation
+/// height while the fork reaches below it, so every refused reorg is at least `WINDOW + 2` blocks deep. Below
+/// that depth every node agrees, whatever its tip.
+///
+/// 360 was chosen because:
+///
+///   * it is `coinbase_min_maturity` at the MainNet activation height - the depth at which the protocol already treats
+///     a block as settled, since a deeper reorg would unspend matured coinbases and break far more than fork choice. A
+///     chain that can reorg this deep has bigger problems than this rule;
+///   * it is four times the 90 block LWMA `difficulty_block_window`, and twice that window's span in chain blocks on a
+///     two algorithm chain, so a refused fork covers a full difficulty adjustment on both algorithms;
+///   * observed reorgs are one to three blocks deep, so it leaves two orders of magnitude of headroom;
+///   * at the effective block times of the two scheduled networks it is about 12 hours on MainNet and 3 hours on
+///     Esmeralda, and far below the thousand-plus block forks the attack this anchors against contemplates.
+///
+/// **The cost is real and is accepted deliberately:** for `WINDOW` blocks after the activation height the anchor
+/// does not engage, and a fork rooted in the pre-fork range can still replace the chain. That exposure is not
+/// what decides the attack, though. The same fork is available for the entire unbounded period *before* the
+/// activation height, so an attacker able to mount it can mount it a day early and the anchor never sees it
+/// either way. What the anchor buys is that the pre-fork range is sealed permanently after the window closes,
+/// and buying that at the cost of partitioning honest nodes on routine reorgs would be a bad trade.
+pub const GHSA_DEEP_REORG_CONFIRMATION_WINDOW: u64 = 360;
+
+/// GHSA-3qmx-q9pv-f3m4 deep reorg anchor: is this reorg trying to put blocks written under the advisory's
+/// *pre-fork* proof of work rules onto a chain that has already moved past the fork?
+///
+/// # Why this is needed at all
+///
+/// Every one of the advisory's consensus rules is gated on the *block's own* height, which is what makes them a
+/// fork rather than a retroactive invalidation of history. Below the activation height the forgeable legacy Monero
+/// coinbase sponge and the merged-namespace Cuckaroo verifier are still the rules, and they stay the rules
+/// forever, because the blocks that were mined under them are on chain and cannot be re-validated.
+///
+/// That grandfathering is safe for history. It is not safe for the *future* of a chain that has passed the fork,
+/// because nothing else in the system bounds how far back a reorg may reach:
+///
+///   * the accumulator credits `achieved_target.target()` rather than the achieved difficulty
+///     (`blocks/accumulated_data.rs`), so a block that did no work still counts for the full target;
+///   * fork choice is pure `total_accumulated_difficulty`, with height only a tiebreak
+///     (`consensus/chain_strength_comparer.rs`);
+///   * there is no reorg depth cap and no consensus checkpoint, and MainNet RandomXM has `max_difficulty =
+///     Difficulty::max()`.
+///
+/// So an attacker forks below the activation height, re-uses one real high difficulty Monero solution to mint
+/// blocks for free under the legacy rules, ramps the LWMA target, out-accumulates the honest chain and unwinds
+/// everything above the fork point - including blocks mined after the fork under the new rules. On a pruned node
+/// the rewind additionally runs past `prune_past_horizon` and is destructive.
+///
+/// # The rule
+///
+/// Once our tip is at least [`GHSA_DEEP_REORG_CONFIRMATION_WINDOW`] blocks above the activation height, refuse a
+/// reorg whose *lowest newly added block* is below that height.
+///
+/// Three things about that phrasing are deliberate:
+///
+///   * It is stated in terms of the blocks being **added**, not the fork point. Those are the blocks that would be
+///     validated under the weaker rules, and they are the only thing the attack can get for free. A fork point at
+///     `activation - 1` whose first added block is at the activation height adds nothing that is not subject to the new
+///     rules, so there is nothing to refuse.
+///   * **The confirmation window is what keeps honest nodes together.** Without it the rule is an absolute height
+///     boundary, and an absolute boundary splits the network at exactly the place it is least affordable. Take a three
+///     block reorg across the fork, with our tip at the activation height, the fork point two blocks below it and added
+///     blocks from `activation - 1` upwards. A node at the activation height would refuse it while its neighbour, one
+///     block behind, accepts it. The refusal is not a deferral either: the fork is discarded, the header sync half of
+///     the anchor long-bans every peer serving it, and the node only recovers by resyncing from scratch. Reorgs two or
+///     three deep are routine on a two algorithm chain with two minute blocks, so an absolute boundary would strand
+///     nodes on ordinary chain activity. With the window, a refusal implies a reorg at least
+///     `GHSA_DEEP_REORG_CONFIRMATION_WINDOW + 2` blocks deep, because the refusing node's tip is that far above the
+///     fork point. Every reorg the network treats as ordinary is therefore accepted by every node no matter where its
+///     tip is, and disagreement is confined to forks far deeper than honest chain activity produces. The price is
+///     stated plainly in the constant's own documentation: for that many blocks after the activation height the node is
+///     still exposed to the attack.
+///   * It rides the existing activation height, derived from the consensus constants
+///     (`BaseNodeConsensusManager::derived_monero_coinbase_activation_height`). There is no new consensus constant and
+///     no second height to coordinate. On a network where the advisory's fork is unscheduled the activation height is
+///     `u64::MAX`, so the (saturating) engagement height is `u64::MAX` too and no reachable tip reaches it, and on
+///     LocalNet the activation height is 0, so `lowest_new_block_height < 0` is never true and it is equally inert. It
+///     also keeps the rule inert for a node syncing history: a node below the engagement height applies the pre-fork
+///     rules and reorgs freely inside the pre-fork range, exactly as it must to reconstruct history.
+///
+/// # This is a consensus rule
+///
+/// It changes chain selection, and unlike the advisory's other rules it is not a function of the candidate
+/// blocks alone - two nodes at different heights can decide a fork differently. That is the trade-off the window
+/// bounds rather than removes. A node that refuses the majority chain stays on its own fork permanently and has
+/// to be resynced; the log message at the refusal site says so.
+pub fn reorg_reintroduces_pre_ghsa_blocks(
+    local_tip_height: u64,
+    lowest_new_block_height: u64,
+    ghsa_activation_height: u64,
+) -> bool {
+    local_tip_height >= ghsa_activation_height.saturating_add(GHSA_DEEP_REORG_CONFIRMATION_WINDOW) &&
+        lowest_new_block_height < ghsa_activation_height
+}
+
 // Checks whether we should add the block as an orphan. If it is the case, the orphan block is added and the chain
 // is reorganised if necessary.
 fn handle_possible_reorg<T: BlockchainBackend>(
@@ -3089,13 +3414,13 @@ fn handle_possible_reorg<T: BlockchainBackend>(
     let hash = candidate_block.header.hash();
     insert_orphan_and_find_new_tips(db, candidate_block, header_validator, consensus_manager)?;
     let after_orphans = timer.elapsed();
-    let res = swap_to_highest_pow_chain(db, config, block_validator, chain_strength_comparer);
+    let res = swap_to_highest_pow_chain(db, config, consensus_manager, block_validator, chain_strength_comparer);
     trace!(
         target: LOG_TARGET,
         "[handle_possible_reorg] block #{}, insert_orphans in {:.2?}, swap_to_highest in {:.2?} '{}'",
         height,
         after_orphans,
-        timer.elapsed() - after_orphans,
+        timer.elapsed().saturating_sub(after_orphans),
         hash.to_hex(),
     );
     res
@@ -3139,7 +3464,7 @@ fn reorganize_chain<T: BlockchainBackend>(
             }
             // We removed a block from the orphan chain, so the chain is now "broken", so we remove the rest of the
             // remaining blocks as well.
-            for block in new_chain_from_fork.iter().skip(i + 1) {
+            for block in new_chain_from_fork.iter().skip(i.saturating_add(1)) {
                 txn.delete_orphan(*block.hash());
             }
             backend.write(txn)?;
@@ -3168,9 +3493,105 @@ fn reorganize_chain<T: BlockchainBackend>(
     Ok(removed_blocks)
 }
 
+/// The GHSA-3qmx-q9pv-f3m4 deep reorg anchor as `swap_to_highest_pow_chain` applies it. Returns `true` if the
+/// swap was refused, in which case the fork has been discarded and the caller must not reorg.
+///
+/// See [`reorg_reintroduces_pre_ghsa_blocks`] for the rule and why it is phrased in terms of the lowest added
+/// block rather than the fork point.
+fn refuse_reorg_below_ghsa_activation<T: BlockchainBackend>(
+    db: &mut T,
+    consensus_manager: &BaseNodeConsensusManager,
+    tip_header: &ChainHeader,
+    best_fork_header: &ChainHeader,
+    reorg_chain: &VecDeque<Arc<ChainBlock>>,
+) -> Result<bool, ChainStorageError> {
+    let lowest_new_block = match reorg_chain.front() {
+        Some(block) => block,
+        None => return Ok(false),
+    };
+    let activation_height = consensus_manager.derived_monero_coinbase_activation_height();
+    if !reorg_reintroduces_pre_ghsa_blocks(tip_header.height(), lowest_new_block.height(), activation_height) {
+        return Ok(false);
+    }
+
+    error!(
+        target: LOG_TARGET,
+        "REFUSED a deep reorg (GHSA-3qmx-q9pv-f3m4). A fork chain of {} block(s) starting at height {} ({}) would \
+         have replaced our chain from there upwards, but the advisory's proof of work rules only become consensus \
+         at height {} and our tip is already at {}. Blocks below that height are still validated with the pre-fork \
+         verifiers the advisory describes as forgeable, so a chain rooted there can be minted at no proof of work \
+         cost no matter how much accumulated difficulty it claims ({}). This fork is being discarded, not queued: \
+         it will never be accepted by this node. If you believe it is the honest chain, this node's database is on \
+         the wrong side of the fork and has to be resynced from scratch.",
+        reorg_chain.len(),
+        lowest_new_block.height(),
+        lowest_new_block.hash(),
+        activation_height,
+        tip_header.height(),
+        best_fork_header.accumulated_data().total_accumulated_difficulty,
+    );
+
+    // Drop the whole fork out of the orphan pool rather than leaving it to win `find_strongest_orphan_tip` again on
+    // the next block: if it stayed, it would mask every legitimate fork behind it and the node would stop following
+    // the chain at all.
+    //
+    // What has to go is the orphan *subtree* rooted at the lowest new block, not just `reorg_chain`.
+    // `reorg_chain` is the single linking chain `get_orphan_link_main_chain` walked back to the main chain, but
+    // `find_orphan_descendant_tips_of` registers a tip for *every* descendant, so the same fork can carry several
+    // tips - an attacker announcing two near-equal tips on the refused fork costs nothing under exactly the
+    // premise this rule exists for. Deleting only the linking chain would leave the sibling branches in
+    // `orphans_db` and `orphan_chain_tips_db` with their parent gone, and the next `swap_to_highest_pow_chain`
+    // that picked one of them would fail `get_orphan_link_main_chain` with `InvalidOperation` - an error that
+    // propagates out of `add_block` before `cleanup_orphans` runs, so the node stops accepting blocks entirely
+    // until it is restarted. The subtree is deleted in reverse discovery order, so every child goes before its
+    // parent: each delete then either removes a tip or promotes a parent that is itself deleted later, and the
+    // root's parent is in the main chain rather than the orphan pool, so the last delete promotes nothing and no
+    // stale tip is left behind. (`LMDBDatabase::delete_orphan` promotes with `lmdb_replace` for the same reason:
+    // a parent with two tip children is promoted once per child.)
+    //
+    // Nothing is recorded in `bad_blocks` here. It looks like the obvious anti-replay, and it was tried, but it
+    // cannot work at this call site: the refusal runs *before* any rewind, so `best_block_height` is still our
+    // tip, while the record would be at a height below the activation height - and `insert_bad_block_and_cleanup`
+    // sweeps every record below `best_block_height - CLEAN_BAD_BLOCKS_BEFORE_REL_HEIGHT`, which is
+    // `best_block_height` itself in a non-test build, in the same write transaction. The record would be deleted
+    // the moment it was written. Making it survive would mean either a record the sweep never reclaims - an
+    // unbounded, remotely triggered table, since minting distinct pre-activation forks is free to the attacker -
+    // or widening the sweep for every other caller. Neither is worth it: re-announcing the fork just has it
+    // orphaned, refused and dropped again, which is the same cost as any other orphan spam and is bounded by the
+    // orphan pool's own capacity.
+    let mut txn = DbTransaction::new();
+    for hash in orphan_subtree_hashes(db, *lowest_new_block.hash())?.iter().rev() {
+        txn.delete_orphan(*hash);
+    }
+    db.write(txn)?;
+    Ok(true)
+}
+
+/// Every orphan in the subtree rooted at `root_hash`, parents before children.
+///
+/// `fetch_orphan_children_of` is the only index that answers "what is hanging off this orphan", and a fork can
+/// branch, so the walk has to be transitive rather than a single chain. Returned in breadth first order; a
+/// caller deleting the subtree reverses it, which puts every child before its parent.
+fn orphan_subtree_hashes<T: BlockchainBackend>(
+    db: &T,
+    root_hash: HashOutput,
+) -> Result<Vec<HashOutput>, ChainStorageError> {
+    let mut ordered = Vec::new();
+    let mut to_visit = VecDeque::new();
+    to_visit.push_back(root_hash);
+    while let Some(hash) = to_visit.pop_front() {
+        ordered.push(hash);
+        for child in db.fetch_orphan_children_of(hash)? {
+            to_visit.push_back(child.header.hash());
+        }
+    }
+    Ok(ordered)
+}
+
 fn swap_to_highest_pow_chain<T: BlockchainBackend>(
     db: &mut T,
     config: &BlockchainDatabaseConfig,
+    consensus_manager: &BaseNodeConsensusManager,
     block_validator: &dyn CandidateBlockValidator<T>,
     chain_strength_comparer: &dyn ChainStrengthComparer,
     // smt_writer: &mut LmdbTreeWriter,
@@ -3219,11 +3640,21 @@ fn swap_to_highest_pow_chain<T: BlockchainBackend>(
     }
 
     let reorg_chain = get_orphan_link_main_chain(db, best_fork_header.hash())?;
-    let fork_hash = reorg_chain
+    let lowest_new_block = reorg_chain
         .front()
         .expect("The new orphan block should be in the queue")
-        .header()
-        .prev_hash;
+        .clone();
+    let fork_hash = lowest_new_block.header().prev_hash;
+
+    // GHSA-3qmx-q9pv-f3m4 deep reorg anchor. This is the choke point for the gossip driven reorg path: it is the
+    // first place where both halves of the question are known - our own tip, and the full set of blocks the swap
+    // would add - and it is still *before* `reorganize_chain`, so nothing has been rewound and the pruned-node
+    // `prune_past_horizon` rewind has not been reached. The header sync path does not come through here and is
+    // anchored separately, in `HeaderSynchronizer::determine_sync_status`.
+    if refuse_reorg_below_ghsa_activation(db, consensus_manager, &tip_header, &best_fork_header, &reorg_chain)? {
+        remove_non_canonical_headers(db)?;
+        return Ok(BlockAddResult::OrphanBlock);
+    }
 
     let num_added_blocks = reorg_chain.len();
     // Note: This will also remove ay surplus headers (i.e. headers that are not linked to any blocks)
@@ -3341,16 +3772,21 @@ fn restore_reorged_chain<T: BlockchainBackend>(
 fn get_vm_key_for_candidate_block<T: BlockchainBackend>(
     db: &mut T,
     candidate_block: Arc<Block>,
-) -> Result<FixedHash, ChainStorageError> {
+) -> Result<(FixedHash, u64), ChainStorageError> {
     get_vm_key_for_candidate_header(db, candidate_block.header.clone())
 }
 
-// this is tricky as we need to find the vm_key hash for the candidate block, but it might not be in the current chain
-// so we need to search for it.
+/// Returns the Tari RandomX VM key hash for a candidate header, and the highest height at which the candidate's
+/// chain and the chain in the database are known to be the same chain.
+///
+/// The candidate may be an orphan that forks below the current tip, so both answers have to be found by walking the
+/// candidate's own ancestry back until it meets the main chain. That meeting height is what any chain dependent
+/// index in the database may be trusted up to (see [`HeaderChainContext::candidate_chain`]); 0 is returned when the
+/// walk never meets the main chain, which trusts nothing.
 fn get_vm_key_for_candidate_header<T: BlockchainBackend>(
     db: &mut T,
     header: BlockHeader,
-) -> Result<FixedHash, ChainStorageError> {
+) -> Result<(FixedHash, u64), ChainStorageError> {
     let vm_height = tari_rx_vm_key_height(header.height);
     let mut current_header = header.clone();
     while current_header.height != vm_height {
@@ -3358,11 +3794,11 @@ fn get_vm_key_for_candidate_header<T: BlockchainBackend>(
         let chain_header = db.fetch_chain_header_by_height(h.height())?;
         if *h.header() == *chain_header.header() {
             // Now we now the orphan links back to the main chain here
-            return Ok(*db.fetch_chain_header_by_height(vm_height)?.hash());
+            return Ok((*db.fetch_chain_header_by_height(vm_height)?.hash(), h.height()));
         }
         current_header = h.header().clone();
     }
-    Ok(FixedHash::from(*current_header.hash()))
+    Ok((FixedHash::from(*current_header.hash()), 0))
 }
 
 /// Insert the provided block into the orphan pool and returns any new tips that were created.
@@ -3428,20 +3864,32 @@ fn insert_orphan_and_find_new_tips<T: BlockchainBackend>(
 
     // validate the block header
     let mut prev_timestamps = get_previous_timestamps(db, &candidate_block.header, rules)?;
-    let vm_key = get_vm_key_for_candidate_block(db, candidate_block.clone())?;
+    let (vm_key, fork_height) = get_vm_key_for_candidate_block(db, candidate_block.clone())?;
+    // The candidate is an orphan: the database holds the main chain, which is only the candidate's chain up to the
+    // fork point. Anything recorded above it belongs to a chain this candidate is not on.
+    //
+    // No pending seeds are tracked for the orphan chain itself, so the seed age rule is deliberately best effort
+    // here: it catches re-use of a seed from the shared history and misses re-use within the orphan chain. That
+    // fails open, and block body validation applies the same rule with an exact view once the chain is committed.
+    let chain_context = HeaderChainContext::candidate_chain(vm_key, fork_height, None);
     let result = validator.validate(
         db,
         &candidate_block.header,
         parent.header(),
         &prev_timestamps,
         None,
-        vm_key,
+        chain_context,
     );
     let achieved_target_diff = match result {
-        Ok(achieved_target_diff) => achieved_target_diff,
+        Ok(validated) => validated.achieved_target,
         // future timelimit validation can succeed at a later time. As the block is not yet valid, we discard it
         // for now and ban the peer, but wont blacklist the block.
         Err(e @ ValidationError::BlockHeaderError(BlockHeaderValidationError::InvalidTimestampFutureTimeLimit)) |
+        // The seed age rule is measured against the chain the header is on, so its verdict belongs to that chain and
+        // not to the header alone: the same header can be stale on one chain and fine on another. Discard it and ban
+        // the peer, but never memo it as bad. `BlockHeaderSyncValidator::blacklist_unless_verdict_can_change` does
+        // the same for the other caller of this validator.
+        Err(e @ ValidationError::BlockHeaderError(BlockHeaderValidationError::OldSeedHash)) |
         // We dont want to mark a block as bad for internal failures
         Err(
             e @ ValidationError::FatalStorageError(_) | e @ ValidationError::IncorrectNumberOfTimestampsProvided { .. },
@@ -3486,6 +3934,7 @@ fn insert_orphan_and_find_new_tips<T: BlockchainBackend>(
         prev_timestamps,
         validator,
         rules.consensus_constants(height),
+        fork_height,
     )?;
     let mut txn = DbTransaction::new();
     debug!(target: LOG_TARGET, "Found {} new orphan tips", tips.len());
@@ -3507,6 +3956,9 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
     prev_timestamps: RollingVec<EpochTime>,
     validator: &dyn HeaderChainLinkedValidator<T>,
     consensus_constants: &ConsensusConstants,
+    // The highest height at which this orphan chain and the chain in the database are the same chain. Every
+    // descendant found here is on the same orphan chain, so they all share it.
+    fork_height: u64,
 ) -> Result<Vec<ChainHeader>, ChainStorageError> {
     let children = db.fetch_orphan_children_of(*prev_chain_header.hash())?;
     if children.is_empty() {
@@ -3539,6 +3991,10 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
         );
 
         // we need to validate the header here because it may never have been validated.
+        // TODO: this takes the Tari RandomX VM key from the main chain, while `fork_height` next to it is derived
+        // from the candidate's own chain. For an orphan that forks below its VM key band boundary the two disagree,
+        // which can fail a legitimate deep fork. Pre-existing behaviour, tracked separately; fixing it means
+        // reworking orphan path VM key derivation.
         let vm_key = *db
             .fetch_chain_header_by_height(tari_rx_vm_key_height(child.header.height))?
             .hash();
@@ -3548,9 +4004,12 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
             prev_chain_header.header(),
             &prev_timestamps,
             None,
-            vm_key,
+            // As in `insert_orphan_and_find_new_tips`: no pending seeds for the orphan chain, so the seed age rule
+            // is deliberately best effort on this path and fails open, with body validation as the backstop.
+            HeaderChainContext::candidate_chain(vm_key, fork_height, None),
         ) {
-            Ok(achieved_target) => {
+            Ok(validated) => {
+                let achieved_target = validated.achieved_target;
                 // Append the child timestamp - a RollingVec ensures that the number of timestamps can never be more
                 // than the median timestamp window size.
                 let mut prev_timestamps_for_children = prev_timestamps.clone();
@@ -3582,6 +4041,7 @@ fn find_orphan_descendant_tips_of<T: BlockchainBackend>(
                     prev_timestamps_for_children,
                     validator,
                     consensus_constants,
+                    fork_height,
                 )?;
                 res.extend(children);
             },
@@ -3747,7 +4207,7 @@ fn prune_to_height<T: BlockchainBackend>(db: &mut T, target_horizon_height: u64)
     );
 
     let mut txn = DbTransaction::new();
-    for block_to_prune in (last_pruned + 1)..=target_horizon_height {
+    for block_to_prune in last_pruned.saturating_add(1)..=target_horizon_height {
         let header = db.fetch_chain_header_by_height(block_to_prune)?;
         // Note, this could actually be done in one step instead of each block, since deleted is
         // accumulated
@@ -4006,7 +4466,7 @@ fn verify_blockchain_consistency_for_height<B: BlockchainBackend>(
             "Block at height {height} has invalid previous hash"
         )));
     }
-    if this_block_header.height != prev_chain_header.height() + 1 {
+    if this_block_header.height != prev_chain_header.height().saturating_add(1) {
         return Err(ChainStorageError::CorruptedDatabase(format!(
             "Block at height {height} does not follow previous header height"
         )));
@@ -4057,6 +4517,8 @@ fn verify_blockchain_consistency_for_height<B: BlockchainBackend>(
 
 #[cfg(test)]
 mod test {
+    // Overflow in test code panics, which is the desired failure mode for a test.
+    #![allow(clippy::arithmetic_side_effects)]
     #![allow(clippy::indexing_slicing)]
     use std::{collections::HashMap, sync};
 
@@ -4064,14 +4526,19 @@ mod test {
     use tari_common::configuration::Network;
     use tari_test_utils::unpack_enum;
     use tari_transaction_components::{
-        consensus::{ConsensusConstantsBuilder, consensus_constants::PowAlgorithmConstants},
+        consensus::{
+            ConsensusConstantsBuilder,
+            consensus_constants::{POW_BACKOFF_DISABLED, PowAlgorithmConstants, UNSCHEDULED_ACTIVATION_HEIGHT},
+        },
         tari_proof_of_work::Difficulty,
+        transaction_components::RangeProofType,
     };
 
     use super::*;
     use crate::{
         block_specs,
         consensus::chain_strength_comparer::strongest_chain,
+        proof_of_work::{AchievedTargetDifficulty, AdjustedTarget, sha3x_difficulty},
         test_helpers::{
             BlockSpecs,
             blockchain::{
@@ -4083,7 +4550,7 @@ mod test {
                 create_test_blockchain_db,
             },
         },
-        validation::{header::HeaderFullValidator, mocks::MockValidator},
+        validation::{ValidatedHeader, header::HeaderFullValidator, mocks::MockValidator},
     };
 
     #[test]
@@ -4180,8 +4647,257 @@ mod test {
         }
     }
 
+    /// `fork_height` is the one thing keeping the orphan path's chain dependent checks honest: it says how far down
+    /// the candidate's chain and the chain in the database are the same chain, and everything the database recorded
+    /// above it has to be ignored. Overstating it is expensive: this path writes headers that fail validation to the
+    /// bad block list, which keeps rejecting them for as long as the list holds them.
+    mod fork_height {
+        use std::sync::Mutex;
+
+        use super::*;
+        use crate::{
+            proof_of_work::AdjustedTarget,
+            validation::{HeaderChainContext, ValidatedHeader},
+        };
+
+        /// A block that extends the tip agrees with the database all the way down to its parent.
+        #[tokio::test]
+        async fn it_reports_the_parent_height_for_a_block_that_extends_the_tip() {
+            let db = create_new_blockchain();
+            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120)]);
+            let tip = main_chain.get("B").unwrap().clone();
+            let (_, next) = create_chained_blocks(&db, &[("C->GB", 1, 120)], tip);
+            let candidate = next.get("C").unwrap().clone();
+
+            let mut access = db.db_write_access().unwrap();
+            let (_, fork_height) = get_vm_key_for_candidate_header(&mut *access, candidate.header().clone()).unwrap();
+            assert_eq!(candidate.height(), 3);
+            assert_eq!(fork_height, 2);
+        }
+
+        /// An orphan that forks below the tip agrees with the database only up to its fork point, however long the
+        /// orphan chain above it grows.
+        #[tokio::test]
+        async fn it_reports_the_fork_point_for_an_orphan_that_forks_below_the_tip() {
+            let db = create_new_blockchain();
+            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120), ("C->B", 1, 120)]);
+            let fork_root = main_chain.get("A").unwrap().clone();
+            let (_, orphan_chain) = create_chained_blocks(&db, &[("B2->GB", 1, 120), ("C2->B2", 1, 120)], fork_root);
+
+            let validator = MockValidator::new(true);
+            let mut access = db.db_write_access().unwrap();
+            for name in ["B2", "C2"] {
+                let block = orphan_chain.get(name).unwrap().clone();
+                insert_orphan_and_find_new_tips(&mut *access, block.to_arc_block(), &validator, &db.consensus_manager)
+                    .unwrap();
+            }
+
+            let orphan_tip = orphan_chain.get("C2").unwrap().clone();
+            assert_eq!(orphan_tip.height(), 3);
+            let (_, fork_height) = get_vm_key_for_candidate_header(&mut *access, orphan_tip.header().clone()).unwrap();
+            assert_eq!(fork_height, 1, "the orphan forks at A, not at its own parent");
+        }
+
+        /// When the walk ends without ever meeting the main chain, nothing about the database can be trusted, so it
+        /// says so. (A candidate sitting on its own VM key band boundary is the reachable version of this: the walk
+        /// has no headers to look at at all.)
+        #[tokio::test]
+        async fn it_trusts_nothing_when_the_walk_never_meets_the_main_chain() {
+            let db = create_new_blockchain();
+            create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120)]);
+
+            let mut header = BlockHeader::new(0);
+            header.height = 0;
+            assert_eq!(tari_rx_vm_key_height(header.height), header.height);
+
+            let mut access = db.db_write_access().unwrap();
+            let (_, fork_height) = get_vm_key_for_candidate_header(&mut *access, header).unwrap();
+            assert_eq!(fork_height, 0);
+        }
+
+        /// Captures the height a `HeaderChainContext` reports for a given Monero seed, so that a test can see what
+        /// the orphan path actually handed to header validation.
+        #[derive(Clone)]
+        struct ContextSpy {
+            seed: Vec<u8>,
+            observed: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl ContextSpy {
+            fn new(seed: Vec<u8>) -> Self {
+                Self {
+                    seed,
+                    observed: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn observed(&self) -> Vec<u64> {
+                self.observed.lock().unwrap().clone()
+            }
+        }
+
+        impl<B: BlockchainBackend> HeaderChainLinkedValidator<B> for ContextSpy {
+            fn validate(
+                &self,
+                db: &B,
+                header: &BlockHeader,
+                _: &BlockHeader,
+                _: &[EpochTime],
+                _: Option<AdjustedTarget>,
+                chain_context: HeaderChainContext<'_>,
+            ) -> Result<ValidatedHeader, ValidationError> {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(chain_context.monero_seed_first_seen_height(db, &self.seed)?);
+                // Same as `MockValidator`: this assumes the consensus rules are the test rules.
+                let difficulty_calculator = DifficultyCalculator::new(create_consensus_rules(), Default::default());
+                let achieved_target = difficulty_calculator.check_achieved_and_target_difficulty(db, header)?;
+                Ok(ValidatedHeader {
+                    achieved_target,
+                    monero_seed: None,
+                })
+            }
+        }
+
+        /// The regression this plumbing exists for: a seed the main chain first used *above* where an orphan forks
+        /// is not that orphan's seed, so the seed age rule must not be able to see it. If it could, a legitimate
+        /// fork would be rejected and - on this path - blacklisted forever.
+        #[tokio::test]
+        async fn an_orphan_cannot_see_a_seed_the_main_chain_first_used_above_the_fork_point() {
+            let db = create_new_blockchain();
+            let (_, main_chain) = create_main_chain(&db, &[("A->GB", 1, 120), ("B->A", 1, 120), ("C->B", 1, 120)]);
+
+            // The main chain used this seed at height 2. Written straight to the index because that index, not the
+            // block that filled it, is what the rule reads.
+            let seed = vec![7u8; 32];
+            {
+                let mut txn = DbTransaction::new();
+                txn.insert_monero_seed_height(seed.clone(), 2);
+                let mut db_write = db.db_write_access().unwrap();
+                db_write.write(txn).unwrap();
+            }
+
+            // The orphan forks at height 1, below that use of the seed.
+            let fork_root = main_chain.get("A").unwrap().clone();
+            let (_, orphan_chain) = create_chained_blocks(&db, &[("B2->GB", 1, 120), ("C2->B2", 1, 120)], fork_root);
+
+            let spy = ContextSpy::new(seed.clone());
+            let mut access = db.db_write_access().unwrap();
+            for name in ["B2", "C2"] {
+                let block = orphan_chain.get(name).unwrap().clone();
+                insert_orphan_and_find_new_tips(&mut *access, block.to_arc_block(), &spy, &db.consensus_manager)
+                    .unwrap();
+            }
+
+            let observed = spy.observed();
+            assert!(!observed.is_empty(), "the orphan path must have validated a header");
+            assert!(
+                observed.iter().all(|height| *height == 0),
+                "the orphan must not be able to see the main chain's seed, saw {observed:?}"
+            );
+            // The counterfactual: the index really does hold it, so a context that trusted the database outright
+            // would have measured this orphan's headers against height 2.
+            assert_eq!(access.fetch_monero_seed_first_seen_height(&seed).unwrap(), 2);
+        }
+    }
+
     mod insert_orphan_and_find_new_tips {
         use super::*;
+        use crate::{
+            proof_of_work::AdjustedTarget,
+            validation::{HeaderChainContext, ValidatedHeader},
+        };
+
+        /// A validator that fails every header, so that a test can see what the orphan path does with the verdict.
+        struct AlwaysFails {
+            /// `true` for the chain dependent seed age verdict, `false` for a verdict about the header alone.
+            seed_age: bool,
+        }
+
+        impl<B: BlockchainBackend> HeaderChainLinkedValidator<B> for AlwaysFails {
+            fn validate(
+                &self,
+                _: &B,
+                _: &BlockHeader,
+                _: &BlockHeader,
+                _: &[EpochTime],
+                _: Option<AdjustedTarget>,
+                _: HeaderChainContext<'_>,
+            ) -> Result<ValidatedHeader, ValidationError> {
+                if self.seed_age {
+                    Err(ValidationError::BlockHeaderError(
+                        BlockHeaderValidationError::OldSeedHash,
+                    ))
+                } else {
+                    Err(ValidationError::BlockHeaderError(
+                        BlockHeaderValidationError::InvalidNonce,
+                    ))
+                }
+            }
+        }
+
+        fn orphan_of_genesis(db: &BlockchainDatabase<TempDatabase>) -> Arc<ChainBlock> {
+            let genesis_block = db
+                .fetch_block(0, true)
+                .unwrap()
+                .try_into_chain_block()
+                .map(Arc::new)
+                .unwrap();
+            let (_, chain) = create_chained_blocks(db, &[("A->GB", 1u64, 120u64)], genesis_block);
+            chain.get("A").unwrap().clone()
+        }
+
+        /// The seed age rule is measured against the chain a header is on, so the same header can be stale on one
+        /// chain and fine on another. This path writes failed headers to the bad block list, which is consulted by
+        /// `check_not_bad_block` on every later attempt, so a verdict that belongs to a chain rather than to the
+        /// header must not be recorded there. `BlockHeaderSyncValidator` already behaves this way.
+        #[tokio::test]
+        async fn it_does_not_blacklist_a_seed_age_failure() {
+            let db = create_new_blockchain();
+            let block = orphan_of_genesis(&db);
+            let mut access = db.db_write_access().unwrap();
+
+            let err = insert_orphan_and_find_new_tips(
+                &mut *access,
+                block.to_arc_block(),
+                &AlwaysFails { seed_age: true },
+                &db.consensus_manager,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ChainStorageError::ValidationError {
+                    source: ValidationError::BlockHeaderError(BlockHeaderValidationError::OldSeedHash)
+                }),
+                "expected the seed age failure to be returned, got {err:?}"
+            );
+
+            let (is_bad_block, reason) = access.bad_block_exists(*block.hash()).unwrap();
+            assert!(!is_bad_block, "a seed age failure must not be blacklisted: {reason}");
+        }
+
+        /// The control for the test above: a verdict about the header alone is still recorded, so the assertion
+        /// there is about `OldSeedHash` and not about this path having stopped blacklisting altogether.
+        #[tokio::test]
+        async fn it_still_blacklists_a_failure_that_is_about_the_header_alone() {
+            let db = create_new_blockchain();
+            let block = orphan_of_genesis(&db);
+            let mut access = db.db_write_access().unwrap();
+
+            insert_orphan_and_find_new_tips(
+                &mut *access,
+                block.to_arc_block(),
+                &AlwaysFails { seed_age: false },
+                &db.consensus_manager,
+            )
+            .unwrap_err();
+
+            let (is_bad_block, _) = access.bad_block_exists(*block.hash()).unwrap();
+            assert!(
+                is_bad_block,
+                "an invalid nonce is the header's own fault and must be blacklisted"
+            );
+        }
 
         #[tokio::test]
         async fn it_inserts_new_block_in_orphan_db_as_tip() {
@@ -4785,6 +5501,534 @@ mod test {
         check_whole_chain(&mut access);
     }
 
+    // ---------------------------------------------------------------------------------------------------------
+    // GHSA-3qmx-q9pv-f3m4 deep reorg anchor
+    // ---------------------------------------------------------------------------------------------------------
+
+    /// The rule itself, in isolation. Everything below exercises it through the real reorg path; this pins the
+    /// properties it has to have, including the ones that are about the rule *not* firing.
+    #[test]
+    fn the_deep_reorg_anchor_only_fires_when_it_should() {
+        const ACTIVATION: u64 = 10_000;
+        const WINDOW: u64 = GHSA_DEEP_REORG_CONFIRMATION_WINDOW;
+
+        // Fires: our tip is a full confirmation window past the fork and the fork chain would add blocks from
+        // below it. The first case is the exact engagement height, the second a genuinely deep fork.
+        assert!(reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION + WINDOW,
+            ACTIVATION - 1,
+            ACTIVATION
+        ));
+        assert!(reorg_reintroduces_pre_ghsa_blocks(ACTIVATION + 5_000, 1, ACTIVATION));
+
+        // Does not fire inside the confirmation window, even though the fork reaches below the activation
+        // height. This is the case that partitions honest nodes if the rule is written as an absolute boundary:
+        // at tip `activation + 1` a node one block ahead of its neighbour would otherwise permanently refuse a
+        // fork the neighbour accepts, and the refusal costs a resync.
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION + 1,
+            ACTIVATION - 1,
+            ACTIVATION
+        ));
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION + WINDOW - 1,
+            ACTIVATION - 1,
+            ACTIVATION
+        ));
+        // ...including the three block reorg across the fork that started all this: tip at the activation
+        // height, fork point two below it.
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION,
+            ACTIVATION - 1,
+            ACTIVATION
+        ));
+
+        // Does not fire below the fork, which is what keeps initial sync - and ordinary pre-fork operation -
+        // working: the node reorgs freely inside the pre-fork range because that range's rules are the pre-fork
+        // rules for everyone.
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(ACTIVATION - 1, 1, ACTIVATION));
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(0, 0, ACTIVATION));
+
+        // Does not fire on a reorg that only adds blocks from the activation height upwards, however far past
+        // the window we are: those blocks are subject to the new rules and had to carry real work.
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION + WINDOW,
+            ACTIVATION,
+            ACTIVATION
+        ));
+        assert!(!reorg_reintroduces_pre_ghsa_blocks(
+            ACTIVATION + 100_000,
+            ACTIVATION,
+            ACTIVATION
+        ));
+
+        // Inert where the advisory's fork is unscheduled: the engagement height saturates at `u64::MAX`, which
+        // no reachable tip reaches.
+        for tip in [0, 1_000, u64::MAX - 1] {
+            assert!(!reorg_reintroduces_pre_ghsa_blocks(
+                tip,
+                0,
+                UNSCHEDULED_ACTIVATION_HEIGHT
+            ));
+        }
+        // ...and inert on a network like LocalNet that has the rules from height 0, because no block is below it.
+        for tip in [0, 1_000, u64::MAX] {
+            assert!(!reorg_reintroduces_pre_ghsa_blocks(tip, 0, 0));
+        }
+    }
+
+    /// The property the confirmation window exists for, stated directly: *no* reorg shallower than the window is
+    /// ever refused, wherever the node's tip happens to be. That is what stops two honest nodes at different
+    /// heights from deciding an ordinary reorg differently - the only forks they can disagree about are ones far
+    /// deeper than honest chain activity produces.
+    ///
+    /// The depth of a reorg is `tip - fork point`, and the lowest block it adds sits at `fork point + 1`
+    /// (`HeaderFullValidator::check_height` makes that an identity, and header sync computes it as
+    /// `split_header.height + 1`), so depth `d` means `lowest_new = tip - d + 1`.
+    #[test]
+    fn the_deep_reorg_anchor_never_refuses_a_reorg_shallower_than_the_window() {
+        const ACTIVATION: u64 = 10_000;
+        const WINDOW: u64 = GHSA_DEEP_REORG_CONFIRMATION_WINDOW;
+
+        for tip in [
+            0,
+            1,
+            ACTIVATION - WINDOW,
+            ACTIVATION - 2,
+            ACTIVATION - 1,
+            ACTIVATION,
+            ACTIVATION + 1,
+            ACTIVATION + WINDOW - 1,
+            ACTIVATION + WINDOW,
+            ACTIVATION + WINDOW + 1,
+            ACTIVATION + 10 * WINDOW,
+        ] {
+            for depth in 1..=WINDOW {
+                let lowest_new = tip.saturating_sub(depth) + 1;
+                assert!(
+                    !reorg_reintroduces_pre_ghsa_blocks(tip, lowest_new, ACTIVATION),
+                    "a {depth} block reorg was refused at tip {tip} (lowest new block {lowest_new})"
+                );
+            }
+        }
+    }
+
+    /// LocalNet constants with the advisory's rules scheduled at `activation` instead of on from height 0, so the
+    /// anchor has a boundary to guard. Everything else is the stock LocalNet rule set, including the default
+    /// chain strength comparer - accumulated difficulty first, height only as a tiebreak - because the whole
+    /// point of the fork these tests build is that it is *shorter and heavier* than the chain it replaces, and a
+    /// height ordering would never pick it.
+    fn rules_with_ghsa_activation_at(activation: u64) -> BaseNodeConsensusManager {
+        BaseNodeConsensusManager::builder(Network::LocalNet)
+            .add_consensus_constants(
+                ConsensusConstantsBuilder::new(Network::LocalNet)
+                    .with_effective_from_height(0)
+                    .with_derive_monero_coinbase_hasher(false)
+                    .build(),
+            )
+            .add_consensus_constants(
+                ConsensusConstantsBuilder::new(Network::LocalNet)
+                    .with_effective_from_height(activation)
+                    .with_derive_monero_coinbase_hasher(true)
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    /// The main chain the deep reorg fixture builds has to be longer than the confirmation window before the
+    /// anchor can engage at all, which is the only reason it is this long. Four blocks past the window leaves
+    /// room for an activation height that is both above the fork chain's lowest block and a full window below
+    /// the tip.
+    const DEEP_REORG_FIXTURE_CHAIN_LEN: u64 = GHSA_DEEP_REORG_CONFIRMATION_WINDOW + 4;
+    /// Every main chain block in the fixture is mined at difficulty 1 - the default `MockValidator` credits the
+    /// LocalNet LWMA target, which never leaves its minimum on a chain of evenly spaced blocks - so the fork has
+    /// to out-accumulate one unit per main chain block. The fork's blocks carry real proof of work instead, and
+    /// `apply_deep_reorg_fork` credits them with it. `mine_to_difficulty` searches for a hash of *exactly* the
+    /// requested difficulty, which costs about `difficulty^2` hashes and gives up at 20 000, so this stays well
+    /// clear of that ceiling and buys the accumulated difficulty with more blocks instead.
+    const DEEP_REORG_FIXTURE_FORK_DIFFICULTY: u64 = 30;
+    /// Enough blocks at that difficulty to beat the whole main chain with room to spare.
+    const DEEP_REORG_FIXTURE_FORK_LEN: u64 = DEEP_REORG_FIXTURE_CHAIN_LEN / DEEP_REORG_FIXTURE_FORK_DIFFICULTY + 2;
+
+    fn leaked(name: String) -> &'static str {
+        Box::leak(name.into_boxed_str())
+    }
+
+    fn fixture_spec(name: &'static str, difficulty: u64, block_time: u64) -> crate::test_helpers::BlockSpec {
+        crate::test_helpers::BlockSpec::builder()
+            .with_name(name)
+            .with_block_time(block_time)
+            .with_difficulty(Difficulty::from_u64(difficulty).unwrap())
+            .finish()
+    }
+
+    /// `M1 -> M2 -> ... -> M{DEEP_REORG_FIXTURE_CHAIN_LEN}`, with a much heavier fork rooted at `M2` that
+    /// *branches* at its tip: `... -> F{n} -> {E2, D3}`. The branch is not decoration.
+    /// `find_orphan_descendant_tips_of` registers a chain tip for every descendant, so a refused fork can have
+    /// several tips while `get_orphan_link_main_chain` only ever returns the one linking chain - and an attacker
+    /// announcing two near-equal tips on the same refused fork costs nothing under the premise this rule exists
+    /// for.
+    ///
+    /// Returns the harness pieces plus both chains.
+    #[allow(clippy::type_complexity)]
+    fn deep_reorg_fixture(
+        activation: u64,
+    ) -> (
+        BlockchainDatabase<TempDatabase>,
+        HashMap<String, Arc<ChainBlock>>,
+        HashMap<String, Arc<ChainBlock>>,
+    ) {
+        let rules = rules_with_ghsa_activation_at(activation);
+        assert_eq!(rules.derived_monero_coinbase_activation_height(), activation);
+        let db = crate::test_helpers::blockchain::create_custom_blockchain(rules);
+
+        // Revealed value coinbases: the chain has to be hundreds of blocks long and every validator in this
+        // harness is a mock, so paying for a bullet proof per block buys nothing.
+        let main_chain_specs = (1..=DEEP_REORG_FIXTURE_CHAIN_LEN)
+            .map(|height| {
+                let name = if height == 1 {
+                    leaked("M1->GB".to_string())
+                } else {
+                    leaked(format!("M{height}->M{}", height - 1))
+                };
+                fixture_spec(name, 1, 120)
+            })
+            .collect::<Vec<_>>();
+        let (_, mainchain) = crate::test_helpers::blockchain::create_main_chain_with_range_proof_type(
+            &db,
+            main_chain_specs,
+            Some(RangeProofType::RevealedValue),
+        );
+        // Initial sync across the boundary: every block above was added one at a time through the very same
+        // `handle_possible_reorg` path, with the tip crossing `activation` on the way. The anchor must not have
+        // touched any of them.
+        assert_eq!(
+            db.get_chain_metadata().unwrap().best_block_height(),
+            DEEP_REORG_FIXTURE_CHAIN_LEN,
+            "syncing through the activation height must be unaffected"
+        );
+
+        // The fork's lowest block is at height 3, two below the fork point's successor... and the specs are
+        // emitted in non-decreasing height order so that the fixture's shared Merkle tree is written in order.
+        // `D3` shares its height with `E2` and gets a different block time so that it cannot collide with it.
+        let last_linear_height = DEEP_REORG_FIXTURE_FORK_LEN + 1;
+        let mut fork_specs = (0..DEEP_REORG_FIXTURE_FORK_LEN - 1)
+            .map(|index| {
+                let height = index + 3;
+                let name = match index {
+                    0 => leaked("C2->GB".to_string()),
+                    1 => leaked(format!("F{height}->C2")),
+                    _ => leaked(format!("F{height}->F{}", height - 1)),
+                };
+                fixture_spec(name, DEEP_REORG_FIXTURE_FORK_DIFFICULTY, 120)
+            })
+            .collect::<Vec<_>>();
+        fork_specs.push(fixture_spec(
+            leaked(format!("D3->F{last_linear_height}")),
+            DEEP_REORG_FIXTURE_FORK_DIFFICULTY - 1,
+            121,
+        ));
+        fork_specs.push(fixture_spec(
+            leaked(format!("E2->F{last_linear_height}")),
+            DEEP_REORG_FIXTURE_FORK_DIFFICULTY,
+            120,
+        ));
+
+        let fork_block = mainchain.get("M2").unwrap().clone();
+        let (_, reorg_chain) = crate::test_helpers::blockchain::create_chained_blocks_with_range_proof_type(
+            &db,
+            fork_specs,
+            fork_block,
+            Some(RangeProofType::RevealedValue),
+        );
+        assert_eq!(reorg_chain.get("C2").unwrap().height(), 3);
+        assert_eq!(
+            reorg_chain.get("E2").unwrap().height(),
+            reorg_chain.get("D3").unwrap().height()
+        );
+        assert_ne!(
+            reorg_chain.get("D3").unwrap().hash(),
+            reorg_chain.get("E2").unwrap().hash()
+        );
+        (db, mainchain, reorg_chain)
+    }
+
+    /// The names of the fork blocks, tip first: `E2`, then its sibling `D3`, then the linear chain back down to
+    /// `C2`.
+    fn deep_reorg_fork_names_tip_first() -> Vec<String> {
+        let mut names = vec!["E2".to_string(), "D3".to_string()];
+        for index in (0..DEEP_REORG_FIXTURE_FORK_LEN - 1).rev() {
+            let height = index + 3;
+            names.push(if index == 0 {
+                "C2".to_string()
+            } else {
+                format!("F{height}")
+            });
+        }
+        names
+    }
+
+    /// A header validator that accepts every header and credits it with the proof of work the header actually
+    /// carries.
+    ///
+    /// The default `MockValidator` credits the LWMA *target* difficulty computed from the LocalNet rules, which
+    /// sits at its minimum of 1 for every evenly spaced block in this harness - so with it a fork can only win
+    /// by being longer than the chain it replaces, and the fork here has to reach hundreds of blocks below a tip
+    /// it is only a few blocks taller than. This one reports what `mine_to_difficulty` actually mined, so a
+    /// short heavy fork is expressible. It is not more permissive than the mock it replaces: it accepts exactly
+    /// the same headers.
+    struct PowCreditingHeaderValidator;
+
+    impl<B: BlockchainBackend> HeaderChainLinkedValidator<B> for PowCreditingHeaderValidator {
+        fn validate(
+            &self,
+            _db: &B,
+            header: &BlockHeader,
+            _prev_header: &BlockHeader,
+            _prev_timestamps: &[EpochTime],
+            _target_difficulty: Option<AdjustedTarget>,
+            _chain_context: HeaderChainContext<'_>,
+        ) -> Result<ValidatedHeader, ValidationError> {
+            let achieved = sha3x_difficulty(header)?;
+            Ok(ValidatedHeader {
+                achieved_target: AchievedTargetDifficulty::try_construct(
+                    PowAlgorithm::Sha3x,
+                    achieved,
+                    achieved,
+                    achieved,
+                )
+                .expect("achieved == target"),
+                // This harness mines Sha3x only, so there is never a Monero seed to report.
+                monero_seed: None,
+            })
+        }
+    }
+
+    /// Feeds the fork in tip-first (so the intermediate blocks are plain orphans) and returns the result of the
+    /// call that links it to the main chain - the one that would perform the swap.
+    fn apply_deep_reorg_fork(
+        db: &BlockchainDatabase<TempDatabase>,
+        reorg_chain: &HashMap<String, Arc<ChainBlock>>,
+    ) -> BlockAddResult {
+        let mock_validator = MockValidator::new(true);
+        let header_validator = PowCreditingHeaderValidator;
+        let chain_strength_comparer = strongest_chain().by_sha3x_difficulty().build();
+        let mut access = db.db_write_access().unwrap();
+        let mut names = deep_reorg_fork_names_tip_first();
+        let linking_block = names.pop().expect("the fork is not empty");
+        assert_eq!(linking_block, "C2");
+        for name in names {
+            handle_possible_reorg(
+                &mut *access,
+                &Default::default(),
+                &db.consensus_manager,
+                &mock_validator,
+                &header_validator,
+                &*chain_strength_comparer,
+                reorg_chain.get(&name).unwrap().to_arc_block(),
+            )
+            .unwrap()
+            .assert_orphaned();
+        }
+        handle_possible_reorg(
+            &mut *access,
+            &Default::default(),
+            &db.consensus_manager,
+            &mock_validator,
+            &header_validator,
+            &*chain_strength_comparer,
+            reorg_chain.get(&linking_block).unwrap().to_arc_block(),
+        )
+        .unwrap()
+    }
+
+    /// The activation height that makes the fixture's tip land exactly on the anchor's engagement height: the
+    /// fork's lowest block is at 3, so an activation height of 4 is above it, and the tip is
+    /// `4 + GHSA_DEEP_REORG_CONFIRMATION_WINDOW`.
+    const DEEP_REORG_FIXTURE_ENGAGED_ACTIVATION: u64 = 4;
+
+    /// The attack this exists for: our tip is a full confirmation window past the activation height, and a
+    /// heavier fork wants to replace the chain from *below* it, where the forgeable pre-fork verifiers are still
+    /// the rules. Refused, and the fork is dropped rather than left to win the tip selection again on the next
+    /// block.
+    #[tokio::test]
+    async fn deep_reorg_anchor_refuses_a_fork_rooted_below_the_activation_height() {
+        let (db, mainchain, reorg_chain) = deep_reorg_fixture(DEEP_REORG_FIXTURE_ENGAGED_ACTIVATION);
+        assert_eq!(
+            db.get_chain_metadata().unwrap().best_block_height(),
+            DEEP_REORG_FIXTURE_ENGAGED_ACTIVATION + GHSA_DEEP_REORG_CONFIRMATION_WINDOW,
+            "the fixture must put the tip exactly on the anchor's engagement height"
+        );
+
+        let result = apply_deep_reorg_fork(&db, &reorg_chain);
+        result.assert_orphaned();
+
+        let access = db.db_write_access().unwrap();
+        // The chain did not move.
+        let tip = access.fetch_last_header().unwrap();
+        assert_eq!(
+            &tip,
+            mainchain
+                .get(&format!("M{DEEP_REORG_FIXTURE_CHAIN_LEN}"))
+                .unwrap()
+                .header()
+        );
+        // The whole fork - both branches, not just the chain that linked it to the main chain - is gone from the
+        // orphan pool, so it cannot mask a legitimate fork behind it forever.
+        for name in deep_reorg_fork_names_tip_first() {
+            let hash = *reorg_chain.get(&name).unwrap().hash();
+            assert!(
+                !access.contains(&DbKey::OrphanBlock(hash)).unwrap(),
+                "{name} is still an orphan"
+            );
+            assert!(
+                access.fetch_orphan_chain_tip_by_hash(&hash).unwrap().is_none(),
+                "{name} is still an orphan chain tip"
+            );
+        }
+        // Nothing is recorded in `bad_blocks`, deliberately: see `refuse_reorg_below_ghsa_activation`. The
+        // record cannot survive `insert_bad_block_and_cleanup`'s sweep at this call site in a non-test build -
+        // the refusal runs before any rewind, so the sweep's threshold is our own tip, which is above the height
+        // being recorded - and making it survive would trade a no-op for an unbounded, remotely grown table.
+        let (is_bad, _) = access.bad_block_exists(*reorg_chain.get("C2").unwrap().hash()).unwrap();
+        assert!(!is_bad, "the refusal must not pretend to record a bad block");
+    }
+
+    /// The same fork and the same tip, with the activation height moved up by one so that the tip is one block
+    /// short of the anchor's engagement height. The fork still reaches below the activation height, so an
+    /// absolute height boundary would refuse it - and would therefore disagree with every node one block behind
+    /// this one, permanently. Inside the window it is allowed.
+    #[tokio::test]
+    async fn deep_reorg_anchor_allows_a_fork_below_the_activation_height_inside_the_confirmation_window() {
+        let activation = DEEP_REORG_FIXTURE_ENGAGED_ACTIVATION + 1;
+        let (db, _mainchain, reorg_chain) = deep_reorg_fixture(activation);
+        assert_eq!(
+            db.get_chain_metadata().unwrap().best_block_height(),
+            activation + GHSA_DEEP_REORG_CONFIRMATION_WINDOW - 1,
+            "the fixture must put the tip one block below the anchor's engagement height"
+        );
+        assert!(
+            reorg_chain.get("C2").unwrap().height() < activation,
+            "the fork must still reach below the activation height, or this tests nothing"
+        );
+
+        apply_deep_reorg_fork(&db, &reorg_chain).assert_reorg(
+            usize::try_from(DEEP_REORG_FIXTURE_FORK_LEN).unwrap(),
+            usize::try_from(DEEP_REORG_FIXTURE_CHAIN_LEN).unwrap() - 2,
+        );
+
+        let access = db.db_write_access().unwrap();
+        let tip = access.fetch_last_header().unwrap();
+        assert_eq!(&tip, reorg_chain.get("E2").unwrap().header());
+    }
+
+    /// The whole schedule moved above our tip: the node is still entirely inside the pre-fork range and the
+    /// anchor must not engage. This is the case that would break every node syncing history if the rule were
+    /// written against the node's *software* rather than its tip.
+    #[tokio::test]
+    async fn deep_reorg_anchor_is_inert_below_the_activation_height() {
+        let (db, _mainchain, reorg_chain) = deep_reorg_fixture(DEEP_REORG_FIXTURE_CHAIN_LEN + 1);
+        apply_deep_reorg_fork(&db, &reorg_chain).assert_reorg(
+            usize::try_from(DEEP_REORG_FIXTURE_FORK_LEN).unwrap(),
+            usize::try_from(DEEP_REORG_FIXTURE_CHAIN_LEN).unwrap() - 2,
+        );
+
+        let access = db.db_write_access().unwrap();
+        let tip = access.fetch_last_header().unwrap();
+        assert_eq!(&tip, reorg_chain.get("E2").unwrap().header());
+    }
+
+    /// The boundary case the rule is deliberately phrased to allow: the fork adds blocks from exactly the
+    /// activation height upwards, so every block it adds is subject to the new rules and had to do real work.
+    /// The tip is far past the engagement height here, so it is the "lowest added block" phrasing doing the
+    /// work, not the window.
+    #[tokio::test]
+    async fn deep_reorg_anchor_allows_a_reorg_that_starts_at_the_activation_height() {
+        let (db, _mainchain, reorg_chain) = deep_reorg_fixture(3);
+        apply_deep_reorg_fork(&db, &reorg_chain).assert_reorg(
+            usize::try_from(DEEP_REORG_FIXTURE_FORK_LEN).unwrap(),
+            usize::try_from(DEEP_REORG_FIXTURE_CHAIN_LEN).unwrap() - 2,
+        );
+
+        let access = db.db_write_access().unwrap();
+        let tip = access.fetch_last_header().unwrap();
+        assert_eq!(&tip, reorg_chain.get("E2").unwrap().header());
+    }
+
+    /// On a network where the advisory's fork is unscheduled the activation height is `u64::MAX`, so the anchor
+    /// can never engage and reorg behaviour is exactly what it is today.
+    #[tokio::test]
+    async fn deep_reorg_anchor_is_inert_on_an_unscheduled_network() {
+        let (db, _mainchain, reorg_chain) = deep_reorg_fixture(UNSCHEDULED_ACTIVATION_HEIGHT);
+        apply_deep_reorg_fork(&db, &reorg_chain).assert_reorg(
+            usize::try_from(DEEP_REORG_FIXTURE_FORK_LEN).unwrap(),
+            usize::try_from(DEEP_REORG_FIXTURE_CHAIN_LEN).unwrap() - 2,
+        );
+
+        let access = db.db_write_access().unwrap();
+        let tip = access.fetch_last_header().unwrap();
+        assert_eq!(&tip, reorg_chain.get("E2").unwrap().header());
+    }
+
+    /// A refusal must not wedge the node.
+    ///
+    /// The refused fork branches at its tip, so `get_orphan_link_main_chain` returns only the chain ending in
+    /// `E2` and the sibling `D3` is not in it. Deleting just that chain leaves `D3` in `orphans_db` *and* in
+    /// `orphan_chain_tips_db` with its parent deleted out from under it, still claiming more accumulated
+    /// difficulty than our chain. `swap_to_highest_pow_chain` then selects it, `get_orphan_link_main_chain`
+    /// fails with `InvalidOperation` because the parent is gone, and that error propagates out of `add_block`
+    /// before `cleanup_orphans` ever runs - so the node rejects blocks until it is restarted.
+    #[tokio::test]
+    async fn deep_reorg_anchor_refused_fork_leaves_no_orphan_behind_and_the_node_keeps_accepting_blocks() {
+        let (db, mainchain, reorg_chain) = deep_reorg_fixture(DEEP_REORG_FIXTURE_ENGAGED_ACTIVATION);
+        let tip_name = format!("M{DEEP_REORG_FIXTURE_CHAIN_LEN}");
+        // The next two blocks on the main chain, built before the refusal so that they are the only thing the
+        // node is asked to do afterwards.
+        let (_, next_blocks) = crate::test_helpers::blockchain::create_chained_blocks_with_range_proof_type(
+            &db,
+            &[("NEXT->GB", 1, 120), ("NEXT2->NEXT", 1, 120)],
+            mainchain.get(&tip_name).unwrap().clone(),
+            Some(RangeProofType::RevealedValue),
+        );
+        let next_block = next_blocks.get("NEXT").unwrap().clone();
+        let next_next_block = next_blocks.get("NEXT2").unwrap().clone();
+
+        apply_deep_reorg_fork(&db, &reorg_chain).assert_orphaned();
+
+        {
+            let access = db.db_write_access().unwrap();
+            for name in deep_reorg_fork_names_tip_first() {
+                let hash = *reorg_chain.get(&name).unwrap().hash();
+                assert!(
+                    !access.contains(&DbKey::OrphanBlock(hash)).unwrap(),
+                    "{name} survived the refusal in the orphan pool"
+                );
+                assert!(
+                    access.fetch_orphan_chain_tip_by_hash(&hash).unwrap().is_none(),
+                    "{name} survived the refusal as an orphan chain tip"
+                );
+            }
+            assert!(
+                access.fetch_strongest_orphan_chain_tips().unwrap().is_empty(),
+                "the refused fork left an orphan chain tip behind"
+            );
+        }
+
+        // And the node is still a working node. The true orphan goes first on purpose: a block whose parent we
+        // do not have is the commonest thing on the wire, and it is the case a leftover orphan tip wedges. A
+        // true orphan registers no tip of its own, so a stale tip is then the *only* thing
+        // `swap_to_highest_pow_chain` can find - it outweighs our chain, `get_orphan_link_main_chain` cannot
+        // reach the main chain from it because its parent was deleted, and the resulting `InvalidOperation`
+        // comes back out of `add_block`.
+        db.add_block(next_next_block.to_arc_block()).unwrap().assert_orphaned();
+        db.add_block(next_block.to_arc_block()).unwrap();
+        assert_eq!(
+            db.get_chain_metadata().unwrap().best_block_height(),
+            DEEP_REORG_FIXTURE_CHAIN_LEN + 2
+        );
+    }
+
     #[tokio::test]
     async fn test_handle_possible_reorg_target_difficulty_is_correct_case_1() {
         let (result, _blocks) = test_case_handle_possible_reorg(&[
@@ -5114,6 +6358,11 @@ mod test {
             .add_consensus_constants(
                 ConsensusConstantsBuilder::new(Network::LocalNet)
                     .clear_proof_of_work()
+                    // `BlockSpec` mines every block at a hardcoded difficulty (1 by default) regardless of the
+                    // consensus target, so under TIP-RFC-MT-0004 the second consecutive Sha3x block would correctly
+                    // be rejected for not clearing its 2x target. That is a property of the test harness, not of the
+                    // reorg behaviour under test, so switch the backoff off here.
+                    .with_pow_backoff_cap(POW_BACKOFF_DISABLED)
                     .add_proof_of_work(PowAlgorithm::Sha3x, PowAlgorithmConstants {
                         min_difficulty: Difficulty::min(),
                         max_difficulty: Difficulty::from_u64(100).expect("valid difficulty"),

@@ -23,7 +23,13 @@
 // This is here because this crate is used as a lib and a binary, mainly to support Cucumber tests. In future, something
 // should be done so this is not needed.
 #![allow(dead_code, unused)]
-use std::{fs, io, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    fs,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
 use dialoguer::Input as InputPrompt;
@@ -102,7 +108,7 @@ fn get_new_passphrase(prompt: &str, confirm: &str) -> Result<SafePassword, ExitE
     loop {
         // Prompt the user for a passphrase and confirm it, up to the defined limit
         // This ensures an unlucky user doesn't get stuck
-        let mut tries = 0;
+        let mut tries = 0u8;
         let mut passphrase = SafePassword::from(""); // initial value for scope
         loop {
             passphrase = prompt_password(prompt)?;
@@ -114,7 +120,7 @@ fn get_new_passphrase(prompt: &str, confirm: &str) -> Result<SafePassword, ExitE
             }
 
             // If they don't match, keep prompting until we hit the sanity limit
-            tries += 1;
+            tries = tries.saturating_add(1);
             if tries == PASSPHRASE_SANITY_LIMIT {
                 return Err(ExitError::new(ExitCode::InputError, "Passphrases don't match!"));
             }
@@ -455,6 +461,41 @@ pub(crate) fn confirm_seed_words(wallet: &mut WalletSqlite) -> Result<(), ExitEr
         match readline {
             Ok(line) => match line.to_lowercase().as_ref() {
                 "confirm" => return Ok(()),
+                _ => continue,
+            },
+            Err(e) => {
+                return Err(ExitError::new(ExitCode::IOError, e));
+            },
+        }
+    }
+}
+
+/// Confirm with the user that the wallet seed words may be written, in the clear, to the given file.
+///
+/// This is only asked when the wallet passphrase was not supplied up front (via the CLI or the config file), as in
+/// that case the wallet is being driven interactively and the user may not have intended to export the seed words.
+///
+/// Returns `true` if and only if the user confirmed the export.
+pub(crate) fn confirm_seed_words_file(file_name: &Path) -> Result<bool, ExitError> {
+    println!();
+    println!("=========================");
+    println!("       IMPORTANT!        ");
+    println!("=========================");
+    println!("You asked for the wallet seed words to be written to:");
+    println!("  {}", file_name.display());
+    println!("They will be written unencrypted; anyone able to read that file can spend your funds.");
+    println!();
+    println!("\x07"); // beep!
+
+    let mut rl = Editor::<()>::new();
+    loop {
+        println!("Are you sure you want to write the seed words to this file?");
+        println!(r#"Type "yes" or "y" to continue, or "no" or "n" to start the wallet without exporting them."#);
+        let readline = rl.readline(">> ");
+        match readline {
+            Ok(line) => match line.trim().to_lowercase().as_ref() {
+                "yes" | "y" => return Ok(true),
+                "no" | "n" => return Ok(false),
                 _ => continue,
             },
             Err(e) => {

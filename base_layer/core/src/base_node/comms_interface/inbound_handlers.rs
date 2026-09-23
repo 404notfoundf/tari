@@ -45,7 +45,7 @@ use tari_node_components::blocks::{
 use tari_transaction_components::{
     aggregated_body::AggregateBody,
     consensus::ConsensusConstants,
-    tari_proof_of_work::{Difficulty, PowAlgorithm, PowError},
+    tari_proof_of_work::{PowAlgorithm, PowError},
 };
 use tari_utilities::hex::Hex;
 use tokio::sync::{RwLock, watch};
@@ -62,17 +62,18 @@ use crate::{
         error::CommsInterfaceError,
         local_interface::BlockEventSender,
     },
-    chain_storage::{BlockAddResult, BlockchainBackend, ChainStorageError, async_db::AsyncBlockchainDb},
+    chain_storage::{BlockAddResult, BlockchainBackend, ChainStorageError, MinedInfo, async_db::AsyncBlockchainDb},
     consensus::BaseNodeConsensusManager,
     mempool::{Mempool, MempoolLastSeen},
     proof_of_work::{
+        AdjustedTarget,
         cuckaroo_pow::cuckaroo_difficulty,
-        monero_randomx_difficulty,
+        monero_randomx_difficulty_at_rules_height,
         randomx_factory::RandomXFactory,
         sha3x_difficulty,
         tari_randomx_difficulty,
     },
-    validation::{ValidationError, helpers, tari_rx_vm_key_height},
+    validation::{ValidationError, header::check_randomxt_pow_data, helpers, tari_rx_vm_key_height},
 };
 
 const LOG_TARGET: &str = "c::bn::comms_interface::inbound_handler";
@@ -304,7 +305,9 @@ where B: BlockchainBackend + 'static
                 // the current value, so we read it first and only then wait for the *next* change - an update landing
                 // between the read and the wait cannot be missed.
                 let mut last_seen_rx = self.mempool_last_seen.clone();
-                let deadline = Instant::now() + self.mempool_sync_timeout;
+                let deadline = Instant::now()
+                    .checked_add(self.mempool_sync_timeout)
+                    .unwrap_or_else(Instant::now);
 
                 let best_block_header;
                 let is_mempool_synced;
@@ -399,7 +402,8 @@ where B: BlockchainBackend + 'static
                 let block_template = NewBlockTemplate::from_block(
                     block,
                     self.get_target_difficulty_for_next_block(request.algo, constants, prev_hash)
-                        .await?,
+                        .await?
+                        .adjusted,
                     self.consensus_manager.get_block_reward_at(height),
                     is_mempool_synced,
                 )?;
@@ -537,16 +541,40 @@ where B: BlockchainBackend + 'static
                 Ok(NodeCommsResponse::MinedInfo(output_info))
             },
             NodeCommsRequest::FetchMinedInfoByOutputHash(output_hash) => {
-                let output_info = self.blockchain_db.fetch_mined_info_by_output_hash(output_hash).await?;
-                Ok(NodeCommsResponse::MinedInfo(output_info))
+                // A hash may be indexed under multiple headers; return the entry with the highest-mined output. Entries
+                // without an output (the output was pruned but the spend is still indexed) still carry spent status,
+                // so fall back to the highest-spent one of those rather than reporting nothing.
+                let (mined, spent_only): (Vec<_>, Vec<_>) = self
+                    .blockchain_db
+                    .fetch_mined_info_by_output_hash(output_hash)
+                    .await?
+                    .into_iter()
+                    .partition(|info| info.output.is_some());
+                let result = mined
+                    .into_iter()
+                    .max_by_key(|info| info.output.as_ref().map_or(0, |o| o.mined_height))
+                    .or_else(|| {
+                        spent_only
+                            .into_iter()
+                            .max_by_key(|info| info.input.as_ref().map_or(0, |i| i.spent_height))
+                    })
+                    .unwrap_or(MinedInfo {
+                        input: None,
+                        output: None,
+                    });
+                Ok(NodeCommsResponse::MinedInfo(result))
             },
             NodeCommsRequest::FetchOutputMinedInfo(output_hash) => {
-                let output_info = self.blockchain_db.fetch_output(output_hash).await?;
-                Ok(NodeCommsResponse::OutputMinedInfo(output_info))
+                // A hash may be indexed under multiple headers; return the last-mined output.
+                let mut outputs = self.blockchain_db.fetch_outputs(output_hash).await?;
+                outputs.sort_by_key(|o| o.mined_height);
+                Ok(NodeCommsResponse::OutputMinedInfo(outputs.into_iter().next_back()))
             },
             NodeCommsRequest::CheckOutputSpentStatus(output_hash) => {
-                let input_info = self.blockchain_db.fetch_input(output_hash).await?;
-                Ok(NodeCommsResponse::InputMinedInfo(input_info))
+                // A hash may be indexed under multiple headers; return the last-spent input.
+                let mut inputs = self.blockchain_db.fetch_inputs(output_hash).await?;
+                inputs.sort_by_key(|i| i.spent_height);
+                Ok(NodeCommsResponse::InputMinedInfo(inputs.into_iter().next_back()))
             },
             NodeCommsRequest::FetchValidatorNodeChanges { epoch, sidechain_id } => {
                 let added_validators = self
@@ -567,7 +595,7 @@ where B: BlockchainBackend + 'static
                     epoch,
                 );
 
-                let mut node_changes = Vec::with_capacity(added_validators.len() + exit_validators.len());
+                let mut node_changes = Vec::with_capacity(added_validators.len().saturating_add(exit_validators.len()));
 
                 node_changes.extend(added_validators.into_iter().map(|vn| ValidatorNodeChange::Add {
                     registration: vn.original_registration.into(),
@@ -603,6 +631,17 @@ where B: BlockchainBackend + 'static
                 block_hash.to_hex()
             );
             return Ok(());
+        }
+
+        // GHSA-3qmx-q9pv-f3m4. The canonical `pow_data` test reads at most one byte and needs no chain state, so it
+        // runs before the existence and bad-block lookups, before `fetch_last_chain_header` and the backwards chain
+        // walk in `check_min_block_difficulty`, and before the RandomX VM hash. A zero-extended variant is free for
+        // an attacker to mint, so it must be as close to free for us to discard.
+        if new_block.header.pow_algo() == PowAlgorithm::RandomXT {
+            let constants = self.consensus_manager.consensus_constants(new_block.header.height);
+            check_randomxt_pow_data(&new_block.header.pow, constants.require_canonical_randomxt_pow_data()).map_err(
+                |e| CommsInterfaceError::InvalidBlockHeader(BlockHeaderValidationError::ProofOfWorkError(e)),
+            )?;
         }
 
         // Lets check if the block exists before we try and ask for a complete block
@@ -665,11 +704,43 @@ where B: BlockchainBackend + 'static
         Ok(())
     }
 
+    /// Pre-validation anti-spam gate for a gossiped block announcement.
+    ///
+    /// This runs on an *unlinked* header: nothing here has checked that `new_block.header.height` follows from
+    /// `prev_hash`, or that the header connects to our chain at all. The height is a peer's assertion.
+    ///
+    /// That matters because several consensus rules are height-gated, and the GHSA-3qmx-q9pv-f3m4 rules in
+    /// particular replace verifiers that were forgeable - the merged-namespace Cuckaroo verifier and the Monero
+    /// coinbase Keccak sponge that the sender chose. Selecting the constants from the claimed height let a peer
+    /// name a pre-activation height and be handed the forgeable verifiers, clearing this gate at no proof of work
+    /// cost whatsoever - which is precisely the thing the gate exists to prevent ("bad blocks are not free to
+    /// make, and they are more expensive to make than they are to validate").
+    ///
+    /// So the rules are selected from `max(our tip height, the claimed height)`:
+    ///
+    ///   * the tip height is a fact about our own chain, so a peer cannot talk its way *below* our current rules;
+    ///   * taking the max still honours a plausible claim above our tip - we may simply be behind - and cannot weaken
+    ///     anything, because every flag these rules gate on is monotone in height: it goes false to true at the
+    ///     activation entry and never back;
+    ///   * so `max` is always the stricter of the two candidate rule sets, which is the right default for a gate.
+    ///
+    /// This is deliberately stricter than consensus and it is *not* consensus: it decides only whether we spend
+    /// effort reconciling an announcement. Whether the block is ultimately accepted is decided later by the full
+    /// validators, which run against the block's real, linked height.
+    ///
+    /// Being stricter here does reject announcements, and bans for them: `verify_header_at_rules_height` returns
+    /// `Err` when the announcement does not satisfy the selected rules - on the `pow_data` wire format, and on
+    /// the depth 0 `aux_chain_merkle_proof` rule - and both of those are a long ban. The rules the max picks are
+    /// only ever the *newer* ones, so the announcements this costs are exactly those written under the pre-fork
+    /// rules and announced to a node whose own chain has already passed the fork. A block like that cannot
+    /// become our tip by being announced anyway; if it is genuinely part of a better chain, that chain arrives
+    /// through header and block sync, which do not come through this gate.
     async fn check_min_block_difficulty(&self, new_block: &NewBlock) -> Result<(), CommsInterfaceError> {
-        let constants = self.consensus_manager.consensus_constants(new_block.header.height);
+        let mut header = self.blockchain_db.fetch_last_chain_header().await?;
+        let rules_height = max(header.height(), new_block.header.height);
+        let constants = self.consensus_manager.consensus_constants(rules_height);
         let gen_hash = *self.consensus_manager.get_genesis_block().hash();
         let mut min_difficulty = constants.min_pow_difficulty(new_block.header.pow.pow_algo);
-        let mut header = self.blockchain_db.fetch_last_chain_header().await?;
         loop {
             if new_block.header.pow_algo() == header.header().pow_algo() {
                 min_difficulty = max(
@@ -692,14 +763,28 @@ where B: BlockchainBackend + 'static
                 .await?;
         }
         let achieved = match new_block.header.pow_algo() {
-            PowAlgorithm::RandomXM => monero_randomx_difficulty(
+            PowAlgorithm::RandomXM => monero_randomx_difficulty_at_rules_height(
                 &new_block.header,
                 &self.randomx_factory,
                 &gen_hash,
                 &self.consensus_manager,
+                rules_height,
             )?,
             PowAlgorithm::Sha3x => sha3x_difficulty(&new_block.header)?,
             PowAlgorithm::RandomXT => {
+                // GHSA-3qmx-q9pv-f3m4, belt and braces. `handle_new_block_message` already applied this before any
+                // database work; repeating it keeps the rule attached to the difficulty check itself, so a future
+                // second caller of this function cannot inherit a gap.
+                //
+                // Note what the gating can and cannot promise here: `header.height` is peer supplied and has no
+                // parent linkage yet, so a peer can claim a pre-fork height and turn the rule off. That only ever
+                // makes the rule laxer, never stricter, and it is not free - `height` is covered by `mining_hash`,
+                // which is bytes 3..35 of the RandomX blob, so lying about it destroys the proof of work and the
+                // `achieved < min_difficulty` check below rejects the block anyway.
+                check_randomxt_pow_data(&new_block.header.pow, constants.require_canonical_randomxt_pow_data())
+                    .map_err(|e| {
+                        CommsInterfaceError::InvalidBlockHeader(BlockHeaderValidationError::ProofOfWorkError(e))
+                    })?;
                 let vm_key = *self
                     .blockchain_db
                     .fetch_chain_header(tari_rx_vm_key_height(new_block.header.height))
@@ -708,10 +793,17 @@ where B: BlockchainBackend + 'static
                 tari_randomx_difficulty(&new_block.header, &self.randomx_factory, &vm_key)?
             },
             PowAlgorithm::Cuckaroo => {
-                let constants = self.consensus_manager.consensus_constants(new_block.header.height);
+                // Same corroborated height as above, not the claimed one: `bipartite_cuckaroo_verification` is the
+                // other half of what a peer could talk itself out of by naming a pre-activation height.
+                let constants = self.consensus_manager.consensus_constants(rules_height);
                 let cuckaroo_cycle = constants.cuckaroo_cycle_length();
                 let edge_bits = constants.cuckaroo_edge_bits();
-                cuckaroo_difficulty(&new_block.header, cuckaroo_cycle, edge_bits)?
+                cuckaroo_difficulty(
+                    &new_block.header,
+                    cuckaroo_cycle,
+                    edge_bits,
+                    constants.bipartite_cuckaroo_verification(),
+                )?
             },
         };
         if achieved < min_difficulty {
@@ -1065,12 +1157,16 @@ where B: BlockchainBackend + 'static
                 continue;
             }
 
-            let output_mined_info =
-                db.fetch_output(&input.output_hash())?
-                    .ok_or_else(|| CommsInterfaceError::InvalidFullBlock {
-                        hash: block_hash,
-                        details: format!("Output {} to be spent does not exist in db", input.output_hash()),
-                    })?;
+            // Only the output's contents are used to hydrate the input, and those are identical for
+            // every index entry of the same output hash, so taking any entry is equivalent.
+            let output_mined_info = db
+                .fetch_outputs(&input.output_hash())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| CommsInterfaceError::InvalidFullBlock {
+                    hash: block_hash,
+                    details: format!("Output {} to be spent does not exist in db", input.output_hash()),
+                })?;
 
             input.add_output_data(output_mined_info.output);
         }
@@ -1082,7 +1178,7 @@ where B: BlockchainBackend + 'static
             inputs.len(),
             timer.elapsed()
         );
-        let block = Block::new(header, AggregateBody::new(inputs, outputs, kernels));
+        let block = Block::new(header, AggregateBody::new_unsorted(inputs, outputs, kernels));
         Ok(Arc::new(block))
     }
 
@@ -1168,7 +1264,7 @@ where B: BlockchainBackend + 'static
             metrics::accumulated_difficulty_as_f64().set(0.0);
             return Ok(());
         }
-        let height = tip - DIFF_INDICATOR_LAG;
+        let height = tip.saturating_sub(DIFF_INDICATOR_LAG);
         let chain_header = self.blockchain_db.fetch_chain_header(height).await?;
 
         // Compute indicators in millibits as `log₂(value) * 1000` to make huge numbers fathomable in a time-series
@@ -1201,22 +1297,30 @@ where B: BlockchainBackend + 'static
         Ok(())
     }
 
+    /// Returns both the unadjusted target difficulty and the backoff adjusted target for the next block.
+    ///
+    /// Miners must clear the *adjusted* target (TIP-RFC-MT-0004), so that is what goes into the block template and
+    /// the gRPC miner data. Anything deriving a hash rate from the target must use the *unadjusted* one, otherwise a
+    /// run of same-algorithm blocks inflates the reported hash rate by up to the backoff cap.
     async fn get_target_difficulty_for_next_block(
         &self,
         pow_algo: PowAlgorithm,
         constants: &ConsensusConstants,
         current_block_hash: HashOutput,
-    ) -> Result<Difficulty, CommsInterfaceError> {
+    ) -> Result<AdjustedTarget, CommsInterfaceError> {
         let target_difficulty = self
             .blockchain_db
             .fetch_target_difficulty_for_next_block(pow_algo, current_block_hash)
             .await?;
 
-        let target = target_difficulty.calculate(
+        let target = target_difficulty.calculate_pair(
             constants.min_pow_difficulty(pow_algo),
             constants.max_pow_difficulty(pow_algo),
         );
-        trace!(target: LOG_TARGET, "Target difficulty {target} for PoW {pow_algo}");
+        trace!(
+            target: LOG_TARGET,
+            "Target difficulty {} (adjusted {}) for PoW {pow_algo}", target.base, target.adjusted
+        );
         Ok(target)
     }
 

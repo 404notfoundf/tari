@@ -36,6 +36,7 @@ mod test;
 mod metrics;
 use std::{
     cmp,
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -67,6 +68,65 @@ use crate::{DhtActorError, DhtConfig, DhtRequester, connectivity::metrics::Metri
 
 const LOG_TARGET: &str = "comms::dht::connectivity";
 
+/// How long a peer may sit in the pool with an in-flight dial before we give up on it and free the
+/// slot. A dial that neither connects nor reports a failure within this window would otherwise
+/// occupy a pool slot indefinitely.
+const PENDING_DIAL_GRACE: Duration = Duration::from_secs(60);
+
+/// How many dials to keep in flight per connection still wanted. Dials fail far more often than they
+/// succeed, so dialing only the shortfall leaves the pool permanently short of its target.
+const DIAL_OVERSUBSCRIBE_FACTOR: usize = 3;
+
+/// Ceiling on in-flight dials, as a multiple of the pool size. Oversubscribing helps only up to the
+/// point where the transport itself becomes the bottleneck — Tor in particular starts failing SOCKS
+/// requests when flooded — so the dial budget is capped regardless of how far below target we are.
+const MAX_IN_FLIGHT_POOL_MULTIPLE: usize = 2;
+
+/// How long a peer is excluded from selection after its first failed dial. Doubles per consecutive
+/// failure up to [`DIAL_BACKOFF_MAX`].
+const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling on the per-peer dial backoff. This also bounds the worst case where *every* known peer is
+/// unreachable: the pool then dials nothing until the earliest backoff expires, which is the correct
+/// response — those dials were failing anyway — but should not be open-ended.
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Hard cap on the number of peers we track backoff state for. Every tracked peer becomes one more
+/// `node_id != ?` term in the candidate-selection query, so this is kept well clear of SQLite's bind
+/// parameter limit and of making that query expensive. When the cap is hit the entries that expire
+/// soonest are dropped, which at worst lets those peers become eligible again early.
+const MAX_DIAL_BACKOFF_ENTRIES: usize = 500;
+
+/// Per-peer dial backoff state.
+///
+/// Without this, a node whose pool never becomes healthy re-dials the same set of unreachable peers
+/// on every refresh cycle, forever. Every one of those failures writes back through
+/// `PeerManager::add_or_update_peer`, and that write pressure is what tips the peer database — and
+/// with it the comms actors — over.
+#[derive(Debug, Clone, Copy)]
+struct DialBackoff {
+    /// Consecutive failed dials. Reset when the peer connects.
+    failures: u32,
+    /// The peer is not a dial candidate before this instant.
+    retry_after: Instant,
+}
+
+impl DialBackoff {
+    /// Advance the backoff after another failed dial.
+    fn next(previous: Option<Self>) -> Self {
+        let failures = previous.map_or(1, |b| b.failures.saturating_add(1));
+        // `2^(failures - 1) * base`, saturating rather than wrapping into a short delay.
+        let backoff = DIAL_BACKOFF_BASE
+            .checked_mul(1u32.checked_shl(failures.saturating_sub(1)).unwrap_or(u32::MAX))
+            .unwrap_or(DIAL_BACKOFF_MAX)
+            .min(DIAL_BACKOFF_MAX);
+        Self {
+            failures,
+            retry_after: Instant::now().checked_add(backoff).unwrap_or_else(Instant::now),
+        }
+    }
+}
+
 /// Error type for the DHT connectivity actor.
 #[derive(Debug, Error)]
 pub enum DhtConnectivityError {
@@ -92,6 +152,12 @@ pub(crate) struct DhtConnectivity {
     random_pool: Vec<NodeId>,
     /// Used to track when the random peer pool was last refreshed
     random_pool_last_refresh: Option<Instant>,
+    /// Peers in the pool that have been dialed but have not yet connected or reported a failure,
+    /// and when the dial was issued. A pool entry without a connection handle is only meaningful
+    /// when paired with this: it distinguishes "still dialing" from "stale slot".
+    pending_dials: HashMap<NodeId, Instant>,
+    /// Peers whose dials keep failing, and when they may be dialed again. See [`DialBackoff`].
+    dial_backoff: HashMap<NodeId, DialBackoff>,
     /// Holds references to peer connections that should be kept alive
     connection_handles: Vec<PeerConnection>,
     stats: Stats,
@@ -111,9 +177,11 @@ impl DhtConnectivity {
         metrics_collector: MetricsCollectorHandle,
         shutdown_signal: ShutdownSignal,
     ) -> Self {
-        let pool_size = config.num_neighbouring_nodes + config.num_random_nodes;
+        let pool_size = config.num_neighbouring_nodes.saturating_add(config.num_random_nodes);
         Self {
             random_pool: Vec::with_capacity(pool_size),
+            pending_dials: HashMap::with_capacity(pool_size),
+            dial_backoff: HashMap::new(),
             connection_handles: Vec::with_capacity(pool_size),
             config,
             peer_manager,
@@ -241,15 +309,22 @@ impl DhtConnectivity {
     }
 
     fn log_status(&self) {
-        let pool_size = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
+        let pool_size = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
         let (pool_connected, pool_pending) = self
             .random_pool
             .iter()
             .partition::<Vec<_>, _>(|peer| self.connection_handles.iter().any(|c| c.peer_node_id() == *peer));
+        // Both numbers below are pool-scoped on purpose, and both are labelled as such. `comms::connectivity`
+        // reports `#ConnectedNodes(incl. inbound)` on the same tick, which counts every connected node peer -
+        // inbound connections the DHT pool never selected included - so the two targets legitimately disagree
+        // and only read as contradictory when one of them does not say what it is counting.
         debug!(
             target: LOG_TARGET,
-            "DHT connectivity status: {}peer pool: {}/{} ({} connected, last refreshed {}), active DHT connections: \
-             {}/{}",
+            "DHT connectivity status: {}peer pool: {}/{} ({} connected, last refreshed {}), pool connection \
+             handles held: {}/{}",
             self.cooldown_in_effect
                 .map(|ts| format!(
                     "COOLDOWN({:.2?} remaining) ",
@@ -347,21 +422,26 @@ impl DhtConnectivity {
     }
 
     async fn refresh_entire_pool(&mut self) -> Result<(), DhtConnectivityError> {
-        let pool_size = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
+        let pool_size = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
         // we have no peers, so we need to get peers, so lets double our chances of dialing twice the number we want, we
         // can close them later on And we only select known healty ones
         debug!(
             target: LOG_TARGET,
             "We have no connections asking for {} nodes",
-            pool_size * 2,
+            pool_size.saturating_mul(2),
         );
-        let new_peers = self.fetch_random_peers(pool_size * 2, &Vec::new(), true).await?;
+        let new_peers = self
+            .fetch_random_peers(pool_size.saturating_mul(2), &Vec::new(), true)
+            .await?;
         debug!(
             target: LOG_TARGET,
             "Refreshing peer pool (#new = {})",
             new_peers.len(),
         );
-        let old_peers = self.random_pool.drain(..).collect::<Vec<_>>();
+        let old_peers = std::mem::take(&mut self.random_pool);
         for peer in &new_peers {
             self.insert_random_peer(peer.clone());
         }
@@ -374,8 +454,14 @@ impl DhtConnectivity {
         Ok(())
     }
 
-    async fn dial_multiple_peers(&self, peers_to_dial: &[NodeId]) -> Result<(), DhtConnectivityError> {
+    async fn dial_multiple_peers(&mut self, peers_to_dial: &[NodeId]) -> Result<(), DhtConnectivityError> {
         if !peers_to_dial.is_empty() {
+            // Record the dial before issuing it: until the peer connects or fails it holds a pool
+            // slot with no connection handle, and only this marks it as in flight rather than stale.
+            let dialed_at = Instant::now();
+            for peer in peers_to_dial {
+                self.pending_dials.insert(peer.clone(), dialed_at);
+            }
             self.connectivity.request_many_dials(peers_to_dial.to_vec()).await?;
         }
 
@@ -383,76 +469,85 @@ impl DhtConnectivity {
     }
 
     async fn refresh_random_pool_if_required(&mut self) -> Result<(), DhtConnectivityError> {
-        let pool_size = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
-        let should_refresh = pool_size > 0 &&
-            self.random_pool_last_refresh
-                .map(|instant| instant.elapsed() >= self.config.connectivity.random_pool_refresh_interval)
-                .unwrap_or(true);
-        if should_refresh {
+        let pool_size = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
+        // Topping the pool back up is cheap (it dials only what is actually missing) and must happen
+        // on every tick, otherwise a pool that loses peers stays short until the next refresh
+        // interval — hours away. Only the churn is bound to `random_pool_refresh_interval`, and
+        // `refresh_random_pool` gates that itself.
+        if pool_size > 0 {
             self.refresh_random_pool().await?;
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn refresh_random_pool(&mut self) -> Result<(), DhtConnectivityError> {
-        let pool_size = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
+        let pool_size = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
 
-        // let see who is not connected and remove them
-        let disconnected = self
+        // Churn deliberately drops healthy peers to explore new ones, so it may only run once per
+        // refresh cycle. This function also runs on every `ConnectivityStateOnline` event (every few
+        // seconds), where the only goal is to top the pool back up.
+        let churn_due = self
+            .random_pool_last_refresh
+            .map(|instant| instant.elapsed() >= self.config.connectivity.random_pool_refresh_interval)
+            .unwrap_or(true);
+
+        // A pool entry only counts as connected when we hold a handle that is actually connected.
+        // An entry with no handle at all is either still being dialed or is a stale slot; counting
+        // those as connected makes a decaying pool look full, so we dial no replacements and
+        // measure the churn floor against peers that do not exist.
+        let live_peers = self
             .connection_handles
             .iter()
-            .filter(|c| !c.is_connected())
+            .filter(|c| c.is_connected())
+            .map(|c| c.peer_node_id().clone())
             .collect::<Vec<_>>();
-
-        // lets remove disconnected ones
-        let (mut disconnected_peers, mut connected) = self
+        let (mut connected, remainder) = self
             .random_pool
             .drain(..)
-            .partition::<Vec<_>, _>(|n| disconnected.iter().any(|c| c.peer_node_id() == n));
+            .partition::<Vec<_>, _>(|n| live_peers.contains(n));
+
+        // Of the peers we hold no live connection to, keep the ones whose dial is still in flight —
+        // dropping those would cancel dials that have not had time to complete. Everything else is a
+        // stale slot and is released so it can be replaced below.
+        let pending_dials = &self.pending_dials;
+        let (pending, mut disconnected_peers) = remainder.into_iter().partition::<Vec<_>, _>(|n| {
+            pending_dials
+                .get(n)
+                .is_some_and(|dialed_at| dialed_at.elapsed() < PENDING_DIAL_GRACE)
+        });
+
+        // `pool_size` is a target for *connections*, not for slots, so more may land than we need
+        // once dials are oversubscribed below. Release the surplus, keeping strongly held peers
+        // (e.g. an in-progress sync) in preference to idle ones.
+        if connected.len() > pool_size {
+            let strongly_held = self
+                .connection_handles
+                .iter()
+                .filter(|c| c.is_strongly_held())
+                .map(|c| c.peer_node_id().clone())
+                .collect::<Vec<_>>();
+            connected.sort_by_key(|node_id| !strongly_held.contains(node_id));
+            disconnected_peers.extend(connected.split_off(pool_size));
+        }
 
         // We add at most `churn_rate`% new peers per refresh (or at least 1), and only start
         // churning healthy peers once the pool has more connected peers than the churn floor.
-        let max_churn = cmp::max(pool_size * self.config.connectivity.churn_rate / 100, 1);
+        let max_churn = cmp::max(pool_size.saturating_mul(self.config.connectivity.churn_rate) / 100, 1);
         let keep_size = pool_size.saturating_sub(max_churn);
         // The pool is only healthy enough to churn/explore once we hold more than the churn floor
         // of connected peers. Below that we are short on peers.
         let is_pool_healthy = connected.len() > keep_size;
+        let should_churn = churn_due && is_pool_healthy;
 
-        // When the pool is healthy we can afford to churn out a few peers and probe/revive
-        // arbitrary (possibly never-seen) peers. When we are short on peers we do NOT churn and we
-        // prefer known-good peers (ones we have successfully connected to before) instead of
-        // wasting dials on never-seen/dead peers.
-        info!(
-            target: LOG_TARGET,
-            "refreshing random peer list, asking for {pool_size} peers (is_pool_healthy = {is_pool_healthy}, \
-             #connected = {})",
-            connected.len(),
-        );
-        let mut new_peers = if is_pool_healthy {
-            self.fetch_random_peers(pool_size, &[], false).await?
-        } else {
-            // Prefer known-good peers, but fall back to any peers if we don't have enough known-good
-            // ones (e.g. fresh start or after being offline, when every known-good peer may itself be
-            // offline). Without this fallback the node could get stuck never dialling anyone and never
-            // recover to a healthy state or discover new peers.
-            let mut peers = self.fetch_random_peers(pool_size, &[], true).await?;
-            if peers.len() < pool_size {
-                let remaining = pool_size - peers.len();
-                debug!(
-                    target: LOG_TARGET,
-                    "Only {} known-good peer(s) available, falling back to {remaining} any-status peer(s)",
-                    peers.len(),
-                );
-                let mut exclude = connected.clone();
-                exclude.extend(peers.clone());
-                let extra = self.fetch_random_peers(remaining, &exclude, false).await?;
-                peers.extend(extra);
-            }
-            peers
-        };
-
-        if is_pool_healthy {
+        if should_churn {
             // this is safety counter so we dont loop endlessly here
             let mut disconnect_counter = connected.len() / 2;
             while connected.len() > keep_size && disconnect_counter > 0 {
@@ -476,9 +571,66 @@ impl DhtConnectivity {
                 disconnected_peers.push(disconnect_peer);
             }
         }
-        new_peers.truncate(pool_size.saturating_sub(connected.len()));
 
+        // Peers we hold, are dialing, or have just released are all poor dial candidates: the first
+        // two would become duplicate pool entries and the last we dropped on purpose.
+        let mut exclude = connected.clone();
+        exclude.extend(pending.iter().cloned());
+        exclude.extend(disconnected_peers.iter().cloned());
+
+        // Most dials never land — on a Tor-heavy network the large majority fail — so the number in
+        // flight is deliberately allowed to exceed the number of connections we still want. Dialing
+        // only the shortfall means a shortfall of 24 yields perhaps a handful of connections and the
+        // pool sits below target indefinitely. Overshooting is the cheaper mistake: surplus
+        // connections are reaped above, a persistent shortfall is not self-correcting.
+        let shortfall = pool_size.saturating_sub(connected.len());
+        let target_in_flight = cmp::min(
+            shortfall.saturating_mul(DIAL_OVERSUBSCRIBE_FACTOR),
+            pool_size.saturating_mul(MAX_IN_FLIGHT_POOL_MULTIPLE),
+        );
+        let needed = target_in_flight.saturating_sub(pending.len());
+
+        info!(
+            target: LOG_TARGET,
+            "refreshing random peer list, target {pool_size} connections (is_pool_healthy = \
+             {is_pool_healthy}, churn_due = {churn_due}, #connected = {}, #pending = {}, #stale = {}, \
+             #shortfall = {shortfall}, #target_in_flight = {target_in_flight}, #dialing_now = {needed})",
+            connected.len(),
+            pending.len(),
+            disconnected_peers.len(),
+        );
+        // When the pool is healthy we can afford to probe/revive arbitrary (possibly never-seen)
+        // peers. When we are short on peers we prefer known-good peers (ones we have successfully
+        // connected to before) instead of wasting dials on never-seen/dead peers.
+        let mut new_peers = if needed == 0 {
+            Vec::new()
+        } else if should_churn {
+            self.fetch_random_peers(needed, &exclude, false).await?
+        } else {
+            // Prefer known-good peers, but fall back to any peers if we don't have enough known-good
+            // ones (e.g. fresh start or after being offline, when every known-good peer may itself be
+            // offline). Without this fallback the node could get stuck never dialling anyone and never
+            // recover to a healthy state or discover new peers.
+            let mut peers = self.fetch_random_peers(needed, &exclude, true).await?;
+            if peers.len() < needed {
+                let remaining = needed.saturating_sub(peers.len());
+                debug!(
+                    target: LOG_TARGET,
+                    "Only {} known-good peer(s) available, falling back to {remaining} any-status peer(s)",
+                    peers.len(),
+                );
+                let mut exclude_any = exclude.clone();
+                exclude_any.extend(peers.clone());
+                let extra = self.fetch_random_peers(remaining, &exclude_any, false).await?;
+                peers.extend(extra);
+            }
+            peers
+        };
+        new_peers.truncate(needed);
+
+        // In-flight dials keep their slot; only connected and pending peers stay in the pool.
         self.random_pool = connected;
+        self.random_pool.extend(pending);
         debug!(
             target: LOG_TARGET,
             "Adding new peers to peer pool (#new = {}, #keeping = {})",
@@ -490,6 +642,7 @@ impl DhtConnectivity {
         }
         // Drop any connection handles that were removed from the pool
         for peer_to_disconnect in &disconnected_peers {
+            self.pending_dials.remove(peer_to_disconnect);
             self.remove_connection_handle(peer_to_disconnect).await?;
         }
         // Clean up any connection handles not in the current pool (e.g. accumulated between refresh cycles)
@@ -511,11 +664,25 @@ impl DhtConnectivity {
         }
         self.dial_multiple_peers(&new_peers).await?;
 
-        self.random_pool_last_refresh = Some(Instant::now());
+        // Forget dials for peers that have since left the pool, or that outlived the grace period
+        // without resolving either way.
+        let random_pool = &self.random_pool;
+        self.pending_dials
+            .retain(|node_id, dialed_at| random_pool.contains(node_id) && dialed_at.elapsed() < PENDING_DIAL_GRACE);
+
+        // Only advance the cycle when we actually churned. This function runs on every
+        // `ConnectivityStateOnline` event, so stamping it unconditionally would push the deadline
+        // out of reach and the exploration churn would never come due. A churn skipped because the
+        // pool was unhealthy has not happened, so it stays due and runs once the pool recovers.
+        if should_churn {
+            self.random_pool_last_refresh = Some(Instant::now());
+        }
         Ok(())
     }
 
     async fn handle_new_peer_connected(&mut self, conn: PeerConnection) -> Result<(), DhtConnectivityError> {
+        // The peer is reachable after all, so it starts from a clean slate the next time it fails.
+        self.dial_backoff.remove(conn.peer_node_id());
         if conn.peer_features().is_client() {
             debug!(
                 target: LOG_TARGET,
@@ -559,7 +726,10 @@ impl DhtConnectivity {
             return Ok(());
         }
 
-        let pool_size = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
+        let pool_size = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
         if self.connected_random_pool_peers() < pool_size {
             debug!(
                 target: LOG_TARGET,
@@ -641,7 +811,10 @@ impl DhtConnectivity {
         peers_by_distance.retain(|p| !peer_allow_list.contains(&p.node_id) && !strongly_held.contains(&p.node_id));
 
         // Remove all above threshold connections
-        let threshold = self.config.num_neighbouring_nodes + self.config.num_random_nodes;
+        let threshold = self
+            .config
+            .num_neighbouring_nodes
+            .saturating_add(self.config.num_random_nodes);
         for peer in peers_by_distance.iter_mut().skip(threshold) {
             debug!(
                 target: LOG_TARGET,
@@ -660,6 +833,8 @@ impl DhtConnectivity {
         // Remove any existing connection for this peer
         self.remove_connection_handle(conn.peer_node_id()).await?;
         trace!(target: LOG_TARGET, "Insert new peer connection {conn}" );
+        // The dial resolved — the handle is now the source of truth for this peer.
+        self.pending_dials.remove(conn.peer_node_id());
         self.connection_handles.push(conn);
         Ok(())
     }
@@ -696,6 +871,8 @@ impl DhtConnectivity {
             },
             PeerConnectFailed(node_id) => {
                 self.connection_handles.retain(|c| *c.peer_node_id() != node_id);
+                self.pending_dials.remove(&node_id);
+                self.record_dial_failure(&node_id);
                 if self.metrics_collector.clear_metrics(node_id.clone()).await.is_err() {
                     debug!(
                         target: LOG_TARGET,
@@ -717,6 +894,7 @@ impl DhtConnectivity {
                     self.is_allow_list_peer(&node_id).await?,
                 );
                 self.connection_handles.retain(|c| *c.peer_node_id() != node_id);
+                self.pending_dials.remove(&node_id);
                 if self.metrics_collector.clear_metrics(node_id.clone()).await.is_err() {
                     debug!(
                         target: LOG_TARGET,
@@ -765,6 +943,7 @@ impl DhtConnectivity {
             let exclude = self.get_pool_peers();
 
             self.random_pool.retain(|n| n != current_peer);
+            self.pending_dials.remove(current_peer);
             self.remove_connection_handle(current_peer).await?;
 
             debug!(
@@ -797,7 +976,11 @@ impl DhtConnectivity {
     }
 
     fn insert_random_peer(&mut self, node_id: NodeId) {
-        self.random_pool.push(node_id);
+        // The pool is a set: a duplicate entry would consume a second slot for a peer that can only
+        // ever hold one connection, inflating the pool past its configured size.
+        if !self.random_pool.contains(&node_id) {
+            self.random_pool.push(node_id);
+        }
     }
 
     async fn is_allow_list_peer(&mut self, node_id: &NodeId) -> Result<bool, DhtConnectivityError> {
@@ -823,15 +1006,60 @@ impl DhtConnectivity {
         self.random_pool.clone()
     }
 
+    /// Record a failed dial and push the peer's next eligible dial time out.
+    fn record_dial_failure(&mut self, node_id: &NodeId) {
+        let backoff = DialBackoff::next(self.dial_backoff.get(node_id).copied());
+        trace!(
+            target: LOG_TARGET,
+            "Dial to '{}' failed {} time(s) in a row; excluding it from selection for {:.0?}",
+            node_id.short_str(),
+            backoff.failures,
+            backoff.retry_after.saturating_duration_since(Instant::now()),
+        );
+        self.dial_backoff.insert(node_id.clone(), backoff);
+    }
+
+    /// Drop expired backoff entries and, if the map has grown past its cap, the entries that expire
+    /// soonest.
+    fn prune_dial_backoff(&mut self) {
+        let now = Instant::now();
+        self.dial_backoff.retain(|_, backoff| backoff.retry_after > now);
+        if self.dial_backoff.len() > MAX_DIAL_BACKOFF_ENTRIES {
+            let mut entries = self
+                .dial_backoff
+                .iter()
+                .map(|(node_id, backoff)| (node_id.clone(), backoff.retry_after))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, retry_after)| *retry_after);
+            let overflow = self.dial_backoff.len().saturating_sub(MAX_DIAL_BACKOFF_ENTRIES);
+            for (node_id, _) in entries.into_iter().take(overflow) {
+                self.dial_backoff.remove(&node_id);
+            }
+        }
+    }
+
     async fn fetch_random_peers(
         &mut self,
         n: usize,
         excluded: &[NodeId],
         known_good: bool,
     ) -> Result<Vec<NodeId>, DhtConnectivityError> {
+        // Peers that have just failed us are not candidates. Re-dialling them every cycle is both
+        // futile and the write load that overwhelms the peer database — every failed dial writes the
+        // peer back.
+        self.prune_dial_backoff();
         let mut excluded = excluded.to_vec();
+        excluded.extend(self.dial_backoff.keys().cloned());
         excluded.extend(self.peer_allow_list().await?);
         let peers = self.peer_manager.random_peers(n, &excluded, None, known_good).await?;
+        if peers.is_empty() && n > 0 && !self.dial_backoff.is_empty() {
+            debug!(
+                target: LOG_TARGET,
+                "No dial candidates: {} known peer(s) are in dial backoff. Waiting for one to become eligible \
+                 rather than re-dialling peers that never resolve.",
+                self.dial_backoff.len()
+            );
+        }
         Ok(peers.into_iter().map(|p| p.node_id).collect())
     }
 

@@ -183,6 +183,7 @@ use tari_transaction_components::{
     consensus::{ConsensusConstants, ConsensusManager},
     key_manager::TransactionKeyManagerInterface,
     offline_signing::models::SignedOneSidedTransactionResult,
+    rpc::MAX_ALLOWED_QUERY_SIZE,
     transaction_components::{
         OutputFeatures,
         TransactionOutput,
@@ -382,6 +383,7 @@ impl WalletGrpcServer {
     async fn transfer_single_tx(
         &self,
         recipients: Vec<minotari_app_grpc::tari_rpc::PaymentRecipient>,
+        selection_criteria: UtxoSelectionCriteria,
     ) -> Result<Response<minotari_app_grpc::tari_rpc::TransferResponse>, Status> {
         let fee_per_gram = recipients.first().expect("already checked").fee_per_gram;
         let recipients = recipients
@@ -417,7 +419,7 @@ impl WalletGrpcServer {
         let ids = transaction_service
             .send_one_sided_multi_recipient_transaction(
                 recipients,
-                UtxoSelectionCriteria::default(),
+                selection_criteria,
                 OutputFeatures::default(),
                 fee_per_gram.into(),
             )
@@ -1179,8 +1181,13 @@ impl wallet_server::Wallet for WalletGrpcServer {
             ));
         }
 
+        let selection_criteria = UtxoSelectionCriteria {
+            excluding: parse_excluded_commitments(message.excluded_commitments)?,
+            ..Default::default()
+        };
+
         if message.single_tx {
-            return self.transfer_single_tx(message.recipients).await;
+            return self.transfer_single_tx(message.recipients, selection_criteria).await;
         }
         let recipients = message
             .recipients
@@ -1230,6 +1237,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 MemoField::new_empty()
             };
             let mut transaction_service = self.get_transaction_service();
+            let selection_criteria = selection_criteria.clone();
             transfers.push(async move {
                 (
                     hex_address,
@@ -1238,7 +1246,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .send_one_sided_transaction(
                                 address,
                                 amount.into(),
-                                UtxoSelectionCriteria::default(),
+                                selection_criteria,
                                 OutputFeatures::default(),
                                 fee_per_gram.into(),
                                 payment_id,
@@ -1249,7 +1257,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             .send_one_sided_to_stealth_address_transaction(
                                 address,
                                 amount.into(),
-                                UtxoSelectionCriteria::default(),
+                                selection_criteria,
                                 OutputFeatures::default(),
                                 fee_per_gram.into(),
                                 payment_id,
@@ -1829,7 +1837,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                             target: LOG_TARGET,
                             "GetCompletedTransactions: Sent transaction TxId: {} ({} of {})",
                             txn.tx_id,
-                            i + 1,
+                            i.saturating_add(1),
                             transactions.len()
                         );
                     },
@@ -1968,8 +1976,8 @@ impl wallet_server::Wallet for WalletGrpcServer {
             }
 
             // Update for next iteration
-            current_offset += current_limit;
-            remaining -= current_limit;
+            current_offset = current_offset.saturating_add(current_limit);
+            remaining = remaining.saturating_sub(current_limit);
         }
 
         debug!(
@@ -2139,7 +2147,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                     // Stream the transaction
                     match sender.send(Ok(response)).await {
                         Ok(_) => {
-                            total_sent += 1;
+                            total_sent = total_sent.saturating_add(1);
                             trace!(
                                 target: LOG_TARGET,
                                 "GetAllCompletedTransactionsStreaming: Sent transaction TxId: {} ({} of {})",
@@ -2159,7 +2167,7 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 }
 
                 // Update for next iteration
-                current_offset += current_limit;
+                current_offset = current_offset.saturating_add(current_limit);
                 remaining = remaining.saturating_sub(current_limit);
 
                 trace!(
@@ -2888,43 +2896,45 @@ impl wallet_server::Wallet for WalletGrpcServer {
 
         let mut transaction_service = self.get_transaction_service();
         let tx_id = TxId::from(req.transaction_id);
+        // The completed transaction may no longer exist — e.g. it was reorged out of the chain and
+        // then cancelled. That is exactly the case where the *historical* PayRefs matter, so a
+        // missing transaction must not short-circuit the whole call: we only skip deriving the
+        // current PayRefs / commitment info (which need the live transaction) and still return the
+        // archived history below.
         let completed_tx = match transaction_service.get_completed_transaction(tx_id).await {
-            Ok(completed_tx) => completed_tx,
+            Ok(completed_tx) => Some(completed_tx),
             Err(e) => {
-                warn!(
+                debug!(
                     target: LOG_TARGET,
-                    "get_transaction_pay_refs: Failed to get transaction {}: {}",
+                    "get_transaction_pay_refs: No live transaction {} ({}); returning historical PayRefs only",
                     req.transaction_id,
                     e
                 );
-                return Err(Status::not_found(format!(
-                    "Transaction {} not found",
-                    req.transaction_id
-                )));
+                None
             },
         };
 
-        let payment_references = {
-            // Only return PayRefs if transaction is mined and has block hash
-            if let Some(block_hash) = &completed_tx.mined_in_block {
+        // Only derive current PayRefs when the transaction is still present and mined.
+        let payment_references = match completed_tx
+            .as_ref()
+            .and_then(|tx| tx.mined_in_block.as_ref().map(|block_hash| (tx, block_hash)))
+        {
+            Some((completed_tx, block_hash)) => {
                 let mut payment_references = Vec::new();
 
                 // Generate PayRefs from sent output hashes
                 for output_hash in &completed_tx.sent_output_hashes {
-                    let payref = generate_payment_reference(block_hash, output_hash);
-                    payment_references.push(payref.to_vec());
+                    payment_references.push(generate_payment_reference(block_hash, output_hash).to_vec());
                 }
 
                 // Generate PayRefs from received output hashes
                 for output_hash in &completed_tx.received_output_hashes {
-                    let payref = generate_payment_reference(block_hash, output_hash);
-                    payment_references.push(payref.to_vec());
+                    payment_references.push(generate_payment_reference(block_hash, output_hash).to_vec());
                 }
 
                 // Generate PayRefs from change output hashes (per-output approach)
                 for output_hash in &completed_tx.change_output_hashes {
-                    let payref = generate_payment_reference(block_hash, output_hash);
-                    payment_references.push(payref.to_vec());
+                    payment_references.push(generate_payment_reference(block_hash, output_hash).to_vec());
                 }
 
                 debug!(
@@ -2935,14 +2945,15 @@ impl wallet_server::Wallet for WalletGrpcServer {
                 );
 
                 payment_references
-            } else {
+            },
+            None => {
                 debug!(
                     target: LOG_TARGET,
-                    "get_transaction_pay_refs: Transaction {} is not mined yet",
+                    "get_transaction_pay_refs: Transaction {} is not present/mined; current PayRefs empty",
                     req.transaction_id
                 );
                 vec![]
-            }
+            },
         };
 
         // Fetch historical payrefs for this transaction
@@ -2966,7 +2977,10 @@ impl wallet_server::Wallet for WalletGrpcServer {
         Ok(Response::new(GetTransactionPayRefsResponse {
             #[allow(deprecated)]
             payment_references,
-            output_commitments_info: get_transaction_output_commitments_info(&completed_tx),
+            output_commitments_info: completed_tx
+                .as_ref()
+                .map(get_transaction_output_commitments_info)
+                .unwrap_or_default(),
             historical_payment_references,
         }))
     }
@@ -4137,7 +4151,12 @@ fn update_and_average_latency(latencies: &mut VecDeque<u64>, new_latency: u64) -
     while latencies.len() > AVG_LATENCIES_CAPACITY {
         latencies.pop_back();
     }
-    latencies.iter().sum::<u64>() / max(latencies.len() as u64, 1)
+    latencies
+        .iter()
+        .copied()
+        .fold(0u64, u64::saturating_add)
+        .checked_div(max(latencies.len() as u64, 1))
+        .unwrap_or(0)
 }
 
 async fn handle_completed_tx(
@@ -4473,7 +4492,10 @@ fn get_transaction_output_commitments_info(txn: &CompletedTransaction) -> Vec<ta
     let all_artefacts = input_artefacts.into_iter().chain(output_artefacts).collect::<Vec<_>>();
 
     let mut output_commitments_info = Vec::with_capacity(
-        txn.sent_output_hashes.len() + txn.received_output_hashes.len() + txn.change_output_hashes.len(),
+        txn.sent_output_hashes
+            .len()
+            .saturating_add(txn.received_output_hashes.len())
+            .saturating_add(txn.change_output_hashes.len()),
     );
     for hash in &txn.sent_output_hashes {
         output_commitments_info.push(tari_rpc::CommitmentInfo {
@@ -4525,5 +4547,77 @@ fn get_payment_reference(txn: &CompletedTransaction, hash: &FixedHash) -> Vec<u8
         }
     } else {
         Default::default()
+    }
+}
+
+fn parse_excluded_commitments(commitments: Vec<Vec<u8>>) -> Result<Vec<CompressedCommitment>, Status> {
+    if commitments.len() > MAX_ALLOWED_QUERY_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "excluded_commitments exceeds the maximum allowed size. Requested: {}, max: {MAX_ALLOWED_QUERY_SIZE}",
+            commitments.len()
+        )));
+    }
+
+    commitments
+        .into_iter()
+        .enumerate()
+        .map(|(index, commitment)| {
+            let commitment = CompressedCommitment::from_canonical_bytes(&commitment).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "excluded_commitments[{index}] is not a canonical compressed commitment: {error}"
+                ))
+            })?;
+            commitment.to_commitment().map_err(|error| {
+                Status::invalid_argument(format!(
+                    "excluded_commitments[{index}] is not a valid compressed commitment: {error}"
+                ))
+            })?;
+            Ok(commitment)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use tari_common_types::types::{CommitmentFactory, CompressedCommitment};
+    use tari_crypto::commitment::HomomorphicCommitmentFactory;
+    use tari_transaction_components::rpc::MAX_ALLOWED_QUERY_SIZE;
+    use tari_utilities::ByteArray;
+
+    use super::parse_excluded_commitments;
+
+    #[test]
+    fn parse_excluded_commitments_rejects_invalid_lengths_with_their_index() {
+        let status = parse_excluded_commitments(vec![vec![1; 31]]).unwrap_err();
+
+        assert!(status.message().contains("excluded_commitments[0]"));
+    }
+
+    #[test]
+    fn parse_excluded_commitments_rejects_invalid_points_with_their_index() {
+        let invalid_point = vec![
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let status = parse_excluded_commitments(vec![invalid_point]).unwrap_err();
+
+        assert!(status.message().contains("excluded_commitments[0]"));
+        assert!(status.message().contains("not a valid compressed commitment"));
+    }
+
+    #[test]
+    fn parse_excluded_commitments_rejects_oversized_requests() {
+        let status = parse_excluded_commitments(vec![Vec::new(); MAX_ALLOWED_QUERY_SIZE + 1]).unwrap_err();
+
+        assert!(status.message().contains(&MAX_ALLOWED_QUERY_SIZE.to_string()));
+    }
+
+    #[test]
+    fn parse_excluded_commitments_accepts_canonical_commitments() {
+        let commitment = CompressedCommitment::from_commitment(CommitmentFactory::default().zero());
+        let bytes = commitment.as_bytes().to_vec();
+
+        let parsed = parse_excluded_commitments(vec![bytes]).unwrap();
+
+        assert_eq!(parsed, vec![commitment]);
     }
 }

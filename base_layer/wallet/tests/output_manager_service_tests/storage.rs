@@ -21,6 +21,8 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #![allow(clippy::indexing_slicing)]
+// Overflow in test code panics, which is the desired failure mode for a test.
+#![allow(clippy::arithmetic_side_effects)]
 use std::convert::TryFrom;
 
 use diesel::prelude::*;
@@ -623,6 +625,51 @@ pub async fn test_must_include_filter() {
     assert!(!selected.is_empty());
     let total_value: MicroMinotari = selected.iter().map(|o| o.wallet_output.value()).sum();
     assert!(total_value >= MicroMinotari::from(500));
+}
+
+#[tokio::test]
+pub async fn test_excluding_commitments_filter() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let db = OutputManagerDatabase::new(backend);
+    let key_manager = create_new_random_key_manager().await.unwrap();
+
+    let mut outputs = Vec::new();
+    let mut unspent = Vec::new();
+    for value in [100, 200] {
+        let wallet_output = make_input(
+            &mut rand::rng(),
+            MicroMinotari::from(value),
+            &OutputFeatures::default(),
+            key_manager.key_manager(),
+        );
+        let output = DbWalletOutput::from_wallet_output(wallet_output, None, OutputSource::Standard, None, None);
+        db.add_unspent_output(output.clone(), &key_manager).unwrap();
+        unspent.push((output.hash, true));
+        outputs.push(output);
+    }
+    db.mark_outputs_as_unspent(unspent).unwrap();
+
+    let selection_criteria = UtxoSelectionCriteria {
+        excluding: vec![outputs[0].commitment.clone()],
+        ..Default::default()
+    };
+    let selected = db
+        .fetch_unspent_outputs_for_spending(&selection_criteria, MicroMinotari::from(100), None, &key_manager)
+        .unwrap();
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].commitment, outputs[1].commitment);
+
+    let selection_criteria = UtxoSelectionCriteria {
+        excluding: outputs.into_iter().map(|output| output.commitment).collect(),
+        ..Default::default()
+    };
+    let selected = db
+        .fetch_unspent_outputs_for_spending(&selection_criteria, MicroMinotari::from(100), None, &key_manager)
+        .unwrap();
+
+    assert!(selected.is_empty());
 }
 
 #[tokio::test]

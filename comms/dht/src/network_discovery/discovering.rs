@@ -56,6 +56,26 @@ use crate::{
 
 const LOG_TARGET: &str = "comms::dht::network_discovery";
 
+/// How many claims that only a broken or hostile node could produce a sync peer may relay in one
+/// round before the round is aborted and the sync peer banned.
+///
+/// A peer that is behind NAT or misconfigured is common and costs nothing to skip, so those claims
+/// are not counted here. A forged signature or a malformed multiaddress is not something an honest
+/// relay produces, and without a bound a sync peer could burn the whole per-round budget on them.
+const MAX_HOSTILE_RELAYED_CLAIMS: usize = 5;
+
+/// Classifies a failure to add a single peer that a sync peer relayed to us.
+///
+/// Returns `None` when the failure is not about the relayed claim at all (storage, connectivity) and
+/// the round therefore cannot continue. Otherwise the round continues without this peer, and the
+/// boolean says whether the sync peer relayed something only a broken or hostile node would produce.
+fn classify_relay_failure(err: &NetworkDiscoveryError) -> Option<bool> {
+    match err {
+        NetworkDiscoveryError::PeerValidationError(err) => Some(err.is_ban_offence()),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Discovering {
     params: DiscoveryParams,
@@ -110,7 +130,7 @@ impl Discovering {
                     debug!(target: LOG_TARGET, "Discovering: Attempting to sync from peer `{peer_node_id}`" );
 
                     if self.request_from_peers(conn).await.is_ok() {
-                        self.stats.num_succeeded += 1;
+                        self.stats.num_succeeded = self.stats.num_succeeded.saturating_add(1);
                     }
                 },
                 Err(err) => {
@@ -290,11 +310,12 @@ impl Discovering {
             sync_peer
         );
         let mut stream = self.get_stream(client, sync_peer).await?;
-        let mut counter = 0;
+        let mut counter = 0u32;
+        let mut hostile_claims = 0usize;
         #[allow(clippy::mutable_key_type)]
         let mut peers_received = HashSet::new();
         while let Some(resp) = self.get_peer_response(&mut stream, sync_peer).await? {
-            counter += 1;
+            counter = counter.saturating_add(1);
             if counter > self.params.num_peers_to_request {
                 warn!(target: LOG_TARGET, "Discovering: Sync peer `{sync_peer}` sent more peers than we requested.");
                 return Err(NetworkDiscoveryError::TooManyPeersReceived);
@@ -329,12 +350,42 @@ impl Discovering {
                 warn!(target: LOG_TARGET, "Discovering: Sync peer `{sync_peer}` sent duplicate peer: {err:?}");
                 return Err(err);
             }
-            self.validate_and_add_peer(new_peer).await.inspect_err(|err| {
-                warn!(
-                    target: LOG_TARGET,
-                    "Discovering: Failed to validate and add peer from sync peer `{sync_peer}`: {err:?}"
-                );
-            })?;
+            match self.validate_and_add_peer(new_peer).await {
+                Ok(()) => {},
+                Err(err) => match classify_relay_failure(&err) {
+                    // A sync peer merely relays signed claims. Skip a bad or unusable claim without
+                    // truncating the rest of the stream; otherwise the same entry can permanently
+                    // block every subsequent peer in each discovery round.
+                    Some(is_offence) => {
+                        if is_offence {
+                            hostile_claims = hostile_claims.saturating_add(1);
+                        }
+                        warn!(
+                            target: LOG_TARGET,
+                            "Discovering: Skipping peer relayed by sync peer `{sync_peer}` after validation failed \
+                             (hostile: {is_offence}): {err:?}"
+                        );
+                        // Relaying the occasional unusable claim is normal - relaying claims that
+                        // only a broken or hostile node could produce is not, and skipping them
+                        // must not be free.
+                        if hostile_claims > MAX_HOSTILE_RELAYED_CLAIMS {
+                            warn!(
+                                target: LOG_TARGET,
+                                "Discovering: Sync peer `{sync_peer}` relayed more than {MAX_HOSTILE_RELAYED_CLAIMS} \
+                                 unusable peer claims."
+                            );
+                            return Err(NetworkDiscoveryError::TooManyInvalidPeersReceived);
+                        }
+                    },
+                    None => {
+                        warn!(
+                            target: LOG_TARGET,
+                            "Discovering: Failed to add peer from sync peer `{sync_peer}`: {err:?}"
+                        );
+                        return Err(err);
+                    },
+                },
+            }
         }
 
         Ok(())
@@ -354,9 +405,9 @@ impl Discovering {
         match peer_validator.validate_peer(new_peer, maybe_existing_peer) {
             Ok(valid_peer) => {
                 if peer_exists {
-                    self.stats.num_duplicate_peers += 1;
+                    self.stats.num_duplicate_peers = self.stats.num_duplicate_peers.saturating_add(1);
                 } else {
-                    self.stats.num_new_peers += 1;
+                    self.stats.num_new_peers = self.stats.num_new_peers.saturating_add(1);
                 }
                 self.add_peer(valid_peer).await?;
                 Ok(())
@@ -377,7 +428,8 @@ impl Discovering {
                     NetworkDiscoveryError::EmptyPeerMessageReceived |
                     NetworkDiscoveryError::InvalidPeerDataReceived(_) |
                     NetworkDiscoveryError::DuplicatePeerReceived |
-                    NetworkDiscoveryError::TooManyPeersReceived => {
+                    NetworkDiscoveryError::TooManyPeersReceived |
+                    NetworkDiscoveryError::TooManyInvalidPeersReceived => {
                         self.ban_peer(peer, OffenceSeverity::High, &err).await;
                     },
                     NetworkDiscoveryError::RpcError(rpc_err) if rpc_err.is_caused_by_server() => {
@@ -451,5 +503,67 @@ impl Discovering {
             pending_dials.len()
         );
         pending_dials
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tari_comms::{
+        peer_manager::{NodeId, PeerManagerError},
+        peer_validator::PeerValidatorError,
+    };
+
+    use super::*;
+    use crate::peer_validator::DhtPeerValidatorError;
+
+    fn validation_error(err: PeerValidatorError) -> NetworkDiscoveryError {
+        DhtPeerValidatorError::ValidatorError(err).into()
+    }
+
+    #[test]
+    fn a_relayed_claim_that_fails_validation_does_not_end_the_round() {
+        // A peer behind NAT, or one we simply cannot use, is skipped for free.
+        assert_eq!(
+            classify_relay_failure(&validation_error(PeerValidatorError::PeerHasNoUsableAddresses {
+                peer: NodeId::default()
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            classify_relay_failure(&validation_error(PeerValidatorError::PeerHasNoAddresses {
+                peer: NodeId::default()
+            })),
+            Some(false)
+        );
+
+        // A forged signature or malformed address is skipped too, but counts against the sync peer.
+        assert_eq!(
+            classify_relay_failure(&validation_error(PeerValidatorError::InvalidPeerSignature {
+                peer: NodeId::default()
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            classify_relay_failure(&validation_error(PeerValidatorError::InvalidMultiaddr(
+                "bad address".to_string()
+            ))),
+            Some(true)
+        );
+        assert_eq!(
+            classify_relay_failure(&NetworkDiscoveryError::PeerValidationError(
+                DhtPeerValidatorError::IdentityTooManyClaims { length: 2, max: 1 }
+            )),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_local_failure_ends_the_round() {
+        // Nothing to do with what the sync peer sent, so the round cannot continue.
+        assert_eq!(
+            classify_relay_failure(&NetworkDiscoveryError::PeerManagerError(PeerManagerError::BannedPeer)),
+            None
+        );
+        assert_eq!(classify_relay_failure(&NetworkDiscoveryError::NoSyncPeers), None);
     }
 }

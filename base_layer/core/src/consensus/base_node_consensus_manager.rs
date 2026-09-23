@@ -102,6 +102,14 @@ impl BaseNodeConsensusManager {
         self.inner.consensus_manager.consensus_constants_vec()
     }
 
+    /// The height from which the GHSA-3qmx-q9pv-f3m4 proof of work rules are consensus on this network, or
+    /// `u64::MAX` (`UNSCHEDULED_ACTIVATION_HEIGHT`) where the advisory's fork is not scheduled.
+    ///
+    /// Read off the constants vector, so there is no second place to keep in step with the activation entries.
+    pub fn derived_monero_coinbase_activation_height(&self) -> u64 {
+        ConsensusConstants::derived_monero_coinbase_activation_height(self.consensus_constants_vec())
+    }
+
     pub fn consensus_manager(&self) -> ConsensusManager {
         self.inner.consensus_manager.clone()
     }
@@ -184,12 +192,16 @@ impl BaseNodeConsensusManager {
 
     /// Get the total pre-mine that is still time-locked at the specified height
     pub fn time_locked_pre_mine(&self, height: u64) -> Result<MicroMinotari, String> {
-        Ok(self.total_pre_mine_in_genesis_block() - self.pre_mine_spendable_at_height(height)?)
+        Ok(self
+            .total_pre_mine_in_genesis_block()
+            .saturating_sub(self.pre_mine_spendable_at_height(height)?))
     }
 
     /// Get the total mined block rewards at the specified height (excluding pre-mine)
     pub fn block_rewards_mined_at_height(&self, height: u64) -> Result<MicroMinotari, String> {
-        Ok(self.get_total_emission_at(height) - self.consensus_constants(height).pre_mine_value())
+        Ok(self
+            .get_total_emission_at(height)
+            .saturating_sub(self.consensus_constants(height).pre_mine_value()))
     }
 
     /// Get the total spendable block rewards circulation at the specified height (excluding pre-mine)
@@ -200,27 +212,31 @@ impl BaseNodeConsensusManager {
         //                                     | 10080 -> 15120 - 1 | (360) |
         //                                                          | 15120 -> | (180) |
 
+        // `get_maturity_tranches` maps the consensus constants vector one to one and in order, so the index of the
+        // active constants entry is also the index of the active tranche. Going through
+        // `ConsensusConstants::active_index_at_height` keeps this on the single authoritative definition of "active"
+        // rather than adding another lookup that has to be kept in step, and it is exact where searching the tranche
+        // vector by value was not: two constants entries can produce identical `MaturityTranche` values.
         let maturity_tranches = self.get_maturity_tranches();
-
+        let last_effective_index =
+            ConsensusConstants::active_index_at_height(self.consensus_constants_vec(), height)
+                .ok_or_else(|| format!("Last effective maturity tranche for height {height} not found"))?;
         let last_effective_tranche = maturity_tranches
-            .iter()
-            .filter(|v| v.effective_from_height <= height)
-            .max_by_key(|v| v.effective_from_height)
+            .get(last_effective_index)
             .ok_or_else(|| format!("Last effective maturity tranche for height {height} not found"))?;
-        let last_effective_index = maturity_tranches
-            .iter()
-            .position(|v| v == last_effective_tranche)
-            .ok_or_else(|| format!("Last effective maturity tranche index for height {height} not found"))?;
         let previous_effective_tranch = maturity_tranches
             .get(last_effective_index.saturating_sub(1))
-            .expect("Index should exist")
+            .ok_or_else(|| format!("Last effective maturity tranche index for height {height} not found"))?
             .clone();
 
         // We have to adjust the matured rewards at height to account for the effective from height of the last
         // effective tranche
         let emission_schedule = self.emission_schedule();
         let matured_rewards_at_height = if last_effective_tranche.maturity < previous_effective_tranch.maturity &&
-            height < last_effective_tranche.effective_from_height + previous_effective_tranch.maturity
+            height <
+                last_effective_tranche
+                    .effective_from_height
+                    .saturating_add(previous_effective_tranch.maturity)
         {
             emission_schedule
                 .supply_at_block(height.saturating_sub(previous_effective_tranch.maturity))

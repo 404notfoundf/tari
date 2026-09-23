@@ -68,8 +68,9 @@ use tari_core::{
     consensus::BaseNodeConsensusManager,
     iterators::NonOverlappingIntegerPairIter,
     mempool::{TxStorageResponse, service::LocalMempoolService},
+    proof_of_work::AdjustedTarget,
     validation::tari_rx_vm_key_height,
-    proof_of_work::{monero_rx, monero_rx::FixedByteArray},
+    proof_of_work::{monero_rx, monero_rx::{CoinbasePrefixMode, FixedByteArray}},
     AuxChainHashes,
 };
 use tari_node_components::blocks::{Block, BlockHeader, NewBlockTemplate};
@@ -79,6 +80,7 @@ use tari_transaction_components::{
     generate_coinbase_with_wallet_output,
     key_manager::{KeyManager, TariKeyId, TransactionKeyManagerInterface, TxoStage},
     tari_proof_of_work::{Difficulty, PowAlgorithm, PowData},
+    rpc::MAX_ALLOWED_QUERY_SIZE,
     transaction_components::{
         CoinBaseExtra,
         KernelBuilder,
@@ -97,7 +99,15 @@ use crate::{
     BaseNodeConfig,
     builder::BaseNodeContext,
     grpc::{
-        blocks::{GET_BLOCKS_MAX_HEIGHTS, GET_BLOCKS_PAGE_SIZE, block_fees, block_heights, block_size},
+        blocks::{
+            GET_BLOCKS_PAGE_SIZE,
+            block_fees,
+            block_heights,
+            block_size,
+            height_pages,
+            resolve_requested_heights,
+            stream_blocks,
+        },
         data_cache::DataCache,
         hash_rate::{HashRateMovingAverage, NANOS_PER_UNIT, display_u_decimal_value},
         helpers::{mean, median},
@@ -171,6 +181,7 @@ impl BaseNodeGrpcServer {
             GrpcMethod::GetNewBlock,
             GrpcMethod::GetNewBlockBlob,
             GrpcMethod::GetNetworkDifficulty,
+            GrpcMethod::GetNetworkState,
             GrpcMethod::SubmitBlock,
             GrpcMethod::SubmitBlockBlob,
             GrpcMethod::GetTipInfo,
@@ -224,6 +235,20 @@ pub fn obscure_error_if_true(report: bool, status: Status) -> Status {
         warn!(target: LOG_TARGET, "Obscured status error: {status}");
         Status::new(status.code(), "Error has occurred. Details are obscured.")
     }
+}
+
+/// Rejects a batch query that asks for more than `MAX_ALLOWED_QUERY_SIZE` items, so that a single call can never force
+/// the node into an unbounded number of database lookups. `item_name` is used in the error message, e.g. "hashes".
+fn check_query_size(len: usize, item_name: &str, report_error_flag: bool) -> Result<(), Status> {
+    if len > MAX_ALLOWED_QUERY_SIZE {
+        return Err(obscure_error_if_true(
+            report_error_flag,
+            Status::invalid_argument(format!(
+                "Exceeded maximum allowed query {item_name}. Requested: {len}, max: {MAX_ALLOWED_QUERY_SIZE}"
+            )),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn get_heights(
@@ -425,7 +450,8 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         &self,
         _request: Request<tari_rpc::GetNetworkStateRequest>,
     ) -> Result<Response<tari_rpc::GetNetworkStateResponse>, Status> {
-        trace!(target: LOG_TARGET, "Incoming GRPC request for get network hash rate");
+        self.check_method_enabled(GrpcMethod::GetNetworkState)?;
+        trace!(target: LOG_TARGET, "Incoming GRPC request for GetNetworkState");
         let report_error_flag = self.report_error_flag();
         let mut handler = self.node_service.clone();
         let metadata = handler.get_metadata().await.map_err(|e| {
@@ -461,9 +487,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                                 "Could not get target difficulty for Sha3x: {e}"
                             );
                         })
-                        .unwrap_or(Difficulty::min());
+                        .unwrap_or(AdjustedTarget::unadjusted(Difficulty::min()));
                     let target_time = constants.pow_target_block_interval(PowAlgorithm::Sha3x);
-                    let estimated_hash_rate = target_difficulty.as_u64().checked_div(target_time).unwrap_or(0);
+                    // The *unadjusted* target tracks the real hash rate; the adjusted one carries the same-algorithm
+                    // backoff and would inflate the estimate by up to the backoff cap.
+                    let estimated_hash_rate = target_difficulty.base.as_u64().checked_div(target_time).unwrap_or(0);
                     self.data_cache
                         .set_sha3x_estimated_hash_rate(estimated_hash_rate, *metadata.best_block_hash())
                         .await;
@@ -490,9 +518,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                                 "Could not get target difficulty for Monero RandomX: {e}"
                             );
                         })
-                        .unwrap_or(Difficulty::min());
+                        .unwrap_or(AdjustedTarget::unadjusted(Difficulty::min()));
                     let target_time = constants.pow_target_block_interval(PowAlgorithm::RandomXM);
-                    let estimated_hash_rate = target_difficulty.as_u64().checked_div(target_time).unwrap_or(0);
+                    // The *unadjusted* target tracks the real hash rate; the adjusted one carries the same-algorithm
+                    // backoff and would inflate the estimate by up to the backoff cap.
+                    let estimated_hash_rate = target_difficulty.base.as_u64().checked_div(target_time).unwrap_or(0);
                     self.data_cache
                         .set_monero_randomx_estimated_hash_rate(estimated_hash_rate, *metadata.best_block_hash())
                         .await;
@@ -520,9 +550,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                                 "Could not get target difficulty for Tari RandomX: {e}"
                             );
                         })
-                        .unwrap_or(Difficulty::min());
+                        .unwrap_or(AdjustedTarget::unadjusted(Difficulty::min()));
                     let target_time = constants.pow_target_block_interval(PowAlgorithm::RandomXT);
-                    let estimated_hash_rate = target_difficulty.as_u64().checked_div(target_time).unwrap_or(0);
+                    // The *unadjusted* target tracks the real hash rate; the adjusted one carries the same-algorithm
+                    // backoff and would inflate the estimate by up to the backoff cap.
+                    let estimated_hash_rate = target_difficulty.base.as_u64().checked_div(target_time).unwrap_or(0);
                     self.data_cache
                         .set_tari_randomx_estimated_hash_rate(estimated_hash_rate, *metadata.best_block_hash())
                         .await;
@@ -550,9 +582,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                                 "Could not get target difficulty for Cuckaroo: {e}"
                             );
                         })
-                        .unwrap_or(Difficulty::min());
+                        .unwrap_or(AdjustedTarget::unadjusted(Difficulty::min()));
                     let target_time = constants.pow_target_block_interval(PowAlgorithm::Cuckaroo);
+                    // The *unadjusted* target tracks the real hash rate; see above.
                     let estimated_hash_rate_scaled = target_difficulty
+                        .base
                         .as_u64()
                         .saturating_mul(NANOS_PER_UNIT) // We have to add scaling as this value can be < 1
                         .checked_div(target_time)
@@ -742,7 +776,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 Sorting::Desc => {
                     let from = match tip.overflowing_sub(num_headers) {
                         (_, true) => 0,
-                        (res, false) => res + 1,
+                        (res, false) => res.saturating_add(1),
                     };
                     (from..=tip, true)
                 },
@@ -753,7 +787,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                 Sorting::Desc => {
                     let from = match from_height.overflowing_sub(num_headers) {
                         (_, true) => 0,
-                        (res, false) => res + 1,
+                        (res, false) => res.saturating_add(1),
                     };
                     (from..=from_height, true)
                 },
@@ -1159,6 +1193,8 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
     }
 
     #[allow(clippy::too_many_lines)]
+    // Ristretto point/scalar and signature arithmetic, not integer arithmetic: cannot overflow.
+    #[allow(clippy::arithmetic_side_effects)]
     async fn get_new_block_template_with_coinbases(
         &self,
         request: Request<tari_rpc::GetNewBlockTemplateWithCoinbasesRequest>,
@@ -1259,19 +1295,19 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let mut total_shares = 0u128;
         for coinbase in &coinbases {
-            total_shares += u128::from(coinbase.value);
+            total_shares = total_shares.saturating_add(u128::from(coinbase.value));
         }
         let mut cur_share_sum = 0u128;
         let mut prev_coinbase_value = 0u128;
         for coinbase in &mut coinbases {
-            cur_share_sum += u128::from(coinbase.value);
+            cur_share_sum = cur_share_sum.saturating_add(u128::from(coinbase.value));
             coinbase.value = u64::try_from(
                 (cur_share_sum.saturating_mul(reward))
                     .checked_div(total_shares)
                     .ok_or_else(|| {
                         obscure_error_if_true(report_error_flag, Status::internal("total shares are zero".to_string()))
-                    })? -
-                    prev_coinbase_value,
+                    })?
+                    .saturating_sub(prev_coinbase_value),
             )
             .map_err(|_| {
                 obscure_error_if_true(
@@ -1279,7 +1315,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                     Status::internal("Single coinbase fees exceeded u64".to_string()),
                 )
             })?;
-            prev_coinbase_value += u128::from(coinbase.value);
+            prev_coinbase_value = prev_coinbase_value.saturating_add(u128::from(coinbase.value));
         }
 
         let key_manager = KeyManager::new_random().map_err(|e| {
@@ -1454,6 +1490,8 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
     }
 
     #[allow(clippy::too_many_lines)]
+    // Ristretto point/scalar and signature arithmetic, not integer arithmetic: cannot overflow.
+    #[allow(clippy::arithmetic_side_effects)]
     async fn get_new_block_with_coinbases(
         &self,
         request: Request<tari_rpc::GetNewBlockWithCoinbasesRequest>,
@@ -1513,7 +1551,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let mut amount = 0u64;
         for coinbase in &coinbases {
-            amount += coinbase.value;
+            amount = amount.saturating_add(coinbase.value);
         }
 
         if amount != reward.as_u64() {
@@ -2061,58 +2099,17 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             "Incoming GRPC request for GetBlocks: {:?}", request.heights
         );
 
-        let mut heights = request.heights;
-        if heights.is_empty() {
-            let mut handler = self.node_service.clone();
-            if let Ok(tip) = handler.get_metadata().await {
-                heights.push(tip.best_block_height());
-            }
-        }
+        let heights = resolve_requested_heights(self.node_service.clone(), request.heights, report_error_flag).await?;
 
-        heights.truncate(GET_BLOCKS_MAX_HEIGHTS);
-        heights.sort_unstable();
-        // unreachable panic: `heights` is not empty
-        let start = *heights.first().expect("unreachable");
-        let end = *heights.last().expect("unreachable");
-
-        let mut handler = self.node_service.clone();
-        let (mut tx, rx) = mpsc::channel(GET_BLOCKS_PAGE_SIZE);
-        let page_iter = NonOverlappingIntegerPairIter::new(start, end.saturating_add(1), GET_BLOCKS_PAGE_SIZE)
+        // Only fetch the heights that were actually requested: sparse requests are grouped into maximal contiguous
+        // runs and each run is paged individually, so the number of blocks hydrated is bounded by the number of
+        // requested heights and not by the span between the lowest and highest requested height.
+        let pages = height_pages(&heights, GET_BLOCKS_PAGE_SIZE)
             .map_err(|e| obscure_error_if_true(report_error_flag, Status::invalid_argument(e)))?;
-        task::spawn(async move {
-            for (start, end) in page_iter {
-                let blocks = match handler.get_blocks(start..=end, false).await {
-                    Err(err) => {
-                        warn!(
-                            target: LOG_TARGET,
-                            "Error communicating with local base node: {err:?}"
-                        );
-                        return;
-                    },
-                    Ok(data) => data.into_iter().filter(|b| heights.contains(&b.header().height)),
-                };
 
-                for block in blocks {
-                    trace!(
-                        target: LOG_TARGET,
-                        "GetBlock GRPC sending block #{}",
-                        block.header().height
-                    );
-                    let result = block.try_into().map_err(|err| {
-                        obscure_error_if_true(
-                            report_error_flag,
-                            Status::internal(format!("Could not provide block: {err}")),
-                        )
-                    });
-                    if tx.send(result).await.is_err() {
-                        warn!(
-                            target: LOG_TARGET,
-                            "[get_blocks] Request was cancelled while sending a response"
-                        );
-                    }
-                }
-            }
-        });
+        let handler = self.node_service.clone();
+        let (tx, rx) = mpsc::channel(GET_BLOCKS_PAGE_SIZE);
+        task::spawn(stream_blocks(handler, pages, tx, report_error_flag));
 
         trace!(target: LOG_TARGET, "Sending GetBlocks response stream to client");
         Ok(Response::new(rx))
@@ -2160,6 +2157,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         let report_error_flag = self.report_error_flag();
         trace!(target: LOG_TARGET, "Incoming GRPC request for SearchKernels");
         let request = request.into_inner();
+        check_query_size(request.signatures.len(), "signatures", report_error_flag)?;
 
         let kernels = request
             .signatures
@@ -2216,6 +2214,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         let report_error_flag = self.report_error_flag();
         trace!(target: LOG_TARGET, "Incoming GRPC request for SearchUtxos");
         let request = request.into_inner();
+        check_query_size(request.commitments.len(), "commitments", report_error_flag)?;
 
         let outputs = request
             .commitments
@@ -2255,6 +2254,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                         target: LOG_TARGET,
                         "[search_utxos] Request was cancelled while sending a response"
                     );
+                    return;
                 }
             }
         });
@@ -2272,6 +2272,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         let report_error_flag = self.report_error_flag();
         trace!(target: LOG_TARGET, "Incoming GRPC request for FetchMatchingUtxos");
         let request = request.into_inner();
+        check_query_size(request.hashes.len(), "hashes", report_error_flag)?;
 
         let hashes = request
             .hashes
@@ -3026,7 +3027,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let start_height = start_header.height();
         let end_height = start_height
-            .checked_add(request.count - 1)
+            .checked_add(request.count.saturating_sub(1))
             .ok_or_else(|| Status::invalid_argument("Request start height + count overflows u64"))?;
 
         task::spawn(async move {
@@ -3121,6 +3122,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             "Incoming GRPC request for SearchPaymentReferencesViaOutputHash: {} hashes",
             request.hashes.len()
         );
+        check_query_size(request.hashes.len(), "hashes", report_error_flag)?;
 
         let hashes = request
             .hashes
@@ -3208,6 +3210,14 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
             "Incoming GRPC request for SearchPaymentReferences: {} PayRefs",
             request.payment_reference_hex.len()
         );
+        check_query_size(
+            request
+                .payment_reference_hex
+                .len()
+                .saturating_add(request.payment_reference_bytes.len()),
+            "payment references",
+            report_error_flag,
+        )?;
 
         let (mut tx, rx) = mpsc::channel(100);
         let mut node_service = self.node_service.clone();
@@ -3497,11 +3507,13 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
         
         let aux_chain_hashes = AuxChainHashes::try_from(vec![monero::Hash::from_slice(merge_mining_hash.as_slice())]).map_err(|err| obscure_error_if_true(report_error_flag, Status::internal(err.to_string())))?;
         
+        // GHSA-3qmx-q9pv-f3m4: 节点按 Tari 区块高度只接受一种 coinbase 线格式。
         let monero_data = monero_rx::construct_monero_data(
             monero_block,
             seed_hash.clone(),
             aux_chain_hashes.clone(),
             merge_mining_hash,
+            CoinbasePrefixMode::for_height(&self.consensus_rules, block.header.height),
         ).map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
 
         let mut monero_data_bytes = Vec::new();

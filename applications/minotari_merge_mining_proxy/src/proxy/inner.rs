@@ -44,7 +44,12 @@ use serde_json::json;
 use tari_common_types::tari_address::TariAddress;
 use tari_core::{
     consensus::BaseNodeConsensusManager,
-    proof_of_work::{monero_randomx_difficulty, monero_rx, monero_rx::FixedByteArray, randomx_factory::RandomXFactory},
+    proof_of_work::{
+        monero_randomx_difficulty,
+        monero_rx,
+        monero_rx::{CoinbasePrefixMode, FixedByteArray},
+        randomx_factory::RandomXFactory,
+    },
 };
 use tari_utilities::hex::Hex;
 use tokio::time::timeout;
@@ -147,7 +152,9 @@ impl InnerService {
 
         // Add them together. You could multiply them a factor, but xmrig will generally just check if the height or the
         // hash is different.
-        let reported_height = p2pool_height + monero_height + base_node_height;
+        let reported_height = p2pool_height
+            .saturating_add(monero_height)
+            .saturating_add(base_node_height);
 
         // As of xmrig 6.22.0, the block hash is stored separately and does not need to match the block template they
         // are mining, but if that changes in future, you might need to return the monero hash.
@@ -209,11 +216,21 @@ impl InnerService {
                     continue;
                 },
             };
+            // GHSA-3qmx-q9pv-f3m4: which coinbase wire format the node will accept is a function of the Tari
+            // header's height, so the height has to be read before the pow data is built.
+            let tari_header_height = block_data
+                .template
+                .tari_block
+                .header
+                .as_ref()
+                .ok_or(MmProxyError::UnexpectedMissingData("tari_block.header".to_string()))?
+                .height;
             let monero_data = monero_rx::construct_monero_data(
                 monero_block,
                 block_data.template.monero_seed.clone(),
                 block_data.aux_chain_hashes.clone(),
                 block_data.template.tari_merge_mining_hash,
+                CoinbasePrefixMode::for_height(&self.consensus_manager, tari_header_height),
             )?;
 
             debug!(target: LOG_TARGET, "Monero PoW Data: {:?}", monero_data);
@@ -438,7 +455,7 @@ impl InnerService {
         // preventing coinbase corruption.
         if let Some(offset) = monerod_resp["result"]["reserved_offset"].as_u64() {
             let tag_size = TARI_MERGE_MINING_TAG_SIZE as u64;
-            monerod_resp["result"]["reserved_offset"] = (offset + tag_size).into();
+            monerod_resp["result"]["reserved_offset"] = offset.saturating_add(tag_size).into();
         }
 
         let tari_difficulty = final_block_template_data.template.tari_difficulty;
@@ -467,7 +484,7 @@ impl InnerService {
                 "height": tari_height,
                 // The aux chain merkle root, before the final block hash can be calculated
                 "mining_hash": aux_chain_mr,
-                "miner_reward": block_reward + total_fees,
+                "miner_reward": block_reward.saturating_add(total_fees),
             }),
         );
 
@@ -643,7 +660,7 @@ impl InnerService {
     #[allow(clippy::too_many_lines)]
     async fn get_monerod_url(&self, request_uri: &Uri) -> Result<Option<Url>, MmProxyError> {
         // Return the previously qualified monerod URL if it exists
-        let mut busy_qualifying = 0;
+        let mut busy_qualifying = 0u64;
         let start_reading_lock_time = Instant::now();
         loop {
             let lock_contents = {
@@ -662,7 +679,7 @@ impl InnerService {
                     trace!(
                         target: LOG_TARGET,
                         "Waiting for lock data ({} - {:.2?}), {}, {}",
-                        {busy_qualifying += 1; busy_qualifying}, time_lapsed, BUSY_QUALIFYING, request_uri.path()
+                        {busy_qualifying = busy_qualifying.saturating_add(1); busy_qualifying}, time_lapsed, BUSY_QUALIFYING, request_uri.path()
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
@@ -702,7 +719,10 @@ impl InnerService {
             .iter()
             .position(|x| x == &last_used_url)
             .unwrap_or(0);
-        pos = (pos + 1) % self.config.monerod_url.len();
+        pos = pos
+            .saturating_add(1)
+            .checked_rem(self.config.monerod_url.len())
+            .unwrap_or(0);
         let (left, right) = self.config.monerod_url.split_at_checked(pos).ok_or_else(|| {
             self.clear_current_monerod_server_lock(Some(self.config.monerod_url[0].as_str()), None);
             MmProxyError::ConversionError("last_used_url".to_string())
@@ -728,7 +748,7 @@ impl InnerService {
             let pos = self.config.monerod_url.iter().position(|x| x == server).unwrap_or(0);
             debug!(
                 target: LOG_TARGET, "Trying to connect to Monerod server at: {} (entry {} of {})",
-                url.as_str(), pos + 1, self.config.monerod_url.len()
+                url.as_str(), pos.saturating_add(1), self.config.monerod_url.len()
             );
             match timeout(self.config.monerod_connection_timeout, reqwest::get(url.clone())).await {
                 // For this availability check we deliberately do not provide the body of the request if it is a POST
@@ -805,7 +825,7 @@ impl InnerService {
             let current_reserve = params.get("reserve_size").and_then(|v| v.as_u64()).unwrap_or(0);
             params.insert(
                 "reserve_size".to_string(),
-                serde_json::json!(current_reserve + tag_size),
+                serde_json::json!(current_reserve.saturating_add(tag_size)),
             );
         }
 

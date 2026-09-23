@@ -457,6 +457,7 @@ impl TryFrom<grpc::SidechainBlockHeader> for SidechainBlockHeader {
         let network_byte = u8::try_from(value.network).map_err(|_| "Invalid network byte: overflows u8".to_string())?;
         Ok(Self {
             network: network_byte,
+            protocol_version: value.protocol_version,
             parent_id: value.parent_id.try_into().map_err(|_| "Invalid parent id")?,
             justify_id: value.justify_id.try_into().map_err(|_| "Invalid justify id")?,
             height: value.height,
@@ -490,6 +491,7 @@ impl From<&SidechainBlockHeader> for grpc::SidechainBlockHeader {
     fn from(value: &SidechainBlockHeader) -> Self {
         Self {
             network: u32::from(value.network),
+            protocol_version: value.protocol_version,
             parent_id: value.parent_id.to_vec(),
             justify_id: value.justify_id.to_vec(),
             height: value.height,
@@ -573,6 +575,9 @@ impl TryFrom<grpc::QuorumCertificate> for QuorumCertificate {
         Ok(Self {
             header_hash: value.header_hash.try_into().map_err(|_| "Invalid block body hash")?,
             parent_id: value.parent_id.try_into().map_err(|_| "Invalid parent id")?,
+            epoch: value.epoch,
+            height: value.height,
+            protocol_version: value.protocol_version,
             signatures: value
                 .signatures
                 .into_iter()
@@ -590,6 +595,9 @@ impl From<&QuorumCertificate> for grpc::QuorumCertificate {
         Self {
             parent_id: value.parent_id.to_vec(),
             header_hash: value.header_hash.to_vec(),
+            epoch: value.epoch,
+            height: value.height,
+            protocol_version: value.protocol_version,
             signatures: value.signatures.iter().map(Into::into).collect(),
             decision: grpc::QuorumDecision::from(value.decision).into(),
         }

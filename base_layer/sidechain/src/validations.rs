@@ -17,6 +17,12 @@ use crate::{
 
 const LOG_TARGET: &str = "c::sidechain::validations";
 
+/// The maximum number of signatures a quorum certificate may contain. A valid quorum certificate contains at most one
+/// signature per committee member, so this is an upper bound for any committee size. It is enforced at the proto
+/// deserialization boundary and again during proof validation, in both cases before any signature is verified or
+/// duplicates are collected, so that the work an untrusted quorum certificate can cause is bounded.
+pub const MAX_QC_SIGNATURES: usize = 1000;
+
 pub fn check_proof_elements(
     header: &SidechainBlockHeader,
     proof_elements: &[CommitProofElement],
@@ -48,7 +54,7 @@ pub fn check_proof_elements(
                 }
 
                 if proven_3_chain < 3 {
-                    proven_3_chain += 1;
+                    proven_3_chain = proven_3_chain.saturating_add(1);
                     debug!(target: LOG_TARGET, "3-chain rule: {proven_3_chain} of 3 proven");
                 }
 
@@ -179,6 +185,16 @@ fn validate_qc(
         });
     }
 
+    if qc.signatures.len() > MAX_QC_SIGNATURES {
+        return Err(SidechainProofValidationError::InvalidProof {
+            details: format!(
+                "Quorum certificate must contain at most {} signatures but contained {}",
+                MAX_QC_SIGNATURES,
+                qc.signatures.len()
+            ),
+        });
+    }
+
     if qc.decision != quorum_decision {
         return Err(SidechainProofValidationError::InvalidProof {
             details: format!(
@@ -205,7 +221,7 @@ fn validate_qc(
             });
         }
 
-        if !sig.verify(&block_id, quorum_decision) {
+        if !sig.verify(qc.protocol_version, &block_id, quorum_decision, qc.epoch, qc.height) {
             return Err(SidechainProofValidationError::InvalidProof {
                 details: format!("Invalid signature for QC for block ID {block_id}",),
             });

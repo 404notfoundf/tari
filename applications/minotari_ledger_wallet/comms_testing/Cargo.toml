@@ -1,0 +1,73 @@
+# This crate is its own workspace, and is `exclude`d from the repository root workspace. That is deliberate and is a
+# security property - see the comment on `[workspace] exclude` in the root `Cargo.toml`, and the crate docs in
+# `src/lib.rs`. In short: as a member of the root workspace it lands in the default package selection, and Cargo
+# then unifies the `test_transport` feature it enables into the one `minotari_ledger_wallet_comms` rlib that the
+# shipped `minotari_console_wallet` links.
+#
+# Because it is its own workspace, the fields below cannot be inherited from the root `[workspace.package]` and are
+# written out literally. Keep them in step with the root workspace when it moves.
+[workspace]
+
+[package]
+name = "minotari_ledger_wallet_comms_testing"
+description = "Speculos simulator transport for the Minotari Ledger Wallet. Test harness only - never depend on this from a shipped binary."
+version = "6.0.0"
+edition = "2024"
+rust-version = "1.93.0"
+authors = ["The Tari Development Community"]
+repository = "https://github.com/tari-project/tari"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+# `test_transport` is enabled here and nowhere else. That is the whole reason this crate exists as a separate crate,
+# in a separate workspace, rather than as a feature of `minotari_ledger_wallet_comms`: `ledger` is a *default*
+# feature of the console wallet, so a redirectable transport that lived in `comms` would ship to users the moment
+# some feature unification turned its gate on. Living out here, it is structurally absent from any build that does
+# not name it.
+minotari_ledger_wallet_comms = { path = "../comms", version = "6.0.0", features = ["test_transport"] }
+minotari_ledger_wallet_common = { path = "../common" }
+
+ledger-transport = { version = "0.11" }
+log = { version = "0.4" }
+
+# The review screen scenarios (`src/review.rs`, `src/approver.rs`) drive `ledger_get_one_sided_metadata_signature`,
+# whose receiver argument is a `TariAddress`. A path dependency on the root workspace's own crate, kept at the same
+# version as the rest of the repository - the same arrangement as `minotari_ledger_wallet_comms` above.
+#
+# `tari_common` is deliberately *not* declared alongside it. The `Network` the accessor also takes comes out of the
+# address itself (`receiver.network()`), so the type is never named here and the dependency would be unused - and
+# `cargo machete` in `.github/workflows/ci.yml` walks the filesystem rather than the workspace graph, so it reaches
+# this excluded crate and would fail the `ci` job over it.
+tari_common_types = { path = "../../../base_layer/common_types", version = "6.0.0" }
+
+# `dialoguer` is what `HumanApprover` asks its two questions with. It is here rather than a second prompting crate
+# because `minotari_ledger_wallet_comms` already depends on this exact version for `examples/ledger_demo`.
+dialoguer = { version = "0.11" }
+
+# Speculos' control API speaks JSON. Only the reading side needs a parser - the request bodies this sends are four
+# fixed shapes and are written out literally in `speculos_api.rs` - but a screen's text can contain anything the
+# device chose to draw, quotes and backslashes included, so decoding it by hand would be a parser with a bug in it.
+serde_json = { version = "1" }
+
+# The independent key derivation oracle (`src/oracle.rs`). Versions are kept in step with the root workspace so
+# that the oracle hashes bytes the same way the rest of the repository does - `tari_crypto` in particular, whose
+# `DomainSeparatedHasher` the device application carries a byte-for-byte copy of.
+tari_crypto = { version = "0.23.2" }
+tari_utilities = { version = "0.10" }
+blake2 = { version = "0.10" }
+digest = { version = "0.10" }
+zeroize = { version = "1" }
+# BIP-32 has non-hardened steps in the Tari path (`.../0/{index}'/{key_type}`), and those need real secp256k1 point
+# arithmetic - a hardened-only path would need none. BIP-32 and BIP-39 themselves are written out in `oracle.rs`
+# rather than taken from a crate: they are about a hundred lines between them, and an oracle exists to be checked
+# by eye against the specification it claims to implement.
+k256 = { version = "0.13" }
+hmac = { version = "0.12" }
+sha2 = { version = "0.10" }
+
+[dev-dependencies]
+# Only the device-facing integration tests need this, to assert that whatever version string the application
+# reports is a semantic version, without pinning the test to a version that moves every release.
+semver = "1.0"
+

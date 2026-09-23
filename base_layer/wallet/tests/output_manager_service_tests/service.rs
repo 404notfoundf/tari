@@ -21,6 +21,8 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #![allow(clippy::indexing_slicing)]
+// Overflow in test code panics, which is the desired failure mode for a test.
+#![allow(clippy::arithmetic_side_effects)]
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -35,9 +37,9 @@ use minotari_wallet::{
         service::OutputManagerService,
         storage::{
             OutputStatus,
-            database::{OutputManagerBackend, OutputManagerDatabase},
+            database::{OutputBackendQuery, OutputManagerBackend, OutputManagerDatabase},
             models::SpendingPriority,
-            sqlite_db::OutputManagerSqliteDatabase,
+            sqlite_db::{OutputManagerSqliteDatabase, SpentOutputInfoForBatch},
         },
     },
     test_utils::create_consensus_constants,
@@ -50,26 +52,34 @@ use tari_common::configuration::Network;
 use tari_common_types::{
     tari_address::TariAddress,
     transaction::TxId,
-    types::{ComAndPubSignature, CompressedPublicKey, FixedHash, HashOutput},
+    types::{ComAndPubSignature, CompressedPublicKey, FixedHash, HashOutput, PrivateKey},
 };
-use tari_script::{TariScript, inputs, script};
+use tari_crypto::keys::SecretKey as SecretKeyTrait;
+use tari_script::{ExecutionStack, TariScript, inputs, push_pubkey_script, script};
 use tari_service_framework::reply_channel;
 use tari_shutdown::Shutdown;
 use tari_transaction_components::{
+    TransactionBuilder,
+    TransactionBuilderError,
     crypto_factories::CryptoFactories,
-    fee::Fee,
+    fee::{Fee, addressed_output_memo, recipient_output_features_and_scripts_size},
     helpers::borsh::SerializedSize,
     key_manager::{TariKeyId, TransactionKeyManagerInterface},
     tari_amount::{MicroMinotari, T, uT},
-    test_helpers::{TestParams, create_wallet_output_with_data},
+    test_helpers::{TestParams, create_consensus_manager, create_wallet_output_with_data},
+    transaction_builder::PendingOutput,
     transaction_components::{
         MemoField,
         OutputFeatures,
+        RangeProofType,
+        Transaction,
         TransactionOutput,
         WalletOutput,
+        WalletOutputBuilder,
         covenants::Covenant,
         memo_field::TxType,
     },
+    validation::transaction::TransactionInternalConsistencyValidator,
     weight::TransactionWeight,
 };
 use tari_transaction_key_manager::legacy_key_manager::{
@@ -103,6 +113,80 @@ fn output_to_self_features_and_scripts_size_byte_size() -> std::io::Result<usize
             TariScript::default().get_serialized_size()? +
             PAYMENT_ID_SIZE,
     ))
+}
+
+/// The fee `OutputManagerService::fee_estimate` quotes when the wallet is short of funds: one input, no change, and
+/// `num_outputs` recipient outputs each carrying the same `AddressAndData` memo the funded path quotes for.
+///
+/// `Fee::calculate` adds the features-and-scripts term once, so the per-output size is multiplied by the number of
+/// outputs, exactly as the funded selection above it does.
+///
+/// `include_memo` exists so a test can show that the memo is actually being paid for: the quote built without it is
+/// strictly cheaper, and an estimate that stopped counting the memo would collapse the two together.
+fn insufficient_funds_fee_estimate(
+    fee_per_gram: MicroMinotari,
+    num_outputs: usize,
+    include_memo: bool,
+) -> MicroMinotari {
+    let constants = create_consensus_constants(0);
+    let memo = if include_memo {
+        addressed_output_memo(
+            MemoField::default(),
+            TariAddress::default(),
+            MicroMinotari::zero(),
+            TxType::PaymentToOther,
+        )
+        .unwrap()
+    } else {
+        MemoField::default()
+    };
+    let size = recipient_output_features_and_scripts_size(
+        constants.transaction_weight_params(),
+        &OutputFeatures::default(),
+        &TariScript::default(),
+        &Covenant::new(),
+        &memo,
+    )
+    .unwrap();
+    Fee::new(*constants.transaction_weight_params()).calculate(
+        fee_per_gram,
+        1,
+        1,
+        num_outputs,
+        size.saturating_mul(num_outputs),
+    )
+}
+
+/// Asserts that an insufficient-funds fee quote prices the same output shape as the funded path: every output paid
+/// for, memo included. A user who tops up to exactly the quoted amount has to be able to send.
+///
+/// The two inequalities are the load-bearing part - they are anchored in `Fee::calculate`'s own terms rather than in
+/// the estimate being checked, so they still fail if the estimate stops counting the memo or stops counting it once
+/// per output. The final equality only pins the exact number.
+fn assert_insufficient_funds_quote(quoted: MicroMinotari, fee_per_gram: MicroMinotari, num_outputs: usize) {
+    assert!(
+        quoted > insufficient_funds_fee_estimate(fee_per_gram, num_outputs, false),
+        "the insufficient-funds quote must pay for the recipient memo, got {quoted}"
+    );
+    if num_outputs > 1 {
+        // Every extra output costs its own features, script and memo on top of its weight. If the quote charged
+        // the features-and-scripts bytes only once, the gap between it and the single-output quote would be
+        // exactly the weight of the extra outputs and nothing more.
+        let constants = create_consensus_constants(0);
+        let single_output = insufficient_funds_fee_estimate(fee_per_gram, 1, true);
+        let extra_output_weight_only = Fee::new(*constants.transaction_weight_params()).calculate(
+            fee_per_gram,
+            0,
+            0,
+            num_outputs.saturating_sub(1),
+            0,
+        );
+        assert!(
+            quoted > single_output + extra_output_weight_only,
+            "the insufficient-funds quote must pay for all {num_outputs} outputs' features and memos, got {quoted}"
+        );
+    }
+    assert_eq!(quoted, insufficient_funds_fee_estimate(fee_per_gram, num_outputs, true));
 }
 
 struct TestOmsService {
@@ -320,7 +404,56 @@ async fn fee_estimate() {
         )
         .await
         .unwrap();
-    assert_eq!(fee.0, MicroMinotari::from(375));
+    assert_insufficient_funds_quote(fee.0, fee_per_gram, 1);
+}
+
+#[tokio::test]
+async fn prepare_transaction_fails_when_all_commitments_are_excluded() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection.clone());
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    let outputs = [3000u64, 4000]
+        .into_iter()
+        .map(|value| {
+            make_input(
+                &mut rand::rng(),
+                MicroMinotari::from(value),
+                &OutputFeatures::default(),
+                oms.key_manager_handle.key_manager(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for output in &outputs {
+        oms.output_manager_handle
+            .add_output(output.clone(), None)
+            .await
+            .unwrap();
+    }
+    backend
+        .mark_outputs_as_unspent(outputs.iter().map(|output| (output.output_hash(), true)).collect())
+        .unwrap();
+
+    let selection_criteria = UtxoSelectionCriteria {
+        excluding: outputs.iter().map(|output| output.commitment().clone()).collect(),
+        ..Default::default()
+    };
+    let result = oms
+        .output_manager_handle
+        .prepare_transaction_to_send(
+            TxId::new_random(),
+            MicroMinotari::from(100),
+            selection_criteria,
+            OutputFeatures::default(),
+            MicroMinotari::from(1),
+            script!(Nop).unwrap(),
+            Covenant::default(),
+            MemoField::new_empty(),
+        )
+        .await;
+
+    assert!(matches!(result, Err(OutputManagerError::NotEnoughFunds)));
 }
 
 #[allow(clippy::identity_op)]
@@ -406,14 +539,14 @@ async fn test_utxo_selection_no_chain_metadata() {
         .fee_estimate(spendable_amount, UtxoSelectionCriteria::default(), fee_per_gram, 1, 2)
         .await
         .unwrap();
-    assert_eq!(fee.0, MicroMinotari::from(256));
+    assert_insufficient_funds_quote(fee.0, fee_per_gram, 2);
 
     let broke_amount = spendable_amount + MicroMinotari::from(2000);
     let fee = oms
         .fee_estimate(broke_amount, UtxoSelectionCriteria::default(), fee_per_gram, 1, 2)
         .await
         .unwrap();
-    assert_eq!(fee.0, MicroMinotari::from(256));
+    assert_insufficient_funds_quote(fee.0, fee_per_gram, 2);
 
     // coin split uses the "Largest" selection strategy
     let (_, tx, utxos_total_value) = oms.create_coin_split(vec![], amount, 5, fee_per_gram).await.unwrap();
@@ -510,7 +643,7 @@ async fn test_utxo_selection_with_chain_metadata() {
         .fee_estimate(spendable_amount, UtxoSelectionCriteria::default(), fee_per_gram, 1, 2)
         .await
         .unwrap();
-    assert_eq!(fee.0, MicroMinotari::from(256));
+    assert_insufficient_funds_quote(fee.0, fee_per_gram, 2);
 
     // test coin split is maturity aware
     let (_, tx, utxos_total_value) = oms.create_coin_split(vec![], amount, 5, fee_per_gram).await.unwrap();
@@ -2204,5 +2337,575 @@ async fn recovered_output_key_not_in_keychain() {
     assert!(
         matches!(result.as_deref(), Ok([])),
         "It should not reach an error condition or return an output"
+    );
+}
+
+/// Builds and finalizes the transaction shape shared by the wallet's "spend the whole input to a single recipient"
+/// paths: one input, one recipient output holding the whole input minus an up-front fee estimate, and no change
+/// output. Returns the fee the transaction builder actually charged.
+///
+/// With no change output there is nothing to absorb a bad estimate: if `amount` leaves less than the builder
+/// charges, the build fails outright.
+async fn build_whole_input_spend(
+    key_manager: &MemoryKeyManager,
+    input: WalletOutput,
+    fee_per_gram: MicroMinotari,
+    output_features: OutputFeatures,
+    amount: MicroMinotari,
+    output_memo: MemoField,
+) -> Result<MicroMinotari, TransactionBuilderError> {
+    let mut builder =
+        TransactionBuilder::new(create_consensus_constants(0), key_manager.clone(), Network::LocalNet).unwrap();
+    builder
+        .with_lock_height(0)
+        .with_fee_per_gram(fee_per_gram)
+        .with_prevent_fee_gt_amount(false)
+        .with_input(input)
+        .unwrap();
+
+    let recipient_address = random_dual_address();
+    // The whole input goes to one output, so declare it - with its real weight - before the keys are reserved: the
+    // reservation is what decides the fee and whether there is change, and that decision is binding.
+    let constants = create_consensus_constants(0);
+    let output_size = recipient_output_features_and_scripts_size(
+        constants.transaction_weight_params(),
+        &output_features,
+        &script!(PushPubKey(Box::default())).unwrap(),
+        &Covenant::default(),
+        &output_memo,
+    )?;
+    let sender_offset = builder
+        .reserve_sender_offset_keys(&[PendingOutput::new(amount, output_size)])?
+        .pop()
+        .unwrap();
+    let encryption_key = key_manager.get_random_key(None, None).unwrap();
+    let (commitment_mask, _script_key) = key_manager.get_next_commitment_mask_and_script_key().unwrap();
+    let script = push_pubkey_script(
+        &key_manager
+            .stealth_address_script_spending_key(&commitment_mask.key_id, recipient_address.public_spend_key())
+            .unwrap(),
+    );
+    let output = WalletOutputBuilder::new(amount, commitment_mask.key_id)
+        .with_features(output_features)
+        .with_script(script)
+        .encrypt_data_for_recovery(key_manager, Some(&encryption_key.key_id), output_memo)
+        .unwrap()
+        .with_input_data(ExecutionStack::default())
+        .with_sender_offset_public_key(sender_offset.pub_key.clone())
+        .with_script_key(TariKeyId::Zero)
+        .with_minimum_value_promise(MicroMinotari::zero())
+        .sign_metadata_signature_user_verified(key_manager, &sender_offset.key_id, &recipient_address)
+        .unwrap()
+        .try_build(key_manager)
+        .unwrap();
+    builder
+        .add_recipient(
+            recipient_address,
+            output,
+            sender_offset.key_id,
+            Some(encryption_key.key_id),
+        )
+        .unwrap();
+
+    builder.build().map(|finalized| finalized.fee)
+}
+
+fn random_dual_address() -> TariAddress {
+    let view_key = CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng()));
+    let spend_key = CompressedPublicKey::from_secret_key(&PrivateKey::random(&mut rand::rng()));
+    TariAddress::new_dual_address_with_default_features(view_key, spend_key, Network::LocalNet).unwrap()
+}
+
+/// The production estimate under test: every whole-input spend path routes its recipient output through
+/// `recipient_output_features_and_scripts_size`. Deliberately no arithmetic here - re-deriving the size in the
+/// test file is what let the original bug through, since the test would then agree with itself.
+fn production_estimate(
+    output_features: &OutputFeatures,
+    memo: &MemoField,
+    fee_per_gram: MicroMinotari,
+) -> MicroMinotari {
+    let constants = create_consensus_constants(0);
+    let size = recipient_output_features_and_scripts_size(
+        constants.transaction_weight_params(),
+        output_features,
+        &script!(PushPubKey(Box::default())).unwrap(),
+        &Covenant::default(),
+        memo,
+    )
+    .unwrap();
+    Fee::new(*constants.transaction_weight_params()).calculate(fee_per_gram, 1, 1, 1, size)
+}
+
+async fn spendable_input(key_manager: &MemoryKeyManager, value: MicroMinotari) -> WalletOutput {
+    make_input(
+        &mut rand::rng(),
+        value,
+        &OutputFeatures::default(),
+        key_manager.key_manager(),
+    )
+}
+
+/// Drives the production fee estimate for a whole-input spend against a real `TransactionBuilder`:
+/// - the estimate for `memo` must be exactly the fee the builder charges, and
+/// - an estimate made for an empty memo must be too small to build at all.
+///
+/// The second half is what makes the first half meaningful: it fails if the estimate ever stops counting the memo.
+async fn assert_estimate_matches_and_memo_is_load_bearing(
+    key_manager: &MemoryKeyManager,
+    value: MicroMinotari,
+    fee_per_gram: MicroMinotari,
+    output_features: OutputFeatures,
+    memo: MemoField,
+) {
+    let expected_fee = production_estimate(&output_features, &memo, fee_per_gram);
+    let fee = build_whole_input_spend(
+        key_manager,
+        spendable_input(key_manager, value).await,
+        fee_per_gram,
+        output_features.clone(),
+        value - expected_fee,
+        memo.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fee, expected_fee,
+        "the production estimate must be exactly what the transaction builder charges"
+    );
+
+    // Dropping the memo from the estimate is not a rounding nit: the transaction cannot be balanced at all.
+    let short_fee = production_estimate(&output_features, &MemoField::default(), fee_per_gram);
+    assert!(
+        short_fee < expected_fee,
+        "the estimate must count the memo bytes, {short_fee} vs {expected_fee}"
+    );
+    let err = build_whole_input_spend(
+        key_manager,
+        spendable_input(key_manager, value).await,
+        fee_per_gram,
+        output_features,
+        value - short_fee,
+        memo,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, TransactionBuilderError::SpendingMoreThanAvailable { .. }),
+        "expected the build to fail outright, got {err:?}"
+    );
+}
+
+/// Covers `OutputManagerService::encumber_aggregate_utxo`, whose recipient output carries the caller supplied
+/// payment id (`--payment-id`) in its encrypted data.
+///
+/// The path itself cannot be driven from a unit test - it derives the pre-mine script key from a
+/// `TariKeyId::LedgerKey` and needs a Ledger device - so this exercises the estimate the path now calls,
+/// `recipient_output_features_and_scripts_size`, against a real transaction of the same shape.
+#[tokio::test]
+async fn encumber_aggregate_utxo_fee_estimate_counts_the_output_memo() {
+    let key_manager = create_new_random_key_manager().await.unwrap();
+    let payment_id = MemoField::new_open(vec![7u8; 64], TxType::PaymentToOther).unwrap();
+    let output_features = OutputFeatures {
+        maturity: 5,
+        range_proof_type: RangeProofType::BulletProofPlus,
+        ..Default::default()
+    };
+    assert_estimate_matches_and_memo_is_load_bearing(
+        &key_manager,
+        MicroMinotari::from(2_000_000),
+        MicroMinotari::from(7),
+        output_features,
+        payment_id,
+    )
+    .await;
+}
+
+/// Covers `OutputManagerService::spend_backup_pre_mine_utxo`, whose recipient output memo is the caller's payment
+/// id with the wallet's address attached - an `AddressAndData` memo padded to a 130 byte minimum, so omitting it
+/// from the estimate is short by several grams.
+///
+/// The memo cannot be built before the fee is known because it carries the fee, so the service measures a copy
+/// built with a zero fee. This exercises both production pieces: `addressed_output_memo` (the constructor used for
+/// the measured copy and for the real output) and the estimate that consumes it. Like the aggregate path, the real
+/// path needs a Ledger device, so the transaction shape is reproduced here.
+#[tokio::test]
+async fn spend_backup_pre_mine_utxo_fee_estimate_counts_the_output_memo() {
+    let key_manager = create_new_random_key_manager().await.unwrap();
+    let value = MicroMinotari::from(2_000_000);
+    let fee_per_gram = MicroMinotari::from(7);
+    let wallet_address = random_dual_address();
+    // `OutputManagerRequest::SpendBackupPreMineUtxo` builds this from the hash of the output being spent. (The
+    // pre-mine index that picks the script key is a different memo, the one decrypted from the input.)
+    let payment_id = MemoField::new_open(vec![9u8; 32], TxType::PaymentToOther).unwrap();
+    let output_features = OutputFeatures {
+        maturity: 0,
+        range_proof_type: RangeProofType::BulletProofPlus,
+        ..Default::default()
+    };
+
+    let measured_memo = addressed_output_memo(
+        payment_id.clone(),
+        wallet_address.clone(),
+        MicroMinotari::zero(),
+        TxType::PaymentToOther,
+    )
+    .unwrap();
+    let expected_fee = production_estimate(&output_features, &measured_memo, fee_per_gram);
+    let real_memo = addressed_output_memo(payment_id, wallet_address, expected_fee, TxType::PaymentToOther).unwrap();
+    assert_eq!(
+        measured_memo.get_size(),
+        real_memo.get_size(),
+        "the fee is a fixed width field, so measuring the memo with a zero fee must be safe"
+    );
+
+    assert_estimate_matches_and_memo_is_load_bearing(&key_manager, value, fee_per_gram, output_features, real_memo)
+        .await;
+}
+
+/// Covers the `PrepareWithdrawMultisigTransaction` estimate in the transaction service, which spends a whole
+/// multisig input to a single recipient with no change output. Its output memo is the recipient address attached
+/// to an empty payment id, again padded to the 130 byte `AddressAndData` minimum.
+///
+/// The path needs collected multisig signatures over a real UTXO, so as above this exercises the production
+/// estimate and memo constructor it uses against a real transaction of the same shape.
+/// `MultisigSession::spend_multisig_utxo` builds a bit-for-bit identical estimate; it is driven end to end by
+/// `multisig::session::test::spend_multisig_utxo_fee_estimate_counts_the_output_memo`.
+#[tokio::test]
+async fn multisig_withdraw_fee_estimate_counts_the_output_memo() {
+    let key_manager = create_new_random_key_manager().await.unwrap();
+    let fee_per_gram = MicroMinotari::from(1);
+    let recipient_address = random_dual_address();
+    let output_features = OutputFeatures::default();
+
+    let measured_memo = addressed_output_memo(
+        MemoField::default(),
+        recipient_address.clone(),
+        MicroMinotari::zero(),
+        TxType::PaymentToOther,
+    )
+    .unwrap();
+    let expected_fee = production_estimate(&output_features, &measured_memo, fee_per_gram);
+    let real_memo = addressed_output_memo(
+        MemoField::default(),
+        recipient_address,
+        expected_fee,
+        TxType::PaymentToOther,
+    )
+    .unwrap();
+    assert_eq!(measured_memo.get_size(), real_memo.get_size());
+
+    assert_estimate_matches_and_memo_is_load_bearing(
+        &key_manager,
+        MicroMinotari::from(2_000_000),
+        fee_per_gram,
+        output_features,
+        real_memo,
+    )
+    .await;
+}
+
+/// Assert that a transaction is internally consistent, which includes checking that
+/// `sum(input script keys) - sum(output sender offset keys)` equals the published script offset.
+///
+/// Every one of these flows now takes its sender offset keys from a single `get_script_offset` call, so the offset
+/// balancing is the property that would break if the key count or the change decision were ever off by one.
+fn assert_validates(tx: &Transaction) {
+    let validator =
+        TransactionInternalConsistencyValidator::new(false, create_consensus_manager(), CryptoFactories::default());
+    validator
+        .validate(tx, None, None, u64::MAX)
+        .expect("the transaction, and therefore its script offset, must be valid");
+}
+
+/// An input whose script actually runs: `make_input`'s `TariScript::default()` is a `PushPubKey` of the default
+/// public key, which leaves two items on the stack and so cannot be verified at all.
+async fn oms_with_spendable_input(value: MicroMinotari) -> (TestOmsService, tempfile::TempDir, WalletOutput) {
+    let (connection, tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+    let uo = spendable_test_input(&mut oms, &backend, value).await;
+    (oms, tempdir, uo)
+}
+
+async fn spendable_test_input(
+    oms: &mut TestOmsService,
+    backend: &OutputManagerSqliteDatabase,
+    value: MicroMinotari,
+) -> WalletOutput {
+    let uo = make_input_with_features(
+        &mut rand::rng(),
+        value,
+        OutputFeatures::default(),
+        oms.key_manager_handle.key_manager(),
+    );
+    oms.output_manager_handle.add_output(uo.clone(), None).await.unwrap();
+    backend.mark_outputs_as_unspent(vec![(uo.output_hash(), true)]).unwrap();
+    uo
+}
+
+/// An even coin split puts the indivisible remainder on the last output, so the outputs are not all the same size.
+/// All of them still take their sender offset keys from the one reservation, so the offset has to balance.
+#[tokio::test]
+async fn coin_split_even_builds_a_valid_transaction() {
+    // A value that does not divide evenly by the split count, so the last output absorbs the remainder.
+    let (mut oms, _tempdir, uo) = oms_with_spendable_input(MicroMinotari::from(20_000_007)).await;
+
+    let split_count = 5;
+    let (_tx_id, tx, _amount) = oms
+        .output_manager_handle
+        .create_coin_split_even(vec![uo.commitment().clone()], split_count, MicroMinotari::from(1))
+        .await
+        .unwrap();
+
+    assert_eq!(tx.body.inputs().len(), 1);
+    assert_eq!(tx.body.outputs().len(), split_count);
+    assert_validates(&tx);
+}
+
+/// An uneven split takes a fixed amount per output and leaves the rest as change, so this exercises the case where
+/// the reservation has to draw one more key than the transaction has recipient outputs.
+#[tokio::test]
+async fn coin_split_builds_a_valid_transaction_with_change() {
+    let (mut oms, _tempdir, _uo) = oms_with_spendable_input(MicroMinotari::from(20_000_000)).await;
+
+    let split_count = 4;
+    let (_tx_id, tx, _amount) = oms
+        .output_manager_handle
+        .create_coin_split(
+            vec![],
+            MicroMinotari::from(1_000_000),
+            split_count,
+            MicroMinotari::from(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tx.body.inputs().len(), 1);
+    assert_eq!(
+        tx.body.outputs().len(),
+        split_count + 1,
+        "the leftover should have become a change output"
+    );
+    assert_validates(&tx);
+}
+
+#[tokio::test]
+async fn coin_join_builds_a_valid_transaction() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+    let mut commitments = Vec::new();
+    for _ in 0..3 {
+        let uo = spendable_test_input(&mut oms, &backend, MicroMinotari::from(5_000_000)).await;
+        commitments.push(uo.commitment().clone());
+    }
+
+    let (_tx_id, tx, _amount) = oms
+        .output_manager_handle
+        .create_coin_join(commitments, MicroMinotari::from(1), MemoField::new_empty())
+        .await
+        .unwrap();
+
+    assert_eq!(tx.body.inputs().len(), 3);
+    assert_eq!(tx.body.outputs().len(), 1, "a join spends everything into one output");
+    assert_validates(&tx);
+}
+
+#[tokio::test]
+async fn pay_to_self_builds_a_valid_transaction() {
+    let (mut oms, _tempdir, _uo) = oms_with_spendable_input(MicroMinotari::from(20_000_000)).await;
+
+    let (_fee, tx, _tx_id) = oms
+        .output_manager_handle
+        .create_pay_to_self_transaction(
+            MicroMinotari::from(1_000_000),
+            UtxoSelectionCriteria::default(),
+            OutputFeatures::default(),
+            MicroMinotari::from(1),
+            None,
+            MemoField::new_empty(),
+            MicroMinotari::zero(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tx.body.inputs().len(), 1);
+    assert_eq!(tx.body.outputs().len(), 2, "the payment plus change");
+    assert_validates(&tx);
+}
+
+/// Regression test for a bug where `OutputManagerRequest::GetOutputsByQuery` was handled by wrapping the query
+/// result in a status-specific `OutputManagerResponse` variant (originally `SpentOutputs`, then a status-mismatched
+/// `UnspentOutputs`) instead of the generic `OutputManagerResponse::Outputs(outputs)` variant. Since
+/// `GetOutputsByQuery` can return outputs of ANY status depending on the query filter, wrapping it in a
+/// status-specific variant caused `OutputManagerHandle::get_outputs_by_query` (which matches on `Outputs`) to fail
+/// with `OutputManagerError::UnexpectedApiResponse` whenever the actual response variant didn't match. This broke
+/// the multisig withdrawal path (`GetMultisigUtxoData`, `PrepareWithdrawMultisigTransaction`, `SendMultisigUtxo`)
+/// which all call `get_outputs_by_query` internally. See also
+/// `get_outputs_by_query_returns_matching_spent_output` and
+/// `get_outputs_by_query_returns_empty_for_non_matching_status` below for the negative-path cases this test alone would
+/// not have caught.
+#[tokio::test]
+async fn get_outputs_by_query_returns_matching_unspent_output() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    // Add a real unspent output to the OMS.
+    let uo = spendable_test_input(&mut oms, &backend, MicroMinotari::from(5_000_000)).await;
+    let commitment = uo.commitment().clone();
+
+    let mut query = OutputBackendQuery {
+        status: vec![OutputStatus::Unspent],
+        ..Default::default()
+    };
+    query.commitments.push(commitment.clone());
+
+    let result = oms
+        .output_manager_handle
+        .get_outputs_by_query(query)
+        .await
+        .expect("get_outputs_by_query should succeed for a query matching an existing unspent output");
+
+    assert_eq!(result.len(), 1, "expected exactly one output matching the query");
+    assert_eq!(result[0].commitment, commitment);
+    assert_eq!(result[0].hash, uo.output_hash());
+    assert_eq!(result[0].status, OutputStatus::Unspent);
+}
+
+/// Companion regression test to `get_outputs_by_query_returns_matching_unspent_output`, covering the reviewer's
+/// point directly: "Your test passes because you only specified unspent." `GetOutputsByQuery` can return outputs
+/// of ANY status depending on the query filter, so it must not be wrapped in a status-specific response variant.
+/// This test builds a real SPENT output and queries for it with `OutputStatus::Spent`. Together with the unspent
+/// test above, it guards against a future regression where either the service (`service.rs`) or the handle
+/// (`handle.rs`) side of `GetOutputsByQuery` reverts to wrapping/matching a status-specific variant
+/// (`SpentOutputs`/`UnspentOutputs`) instead of the generic `Outputs` variant: if only one side is changed back,
+/// every call - including the unspent test above - fails with `OutputManagerError::UnexpectedApiResponse`
+/// (verified locally by temporarily reverting only the `handle.rs` match arm).
+#[tokio::test]
+async fn get_outputs_by_query_returns_matching_spent_output() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    // Add a real output to the OMS and then mark it as spent directly in the backend.
+    let uo = spendable_test_input(&mut oms, &backend, MicroMinotari::from(5_000_000)).await;
+    let commitment = uo.commitment().clone();
+
+    backend
+        .mark_outputs_as_spent(vec![SpentOutputInfoForBatch {
+            commitment: commitment.clone(),
+            confirmed: true,
+            mark_deleted_at_height: 1,
+            mark_deleted_in_block: FixedHash::zero(),
+        }])
+        .unwrap();
+
+    let mut query = OutputBackendQuery {
+        status: vec![OutputStatus::Spent],
+        ..Default::default()
+    };
+    query.commitments.push(commitment.clone());
+
+    let result = oms
+        .output_manager_handle
+        .get_outputs_by_query(query)
+        .await
+        .expect("get_outputs_by_query should succeed for a query matching an existing spent output");
+
+    assert_eq!(result.len(), 1, "expected exactly one output matching the query");
+    assert_eq!(result[0].commitment, commitment);
+    assert_eq!(result[0].hash, uo.output_hash());
+    assert_eq!(result[0].status, OutputStatus::Spent);
+}
+
+/// Guards against the enum-variant mismatch masking a genuine "no results" case as an error: querying for a
+/// SPENT output using a non-matching `OutputStatus::Unspent` filter must return an empty result, not an error.
+#[tokio::test]
+async fn get_outputs_by_query_returns_empty_for_non_matching_status() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    let uo = spendable_test_input(&mut oms, &backend, MicroMinotari::from(5_000_000)).await;
+    let commitment = uo.commitment().clone();
+
+    backend
+        .mark_outputs_as_spent(vec![SpentOutputInfoForBatch {
+            commitment: commitment.clone(),
+            confirmed: true,
+            mark_deleted_at_height: 1,
+            mark_deleted_in_block: FixedHash::zero(),
+        }])
+        .unwrap();
+
+    // The output is now Spent, but we query for Unspent with the exact commitment - this should return an empty
+    // Vec, not an error.
+    let mut query = OutputBackendQuery {
+        status: vec![OutputStatus::Unspent],
+        ..Default::default()
+    };
+    query.commitments.push(commitment.clone());
+
+    let result = oms
+        .output_manager_handle
+        .get_outputs_by_query(query)
+        .await
+        .expect("get_outputs_by_query should succeed (with an empty result) for a non-matching status filter");
+
+    assert!(
+        result.is_empty(),
+        "expected no outputs to match a status filter that doesn't match the output's actual status"
+    );
+}
+
+/// Regression test for the vulnerability flagged by `greptile-apps[bot]` on PR #8028:
+/// `OutputBackendQuery::default()` seeds `status: vec![OutputStatus::Spent]`, so a caller that does
+/// `query.status.push(OutputStatus::Unspent)` ends up with `status == [Spent, Unspent]` and unintentionally
+/// matches outputs of EITHER status, not just `Unspent`. Combined with `GetOutputsByQuery` now actually
+/// succeeding (see `get_outputs_by_query_returns_matching_unspent_output` above), this meant a
+/// caller-supplied commitment for an ALREADY-SPENT output could be selected via `.first()` in the multisig
+/// withdrawal handlers (`PrepareWithdrawMultisigTransaction`, `GetMultisigUtxoData`, `SendMultisigUtxo`) and
+/// used to build/sign/submit a transaction that spends an already-spent multisig UTXO. The fix is for those
+/// callers to *replace* the default status list (`query.status = vec![OutputStatus::Unspent]`) instead of
+/// pushing onto it. This test builds a real output, marks it `Spent`, then queries for it using that same
+/// fixed (replace, not push) pattern with the exact matching commitment, and asserts the result is EMPTY -
+/// the spent output must NOT be returned when filtering for `Unspent` only.
+#[tokio::test]
+async fn get_outputs_by_query_excludes_spent_output_when_filtering_unspent_only() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection);
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    // Add a real output to the OMS and then mark it as spent directly in the backend.
+    let uo = spendable_test_input(&mut oms, &backend, MicroMinotari::from(5_000_000)).await;
+    let commitment = uo.commitment().clone();
+
+    backend
+        .mark_outputs_as_spent(vec![SpentOutputInfoForBatch {
+            commitment: commitment.clone(),
+            confirmed: true,
+            mark_deleted_at_height: 1,
+            mark_deleted_in_block: FixedHash::zero(),
+        }])
+        .unwrap();
+
+    // Build the query exactly the way the (fixed) multisig callers do: start from the `Spent`-seeded
+    // default, then *replace* (not push onto) the status list with `Unspent` before filtering by the
+    // exact matching commitment of the now-spent output.
+    let mut query = OutputBackendQuery::default();
+    query.commitments.push(commitment.clone());
+    query.status = vec![OutputStatus::Unspent];
+
+    let result = oms
+        .output_manager_handle
+        .get_outputs_by_query(query)
+        .await
+        .expect("get_outputs_by_query should succeed (with an empty result) when filtering for Unspent only");
+
+    assert!(
+        result.is_empty(),
+        "a Spent output must not be returned by a caller filtering for OutputStatus::Unspent only - this is the exact \
+         multisig double-spend vulnerability greptile-apps flagged on PR #8028"
     );
 }

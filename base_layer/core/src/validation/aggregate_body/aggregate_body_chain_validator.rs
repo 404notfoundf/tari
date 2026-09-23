@@ -68,18 +68,25 @@ impl AggregateBodyChainLinkedValidator {
         Self { consensus_manager }
     }
 
+    /// Validate a body (block or transaction) against the current chain state.
+    ///
+    /// The body's inputs are expected to already be hydrated, i.e. each input carries the full data of the output it
+    /// spends rather than just a reference to it. Block sync hydrates compact inputs in
+    /// [`BlockBodyFullValidator::validate_body`](crate::validation::block_body::BlockBodyFullValidator) before calling
+    /// this, and propagated blocks are hydrated on receipt, so no cloning of the body is required here. Passing a body
+    /// with compact (un-hydrated) inputs is a programming error and will be rejected during input validation.
     pub fn validate<B: BlockchainBackend>(
         &self,
         body: &AggregateBody,
         header: &BlockHeader,
         db: &B,
-    ) -> Result<AggregateBody, ValidationError> {
+    ) -> Result<(), ValidationError> {
         let constants = self.consensus_manager.consensus_constants(header.height);
 
         self.validate_consensus(body, db)?;
-        let body = self.validate_body(body, db, constants, header)?;
+        self.validate_body(body, db, constants, header)?;
 
-        Ok(body)
+        Ok(())
     }
 
     fn validate_consensus<B: BlockchainBackend>(&self, body: &AggregateBody, db: &B) -> Result<(), ValidationError> {
@@ -88,68 +95,69 @@ impl AggregateBodyChainLinkedValidator {
         Ok(())
     }
 
+    /// Validate the body against the chain state. See [`Self::validate`] for the input-hydration contract.
     pub fn validate_body<B: BlockchainBackend>(
         &self,
         body: &AggregateBody,
         db: &B,
         constants: &ConsensusConstants,
         header: &BlockHeader,
-    ) -> Result<AggregateBody, ValidationError> {
-        // inputs may be "slim", only containing references to outputs
-        // so we need to resolve those references, creating a new body in the process
-        let inputs = validate_input_not_pruned(body, db)?;
-        // UNCHECKED: sorting has been checked by the AggregateBodyInternalConsistencyValidator
-        let body = AggregateBody::new_sorted_unchecked(inputs, body.outputs().to_vec(), body.kernels().to_vec());
+    ) -> Result<(), ValidationError> {
+        validate_input_maturity(body, header.height)?;
+        check_inputs_are_spendable(db, constants, header.height, body)?;
+        check_outputs(db, constants, body, header.height)?;
+        verify_no_duplicated_inputs_outputs(body)?;
+        verify_no_duplicate_validator_node_registrations(body)?;
+        check_total_burned(body)?;
+        verify_timelocks(body, header.height)?;
 
-        validate_input_maturity(&body, header.height)?;
-        check_inputs_are_spendable(db, constants, header.height, &body)?;
-        check_outputs(db, constants, &body, header.height)?;
-        verify_no_duplicated_inputs_outputs(&body)?;
-        verify_no_duplicate_validator_node_registrations(&body)?;
-        check_total_burned(&body)?;
-        verify_timelocks(&body, header.height)?;
-
-        Ok(body)
+        Ok(())
     }
 }
 
-fn validate_input_not_pruned<B: BlockchainBackend>(
-    body: &AggregateBody,
-    db: &B,
-) -> Result<Vec<TransactionInput>, ValidationError> {
-    let mut inputs: Vec<TransactionInput> = body.inputs().clone();
-    for input in &mut inputs {
-        if input.is_compact() {
-            let input_output_hash = input.output_hash();
-            // TODO: we clone the block body 3 times in validation and the inputs 1 more time here. We also discard
-            //      the hydrated block in all cases expect block sync. This is unnecessarily slow and wasteful.
-            //      SIMPLE REFACTOR: populate/hydrate the block inputs (which is owned, no cloning necessary) before
-            //      performing validation. If hydration fails with UnknownInput, the block is invalid.
-            let output = match db.fetch_output(&input_output_hash) {
-                Ok(val) => match val {
-                    Some(output_mined_info) => output_mined_info.output,
-                    None => {
-                        // Input is found in this block
-                        if let Some(found) = body.outputs().iter().find(|o| o.hash() == input_output_hash) {
-                            found.clone()
-                        } else {
-                            debug!(
-                                target: LOG_TARGET,
-                                "Input not found in database or block, commitment: {}, hash: {}",
-                                input.commitment()?.to_hex(), input_output_hash,
-                            );
-                            return Err(ValidationError::UnknownInput);
-                        }
-                    },
-                },
-                Err(e) => return Err(ValidationError::from(e)),
-            };
-
-            input.add_output_data(output);
+/// Hydrate any compact inputs in `body` in place by resolving the referenced output.
+///
+/// A compact ("slim") input only references the output it spends by hash. This resolves that reference against the
+/// database first, and failing that against the body's own outputs (for an output that is created and spent within
+/// the same block), and populates the input with the full output data. The inputs are mutated in place, so the body
+/// itself, its outputs and its kernels are never cloned; only an output created and spent in the same block is
+/// cloned, since the block must keep its own copy of it.
+///
+/// Returns [`ValidationError::UnknownInput`] if a referenced output cannot be found, meaning the block/transaction is
+/// invalid.
+pub fn hydrate_compact_inputs<B: BlockchainBackend>(body: &mut AggregateBody, db: &B) -> Result<(), ValidationError> {
+    let (inputs, outputs) = body.inputs_mut_with_outputs();
+    for input in inputs.iter_mut() {
+        if !input.is_compact() {
+            continue;
         }
+        let input_output_hash = input.output_hash();
+        let output = match db.fetch_outputs(&input_output_hash) {
+            Ok(val) => match val.into_iter().next() {
+                Some(output_mined_info) => output_mined_info.output,
+                None => {
+                    // Input is found in this block
+                    if let Some(found) = outputs.iter().find(|o| o.hash() == input_output_hash) {
+                        found.clone()
+                    } else {
+                        // Only the output hash is available here: this input is compact, so every other
+                        // accessor (including `commitment()`) would fail with `CompactInputMissingData`.
+                        debug!(
+                            target: LOG_TARGET,
+                            "Input not found in database or block, hash: {}",
+                            input_output_hash,
+                        );
+                        return Err(ValidationError::UnknownInput);
+                    }
+                },
+            },
+            Err(e) => return Err(ValidationError::from(e)),
+        };
+
+        input.add_output_data(output);
     }
 
-    Ok(inputs)
+    Ok(())
 }
 
 pub fn validate_input_maturity(body: &AggregateBody, height: u64) -> Result<(), ValidationError> {
@@ -293,15 +301,27 @@ pub fn check_outputs<B: BlockchainBackend>(
 }
 
 /// This function checks the body contains no duplicated inputs or outputs.
+///
+/// Inputs and outputs are deduplicated by their (canonical) output hash in a single linear pass. This does not rely on
+/// the body being sorted: the `sorted` flag is `#[borsh(skip)]` and so is always false for a body deserialized from the
+/// wire or database, which is exactly the block-sync and propagation case. Two inputs spending the same output are a
+/// duplicate regardless of their signatures; the stricter `TransactionInput` equality (which also compares the
+/// signature and script input data) is enforced by the sorted-and-unique consensus check.
 pub fn verify_no_duplicated_inputs_outputs(body: &AggregateBody) -> Result<(), ValidationError> {
-    if body.contains_duplicated_inputs() {
+    let mut seen_inputs = HashSet::with_capacity(body.inputs().len());
+    if !body
+        .inputs()
+        .iter()
+        .all(|input| seen_inputs.insert(input.output_hash()))
+    {
         warn!(
             target: LOG_TARGET,
             "AggregateBody validation failed due to double input"
         );
         return Err(ValidationError::UnsortedOrDuplicateInput);
     }
-    if body.contains_duplicated_outputs() {
+    let mut seen_outputs = HashSet::with_capacity(body.outputs().len());
+    if !body.outputs().iter().all(|output| seen_outputs.insert(output.hash())) {
         warn!(
             target: LOG_TARGET,
             "AggregateBody validation failed due to double output"
@@ -500,7 +520,7 @@ mod test {
             // A non-registration output should be ignored.
             TransactionOutput::default(),
         ];
-        let body = AggregateBody::new(vec![], outputs, vec![]);
+        let body = AggregateBody::new_unsorted(vec![], outputs, vec![]);
         assert!(verify_no_duplicate_validator_node_registrations(&body).is_ok());
     }
 
@@ -510,7 +530,7 @@ mod test {
         // chain-state check individually but they collide when applied to the validator node set.
         let vn_secret_key = PrivateKey::random(&mut rand::rng());
         let outputs = vec![registration_output(&vn_secret_key), registration_output(&vn_secret_key)];
-        let body = AggregateBody::new(vec![], outputs, vec![]);
+        let body = AggregateBody::new_unsorted(vec![], outputs, vec![]);
         let err = verify_no_duplicate_validator_node_registrations(&body).unwrap_err();
         assert!(matches!(
             err,
@@ -534,14 +554,14 @@ mod test {
     #[test]
     fn it_allows_a_single_burn_commitment_not_in_the_db() {
         let db = TempDatabase::new();
-        let body = AggregateBody::new(vec![], vec![], vec![burn_kernel(random_commitment())]);
+        let body = AggregateBody::new_unsorted(vec![], vec![], vec![burn_kernel(random_commitment())]);
         assert!(validate_burn_commitment_not_in_db(&body, &db).is_ok());
     }
 
     #[test]
     fn it_allows_distinct_burn_commitments_in_one_block() {
         let db = TempDatabase::new();
-        let body = AggregateBody::new(vec![], vec![], vec![
+        let body = AggregateBody::new_unsorted(vec![], vec![], vec![
             burn_kernel(random_commitment()),
             burn_kernel(random_commitment()),
         ]);
@@ -552,11 +572,104 @@ mod test {
     fn it_rejects_two_burns_with_the_same_commitment_in_one_block() {
         let db = TempDatabase::new();
         let commitment = random_commitment();
-        let body = AggregateBody::new(vec![], vec![], vec![
+        let body = AggregateBody::new_unsorted(vec![], vec![], vec![
             burn_kernel(commitment.clone()),
             burn_kernel(commitment),
         ]);
         let err = validate_burn_commitment_not_in_db(&body, &db).unwrap_err();
         assert!(matches!(err, ValidationError::InvalidBurnError(_)));
+    }
+
+    mod duplicated_inputs_outputs {
+        use tari_script::{ExecutionStack, StackItem, script};
+
+        use super::*;
+
+        fn output_with(commitment: CompressedCommitment, script: tari_script::TariScript) -> TransactionOutput {
+            TransactionOutput {
+                commitment,
+                script,
+                ..Default::default()
+            }
+        }
+
+        fn input_spending(output: &TransactionOutput, input_data: ExecutionStack) -> TransactionInput {
+            TransactionInput::new_current_version(
+                SpentOutput::create_from_output(output.clone()),
+                input_data,
+                Default::default(),
+            )
+        }
+
+        #[test]
+        fn it_allows_distinct_inputs_and_outputs() {
+            let outputs = vec![
+                output_with(random_commitment(), script!(Nop).unwrap()),
+                output_with(random_commitment(), script!(Nop).unwrap()),
+            ];
+            let inputs = outputs
+                .iter()
+                .map(|o| input_spending(o, ExecutionStack::default()))
+                .collect();
+            let body = AggregateBody::new_unsorted(inputs, outputs, vec![]);
+            verify_no_duplicated_inputs_outputs(&body).unwrap();
+        }
+
+        #[test]
+        fn it_rejects_two_identical_outputs() {
+            let output = output_with(random_commitment(), script!(Nop).unwrap());
+            let body = AggregateBody::new_unsorted(vec![], vec![output.clone(), output], vec![]);
+            let err = verify_no_duplicated_inputs_outputs(&body).unwrap_err();
+            assert!(matches!(err, ValidationError::UnsortedOrDuplicateOutput));
+        }
+
+        #[test]
+        fn it_rejects_duplicates_in_an_unsorted_body() {
+            // The `sorted` flag is `#[borsh(skip)]`, so a body off the wire always arrives with `sorted == false`.
+            // The check must not depend on it, and must not depend on the duplicates being adjacent either.
+            let commitment = random_commitment();
+            let duplicated = output_with(commitment, script!(Nop).unwrap());
+            let mut outputs = vec![
+                duplicated.clone(),
+                output_with(random_commitment(), script!(Nop).unwrap()),
+                output_with(random_commitment(), script!(Nop).unwrap()),
+                duplicated,
+            ];
+            outputs.reverse();
+            let body = AggregateBody::new_unsorted(vec![], outputs, vec![]);
+            assert!(!body.is_sorted());
+            let err = verify_no_duplicated_inputs_outputs(&body).unwrap_err();
+            assert!(matches!(err, ValidationError::UnsortedOrDuplicateOutput));
+        }
+
+        #[test]
+        fn it_rejects_two_inputs_spending_the_same_output_with_different_witnesses() {
+            // Exactly the shape a competing double spend takes: same output hash, different script input data. The
+            // inputs are deduplicated on the output they spend, so the differing witness must not hide the duplicate.
+            let output = output_with(random_commitment(), script!(Nop).unwrap());
+            let input = input_spending(&output, ExecutionStack::default());
+            let twin = input_spending(&output, ExecutionStack::new(vec![StackItem::Number(1)]));
+            assert_ne!(input.canonical_hash(), twin.canonical_hash());
+
+            let body = AggregateBody::new_unsorted(vec![input, twin], vec![], vec![]);
+            let err = verify_no_duplicated_inputs_outputs(&body).unwrap_err();
+            assert!(matches!(err, ValidationError::UnsortedOrDuplicateInput));
+        }
+
+        #[test]
+        fn it_does_not_catch_two_outputs_that_share_only_a_commitment() {
+            // This check deduplicates outputs by hash, so two outputs with the same commitment but different scripts
+            // hash differently and pass here. Commitment uniqueness within a body is enforced by
+            // `check_sorting_and_duplicates` in the internal consistency validator, which orders outputs on the
+            // commitment alone. This test pins the division of responsibility: if it ever starts failing, the
+            // hash-based check has been tightened and this is the weaker of the two guarantees, not a regression.
+            let commitment = random_commitment();
+            let output = output_with(commitment.clone(), script!(Nop).unwrap());
+            let twin = output_with(commitment, script!(Nop Nop).unwrap());
+            assert_ne!(output.hash(), twin.hash());
+
+            let body = AggregateBody::new_unsorted(vec![], vec![output, twin], vec![]);
+            verify_no_duplicated_inputs_outputs(&body).unwrap();
+        }
     }
 }

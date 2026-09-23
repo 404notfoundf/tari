@@ -9,6 +9,9 @@
 extern crate alloc;
 
 pub mod common_types;
+pub mod ephemeral_nonce;
+pub mod legacy_nonce;
+pub mod script_offset;
 mod utils;
 pub use utils::{
     TARI_DUAL_ADDRESS_MAX_SIZE,

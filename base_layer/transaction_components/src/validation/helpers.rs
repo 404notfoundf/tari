@@ -78,9 +78,10 @@ pub fn check_tari_encrypted_data_byte_size(
     max_encrypted_data_size: usize,
 ) -> Result<(), AggregatedBodyValidationError> {
     let encrypted_data_size = encrypted_data.as_bytes().len();
-    if encrypted_data_size > max_encrypted_data_size + STATIC_ENCRYPTED_DATA_SIZE_TOTAL {
+    let max_total_size = max_encrypted_data_size.saturating_add(STATIC_ENCRYPTED_DATA_SIZE_TOTAL);
+    if encrypted_data_size > max_total_size {
         return Err(AggregatedBodyValidationError::EncryptedDataExceedsMaxSize {
-            max_encrypted_data_size: max_encrypted_data_size + STATIC_ENCRYPTED_DATA_SIZE_TOTAL,
+            max_encrypted_data_size: max_total_size,
             actual_encrypted_data_size: encrypted_data_size,
         });
     }
@@ -275,7 +276,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
@@ -302,7 +303,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
 
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
@@ -330,7 +331,7 @@ mod test {
             let coinbase_output = coinbase.to_transaction_output().unwrap();
             let coinbase_kernel = test_helpers::create_coinbase_kernel(coinbase.commitment_mask_key_id(), &key_manager);
 
-            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let body = AggregateBody::new_unsorted(vec![], vec![coinbase_output], vec![coinbase_kernel]);
             let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
             let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
 

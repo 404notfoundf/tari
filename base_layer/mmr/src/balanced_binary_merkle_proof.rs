@@ -78,9 +78,9 @@ where D: Digest
         let mut path = Vec::new();
         while index > 0 {
             // Parent at (i - 1) / 2
-            let parent = (index - 1) >> 1;
+            let parent = index.saturating_sub(1) >> 1;
             // The children are 2i + 1 and 2i + 2, so together are 4i + 3. We subtract one, we get the other.
-            let sibling = 4 * parent + 3 - index;
+            let sibling = parent.saturating_mul(4).saturating_add(3).saturating_sub(index);
             let hash = tree
                 .get_hash(sibling)
                 .cloned()
@@ -157,22 +157,27 @@ where D: Digest
             for (index, proof) in proofs.iter().enumerate() {
                 // If this path was already joined ignore it.
                 if !join_indices.get(index).expect("Index should expect") && proof.path.len() > height as usize {
-                    let parent = (indices.get(index).expect("Index should expect") - 1) >> 1;
+                    let parent = indices.get(index).expect("Index should expect").saturating_sub(1) >> 1;
                     if let Some(other_proof_idx) = hash_map.insert(parent, index) {
                         *join_indices.get_mut(index).expect("Index should expect") = true;
-                        // The other proof doesn't need a hash, it needs an index to this hash
+                        // The other proof doesn't need a hash, it needs an index to this hash. It must have
+                        // contributed a hash at this height, otherwise the proofs we were given cannot be merged
+                        // (e.g. more than two proofs sharing the same parent).
                         *paths
                             .get_mut(other_proof_idx)
-                            .expect("should exist")
+                            .ok_or(BalancedBinaryMerkleProofError::BadProofSemantics)?
                             .first_mut()
-                            .unwrap() = MergedBalancedBinaryMerkleIndexOrHash::Index(index as u64);
+                            .ok_or(BalancedBinaryMerkleProofError::BadProofSemantics)? =
+                            MergedBalancedBinaryMerkleIndexOrHash::Index(
+                                u64::try_from(index).map_err(|_| BalancedBinaryMerkleProofError::MathOverflow)?,
+                            );
                     } else {
                         paths.get_mut(index).expect("should exist").insert(
                             0,
                             MergedBalancedBinaryMerkleIndexOrHash::Hash(
                                 proof
                                     .path
-                                    .get(proof.path.len() - 1 - height as usize)
+                                    .get(proof.path.len().saturating_sub(1).saturating_sub(height as usize))
                                     .expect("Should exist")
                                     .clone(),
                             ),
@@ -198,7 +203,7 @@ where D: Digest
     ) -> Result<bool, BalancedBinaryMerkleProofError> {
         // Check that the proof and verifier data match
         let n = self.node_indices.len(); // number of merged proofs
-        if self.paths.len() != n || leaf_hashes.len() != n {
+        if self.paths.len() != n || self.heights.len() != n || leaf_hashes.len() != n {
             return Err(BalancedBinaryMerkleProofError::BadProofSemantics);
         }
 
@@ -260,14 +265,14 @@ where D: Digest
                 }
                 // Parent
                 *self.node_indices.get_mut(index).expect("Should exist") =
-                    (*self.node_indices.get(index).expect("Should exist") - 1) >> 1;
+                    self.node_indices.get(index).expect("Should exist").saturating_sub(1) >> 1;
             }
             if !dangling_paths.is_empty() {
                 // Something path ended, but it's not joined with any other path.
                 return Err(BalancedBinaryMerkleProofError::BadProofSemantics);
             }
         }
-        if consumed.len() + 1 < self.paths.len() {
+        if consumed.len().saturating_add(1) < self.paths.len() {
             // If the proof is valid then all but one paths will be consumed by other paths.
             return Err(BalancedBinaryMerkleProofError::BadProofSemantics);
         }
@@ -316,6 +321,34 @@ mod test {
                 .verify_consume(&root, vec![leaves[0].clone(), leaves[1].clone()])
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_merged_proof_with_short_heights_is_rejected() {
+        // `heights` is deserialised along with the rest of the proof, so it may not line up with the other fields
+        let proof = MergedBalancedBinaryMerkleProof::<TestHasher> {
+            paths: vec![vec![], vec![]],
+            node_indices: vec![0, 1],
+            heights: vec![1],
+            _phantom: PhantomData,
+        };
+        assert!(matches!(
+            proof.verify_consume(&vec![0u8; 32], vec![vec![], vec![]]).unwrap_err(),
+            BalancedBinaryMerkleProofError::BadProofSemantics
+        ));
+    }
+
+    #[test]
+    fn test_merging_proofs_that_share_a_parent_is_rejected() {
+        // Three proofs for the same leaf all share a parent, so they cannot be merged into a single proof
+        let leaves = (0..4usize)
+            .map(|i| vec![u8::try_from(i).unwrap(); 32])
+            .collect::<Vec<_>>();
+        let bmt = BalancedBinaryMerkleTree::<TestHasher>::create(leaves);
+        let proof = BalancedBinaryMerkleProof::generate_proof(&bmt, 0).unwrap();
+        let err =
+            MergedBalancedBinaryMerkleProof::create_from_proofs(&[proof.clone(), proof.clone(), proof]).unwrap_err();
+        assert!(matches!(err, BalancedBinaryMerkleProofError::BadProofSemantics));
     }
 
     #[test]
