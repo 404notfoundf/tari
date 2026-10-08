@@ -327,7 +327,10 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
 
         let config = RpcClient::builder()
             .with_deadline(self.config.rpc_deadline)
-            .with_deadline_grace_period(Duration::from_secs(5));
+            .with_deadline_grace_period(Duration::from_secs(5))
+            // Kernels and outputs are small, so let the client buffer many while they are validated
+            .with_stream_buffer_size(100)
+            .with_max_response_size(self.max_streamed_item_size());
 
         // Bound RPC negotiation so a stuck negotiation cannot wedge the sync loop.
         let mut client = tokio::time::timeout(
@@ -437,6 +440,32 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
             .commit()
             .await?;
         Ok((1, sync_to_header.clone()))
+    }
+
+    /// The largest kernel or output (each streamed one at a time) a peer can legitimately send. A non-coinbase
+    /// output's features, script, covenant and payment id are charged `features_and_scripts_bytes_per_gram` bytes per
+    /// gram of block weight, so they cannot exceed `max_block_transaction_weight * features_and_scripts_bytes_per_gram`
+    /// bytes. The rest of an output (commitment, range proof, keys, signature, encrypted data) and an entire kernel are
+    /// small and fixed-size, and coinbase outputs (which are not weighed) have their script and features extra capped
+    /// far below this, so 64 KiB of margin covers them and the protobuf overhead.
+    fn max_streamed_item_size(&self) -> usize {
+        let max_weighed_bytes = self
+            .rules
+            .consensus_constants_vec()
+            .iter()
+            .map(|c| {
+                c.max_block_transaction_weight().saturating_mul(
+                    c.transaction_weight_params()
+                        .params()
+                        .features_and_scripts_bytes_per_gram
+                        .get(),
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        usize::try_from(max_weighed_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(64 * 1024)
     }
 
     async fn sync_kernels_and_outputs(
@@ -959,7 +988,7 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
 
                             let constants = self.rules.consensus_constants(current_header.height).clone();
                             validate_output_version(&constants, &output)?;
-                            validate_individual_output(&output, &constants)?;
+                            validate_individual_output(&output, &constants, self.rules.network().as_network())?;
                             batch_verify_range_proofs(&self.prover, &[&output])?;
 
                             txn.insert_output_via_horizon_sync(
@@ -1067,16 +1096,10 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
                 .collect::<Vec<_>>();
 
             txn.apply_horizon_state_tree_updates(tranche_updates);
-            for output in &inputs_to_delete {
-                if let Some(sidechain_feature) = output.features.sidechain_feature.as_ref() &&
-                    let Some(vn_reg) = sidechain_feature.validator_node_registration()
-                {
-                    txn.delete_validator_node(
-                        sidechain_feature.sidechain_public_key().cloned(),
-                        vn_reg.public_key().clone(),
-                    );
-                }
-            }
+            // Spent validator node registrations need no validator node set update: a registration spend never changes
+            // the set in full block processing either (it is only allowed once the exit has taken effect). Note that
+            // horizon sync does not reconstruct the validator node set at all (pre-existing gap): a pruned node that
+            // horizon synced has an empty validator node set.
             for output in inputs_to_delete {
                 txn.prune_output_from_all_dbs(output.hash(), output.commitment.clone(), output.features.output_type);
             }

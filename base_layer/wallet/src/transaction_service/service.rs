@@ -57,7 +57,6 @@ use tari_crypto::{
     keys::{PublicKey as pkt, SecretKey},
     tari_utilities::ByteArray,
 };
-use tari_max_size::MaxSizeString;
 use tari_script::{
     CompressedCheckSigSchnorrSignature,
     ExecutionStack,
@@ -70,7 +69,6 @@ use tari_script::{
 };
 use tari_service_framework::{reply_channel, reply_channel::Receiver};
 use tari_shutdown::ShutdownSignal;
-use tari_sidechain::EvictionProof;
 use tari_transaction_components::{
     MicroMinotari,
     TransactionBuilder,
@@ -100,12 +98,9 @@ use tari_transaction_components::{
         RecipientSpec,
     },
     transaction_components::{
-        BuildInfo,
-        CodeTemplateRegistration,
         EncryptedData,
         KernelFeatures,
         OutputFeatures,
-        TemplateType,
         Transaction,
         TransactionError,
         TransactionOutput,
@@ -431,15 +426,14 @@ where
                     let temp_tx_id = TxId::new_random();
 
                     // let override the payment_id if the address says we should
-                    if destination.features().contains(TariAddressFeatures::PAYMENT_ID) {
+                    if let Some(address_payment_id) = address_payment_id(&destination) {
                         debug!(
                             target: LOG_TARGET,
                             "Address contains memo, overriding memo {} with {:?}",
-                            payment_id, destination.get_memo_field_payment_id_bytes()
+                            payment_id, address_payment_id
                         );
-                        payment_id =
-                            MemoField::new_open(destination.get_memo_field_payment_id_bytes(), TxType::PaymentToOther)
-                                .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
+                        payment_id = MemoField::new_open(address_payment_id, TxType::PaymentToOther)
+                            .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
                     }
 
                     // Prepare sender part of the transaction
@@ -737,13 +731,9 @@ where
                     let mut request = request;
 
                     for pair_output in &mut request.info.inputs.iter_mut() {
-                        let view_key = key_manager.get_view_key();
                         let spend_key = key_manager.get_spend_key();
 
-                        let commitment_mask_key_id = TariKeyId::DHCommitmentMask {
-                            private_key: view_key.key_id.clone().into(),
-                            public_key: pair_output.sender_offset_public_key().clone(),
-                        };
+                        let commitment_mask_key_id = pair_output.commitment_mask_key_id().clone();
                         let script_pubkey = key_manager
                             .stealth_address_script_spending_key(&commitment_mask_key_id, &spend_key.pub_key)?;
                         let script_key = TariKeyId::Derived {
@@ -1074,6 +1064,7 @@ where
                 validator_node_public_key,
                 validator_node_signature,
                 sidechain_deployment_key,
+                activation_epoch,
                 max_epoch,
                 selection_criteria,
                 fee_per_gram,
@@ -1087,70 +1078,8 @@ where
                             validator_node_signature,
                             sidechain_deployment_key,
                             selection_criteria,
+                            activation_epoch,
                             max_epoch,
-                            fee_per_gram,
-                            payment_id,
-                            transaction_broadcast_join_handles,
-                        )
-                        .await?;
-                    Ok(TransactionServiceResponse::TransactionSent(tx_id))
-                }
-                .await
-            },
-
-            TransactionServiceRequest::RegisterCodeTemplate {
-                template_name,
-                template_version,
-                template_type,
-                build_info,
-                binary_sha,
-                binary_url,
-                fee_per_gram,
-                sidechain_deployment_key,
-            } => {
-                async {
-                    let payment_id = MemoField::new_open(
-                        format!("Template Registration: {template_name}").into_bytes(),
-                        TxType::CodeTemplateRegistration,
-                    )
-                    .map_err(|e| TransactionServiceError::InvalidPaymentId(e.to_string()))?;
-                    let (tx_id, template_address) = self
-                        .register_code_template(
-                            fee_per_gram,
-                            template_name,
-                            template_version,
-                            template_type,
-                            build_info,
-                            binary_sha,
-                            binary_url,
-                            sidechain_deployment_key,
-                            UtxoSelectionCriteria::default(),
-                            payment_id,
-                            transaction_broadcast_join_handles,
-                        )
-                        .await?;
-                    Ok(TransactionServiceResponse::CodeRegistrationTransactionSent {
-                        tx_id,
-                        template_address,
-                    })
-                }
-                .await
-            },
-
-            TransactionServiceRequest::SubmitValidatorEvictionProof {
-                amount,
-                proof,
-                fee_per_gram,
-                payment_id,
-                sidechain_deployment_key,
-            } => {
-                async {
-                    let tx_id = self
-                        .submit_validator_eviction_proof(
-                            amount,
-                            proof,
-                            sidechain_deployment_key,
-                            UtxoSelectionCriteria::default(),
                             fee_per_gram,
                             payment_id,
                             transaction_broadcast_join_handles,
@@ -1327,6 +1256,15 @@ where
                         },
                         Completed(completed_tx) => {
                             let tx_id = completed_tx.tx_id;
+                            // The imported record is decoded from client JSON, which bypasses
+                            // `CompletedTransaction::new`; reject the status `new` rejects. The other fields
+                            // `new` derives (e.g. `transaction_signature`) are kept as supplied, a known
+                            // import trust gap tracked separately.
+                            if completed_tx.status == LegacyTransactionStatus::Coinbase {
+                                return Err(TransactionServiceError::TransactionStorageError(
+                                    TransactionStorageError::CoinbaseNotSupported,
+                                ));
+                            }
                             check_transaction_size(&completed_tx.transaction, tx_id)?;
                             self.db.insert_completed_transaction(tx_id, completed_tx)?;
                             tx_id
@@ -2114,6 +2052,15 @@ where
                     .map_err(|e| TransactionServiceError::ServiceError(format!("TxId: {tx_id}, {e}")))?,
             );
             trace!(target: LOG_TARGET, "finalized_aggregate_encumbed_tx: input_data {:?}", input.input_data);
+            if input.script().is_ok_and(|script| script.is_context_sensitive()) {
+                // The script reads the block height, and the wallet can only evaluate it at its last scanned height;
+                // the base node will evaluate it at the height of the block that spends it, which may differ.
+                warn!(
+                    target: LOG_TARGET,
+                    "TxId: {tx_id}: validating a height-dependent input script against the wallet's last scanned \
+                     height {last_seen_tip_height}; the result may differ when the transaction is mined"
+                );
+            }
             input_keys = input_keys +
                 input
                     .run_and_verify_script(&factory, Some(context))
@@ -2347,9 +2294,9 @@ where
         }
         let temp_tx_id = TxId::new_random();
         // let override the payment_id if the address says we should
-        if dest_address.features().contains(TariAddressFeatures::PAYMENT_ID) {
-            debug!(target: LOG_TARGET, "Address contains memo, overriding memo {} with {:?}", payment_id, dest_address.get_memo_field_payment_id_bytes());
-            payment_id = MemoField::new_open(dest_address.get_memo_field_payment_id_bytes(), TxType::PaymentToOther)
+        if let Some(address_payment_id) = address_payment_id(&dest_address) {
+            debug!(target: LOG_TARGET, "Address contains memo, overriding memo {} with {:?}", payment_id, address_payment_id);
+            payment_id = MemoField::new_open(address_payment_id, TxType::PaymentToOther)
                 .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
         }
 
@@ -2833,9 +2780,9 @@ where
         let tip_height = self.db.get_last_scanned_height()?.unwrap_or(0);
         for (address, amount, memo) in &mut destinations {
             self.verify_send(address, TariAddressFeatures::create_one_sided_only())?;
-            if address.features().contains(TariAddressFeatures::PAYMENT_ID) {
-                debug!(target: LOG_TARGET, "Address contains memo, overriding memo {} with {:?}", memo, address.get_memo_field_payment_id_bytes());
-                *memo = MemoField::new_open(address.get_memo_field_payment_id_bytes(), TxType::PaymentToOther)
+            if let Some(address_payment_id) = address_payment_id(address) {
+                debug!(target: LOG_TARGET, "Address contains memo, overriding memo {} with {:?}", memo, address_payment_id);
+                *memo = MemoField::new_open(address_payment_id, TxType::PaymentToOther)
                     .map_err(OutputManagerError::InvalidPaymentIdFormat)?;
             }
             *memo = memo
@@ -3337,6 +3284,7 @@ where
             .as_ref()
             .map(CompressedPublicKey::from_secret_key);
         if !signature.is_valid_registration_signature_for(
+            self.resources.network.as_byte(),
             sidechain_pk.as_ref(),
             &validator_node_claim_public_key,
             max_epoch,
@@ -3413,6 +3361,7 @@ where
         validator_node_signature: CompressedSignature,
         sidechain_deployment_key: Option<PrivateKey>,
         selection_criteria: UtxoSelectionCriteria,
+        activation_epoch: VnEpoch,
         max_epoch: VnEpoch,
         fee_per_gram: MicroMinotari,
         payment_id: MemoField,
@@ -3424,12 +3373,21 @@ where
         let sidechain_pk = sidechain_deployment_key
             .as_ref()
             .map(CompressedPublicKey::from_secret_key);
-        if !signature.is_valid_exit_signature_for(sidechain_pk.as_ref(), max_epoch) {
+        if !signature.is_valid_exit_signature_for(
+            self.resources.network.as_byte(),
+            sidechain_pk.as_ref(),
+            activation_epoch,
+            max_epoch,
+        ) {
             return Err(TransactionServiceError::InvalidValidatorNodeSignature);
         }
 
-        let output_features =
-            OutputFeatures::for_validator_node_exit(signature, sidechain_deployment_key.as_ref(), max_epoch);
+        let output_features = OutputFeatures::for_validator_node_exit(
+            signature,
+            sidechain_deployment_key.as_ref(),
+            activation_epoch,
+            max_epoch,
+        );
 
         let (fee, transaction, tx_id) = self
             .resources
@@ -3482,160 +3440,6 @@ where
         .await?;
 
         Ok(tx_id)
-    }
-
-    async fn submit_validator_eviction_proof(
-        &mut self,
-        amount: MicroMinotari,
-        eviction_proof: EvictionProof,
-        sidechain_deployment_key: Option<PrivateKey>,
-        selection_criteria: UtxoSelectionCriteria,
-        fee_per_gram: MicroMinotari,
-        payment_id: MemoField,
-        transaction_broadcast_join_handles: &mut FuturesUnordered<
-            JoinHandle<Result<TxId, TransactionServiceProtocolError<TxId>>>,
-        >,
-    ) -> Result<TxId, TransactionServiceError> {
-        let output_features =
-            OutputFeatures::for_validator_node_eviction(eviction_proof, sidechain_deployment_key.as_ref());
-
-        let (fee, transaction, tx_id) = self
-            .resources
-            .output_manager_service
-            .create_pay_to_self_transaction(
-                amount,
-                selection_criteria,
-                output_features,
-                fee_per_gram,
-                None,
-                payment_id.clone(),
-                MicroMinotari::zero(),
-            )
-            .await?;
-
-        // Notify that the transaction was successfully resolved.
-        let _size = self
-            .event_publisher
-            .send(Arc::new(TransactionEvent::TransactionCompletedImmediately(tx_id)));
-        let all_outputs = transaction
-            .body
-            .outputs()
-            .iter()
-            .map(|o| o.hash())
-            .collect::<Vec<HashOutput>>();
-        let lock_height = CompletedTransaction::calculate_lock_height(&transaction);
-        let mut final_payment_id = payment_id.clone();
-        final_payment_id.set_fee(fee);
-        self.submit_transaction(
-            transaction_broadcast_join_handles,
-            CompletedTransaction::new_with_output_hashes(
-                tx_id,
-                self.resources.one_sided_tari_address.clone(),
-                self.resources.one_sided_tari_address.clone(),
-                amount,
-                fee,
-                transaction,
-                LegacyTransactionStatus::Completed,
-                Utc::now(),
-                TransactionDirection::Inbound,
-                None,
-                None,
-                final_payment_id,
-                vec![],
-                all_outputs,
-                vec![],
-                lock_height,
-            )?,
-        )
-        .await?;
-
-        Ok(tx_id)
-    }
-
-    async fn register_code_template(
-        &mut self,
-        fee_per_gram: MicroMinotari,
-        template_name: MaxSizeString<32>,
-        template_version: u16,
-        template_type: TemplateType,
-        build_info: BuildInfo,
-        binary_sha: FixedHash,
-        binary_url: MaxSizeString<255>,
-        sidechain_deployment_key: Option<PrivateKey>,
-        selection_criteria: UtxoSelectionCriteria,
-        payment_id: MemoField,
-
-        transaction_broadcast_join_handles: &mut FuturesUnordered<
-            JoinHandle<Result<TxId, TransactionServiceProtocolError<TxId>>>,
-        >,
-    ) -> Result<(TxId, FixedHash), TransactionServiceError> {
-        let author_key_id = TariKeyId::CodeTemplateAuthor;
-        let author_key = self
-            .resources
-            .transaction_key_manager_service
-            .get_public_key_at_key_id(&author_key_id)?;
-        let nonce = self
-            .resources
-            .transaction_key_manager_service
-            .get_random_key(None, None)?;
-        let mut template_registration = CodeTemplateRegistration {
-            author_public_key: author_key.clone(),
-            author_signature: CompressedSignature::default(),
-            template_name,
-            template_version,
-            template_type,
-            build_info,
-            binary_sha,
-            binary_url,
-        };
-
-        let signature_message = template_registration.create_signature_message(&nonce.pub_key);
-
-        let author_sig = self
-            .resources
-            .transaction_key_manager_service
-            .sign_with_nonce_and_challenge(&author_key_id, &nonce.key_id, &signature_message)
-            .map_err(|e| TransactionServiceError::SidechainSigningError(e.to_string()))?;
-
-        template_registration.author_signature = author_sig;
-
-        let output_features =
-            OutputFeatures::for_template_registration(template_registration, sidechain_deployment_key.as_ref());
-        let (fee, transaction, tx_id) = self
-            .resources
-            .output_manager_service
-            .create_pay_to_self_transaction(
-                0.into(),
-                selection_criteria,
-                output_features,
-                fee_per_gram,
-                None,
-                payment_id.clone(),
-                MicroMinotari::zero(),
-            )
-            .await?;
-        let template_output = transaction
-            .body
-            .outputs()
-            .iter()
-            .find(|o| o.features.output_type.is_template_registration())
-            .ok_or_else(|| {
-                TransactionServiceError::ServiceError(format!(
-                    "Transaction {tx_id} did not contain a template registration utxo"
-                ))
-            })?;
-        let template_address = template_output.hash();
-
-        self.submit_transaction_to_self(
-            transaction_broadcast_join_handles,
-            tx_id,
-            transaction,
-            fee,
-            0.into(),
-            payment_id,
-        )
-        .await?;
-        Ok((tx_id, template_address))
     }
 
     /// Sends a one side payment transaction to a recipient
@@ -3952,9 +3756,13 @@ where
             self.resources.config.clone(),
             self.event_publisher.clone(),
             self.resources.output_manager_service.clone(),
+            self.resources.shutdown_signal.clone(),
         );
 
         let validation_in_progress = self.validation_in_progress.clone();
+        // The protocol holds the wallet database and does remote I/O: stop it on shutdown rather than let it run on
+        // after the wallet's shutdown drain has completed
+        let mut shutdown = self.resources.shutdown_signal.clone();
 
         let mut utxo_scanner_service_event_stream = self.resources.utxo_scanner_handle.get_event_receiver();
 
@@ -3973,6 +3781,11 @@ where
                 tokio::pin!(exec_fut);
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => {
+                            debug!(target: LOG_TARGET, "Transaction Validation Protocol (Id: {id}) stopped by shutdown signal");
+                            return Err(TransactionServiceProtocolError::new(id, TransactionServiceError::Shutdown));
+                        },
                         result = &mut exec_fut => {
                            return result;
                         },
@@ -4729,4 +4542,48 @@ pub struct TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManage
 pub struct TransactionSendResult {
     pub tx_id: TxId,
     pub transaction_status: LegacyTransactionStatus,
+}
+
+/// The payment id that an address asks to be sent with, which then overrides the user's memo. An empty payment id
+/// never overrides the memo, even when the address has the `PAYMENT_ID` flag set.
+fn address_payment_id(address: &TariAddress) -> Option<Vec<u8>> {
+    let payment_id = address.get_memo_field_payment_id_bytes();
+    if address.features().contains(TariAddressFeatures::PAYMENT_ID) && !payment_id.is_empty() {
+        Some(payment_id)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tari_common_types::dammsum::compute_checksum;
+
+    use super::*;
+
+    #[test]
+    fn only_a_non_empty_address_payment_id_overrides_the_memo() {
+        let address = TariAddress::from_base58(
+            "f425UWsDp714RiN53c1G6ek57rfFnotB5NCMyrn4iDgbR8i2sXVHa4xSsedd66o9KmkRgErQnyDdCaAdNLzcKrj7eUb",
+        )
+        .unwrap();
+        assert_eq!(address_payment_id(&address), None);
+
+        let with_id = address.with_memo_field_payment_id(vec![1, 2, 3]).unwrap();
+        assert_eq!(address_payment_id(&with_id), Some(vec![1, 2, 3]));
+
+        // A decoded address with the flag set and an empty payment id
+        let mut bytes = address.to_vec();
+        let last = bytes.len().saturating_sub(1);
+        if let Some(features) = bytes.get_mut(1) {
+            *features |= TariAddressFeatures::PAYMENT_ID.as_u8();
+        }
+        let checksum = compute_checksum(bytes.get(..last).unwrap());
+        if let Some(byte) = bytes.get_mut(last) {
+            *byte = checksum;
+        }
+        let flag_only = TariAddress::from_bytes(&bytes).unwrap();
+        assert!(flag_only.features().contains(TariAddressFeatures::PAYMENT_ID));
+        assert_eq!(address_payment_id(&flag_only), None);
+    }
 }

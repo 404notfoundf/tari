@@ -48,7 +48,10 @@ use crate::{
         comms_interface::{BlockEvent, BlockEvent::BlockSyncRewind},
         sync::{
             header_sync::HEADER_SYNC_INITIAL_MAX_HEADERS,
-            rpc::{BaseNodeSyncService, sync_utxos_task::SyncUtxosTask},
+            rpc::{
+                BaseNodeSyncService,
+                sync_utxos_task::{HEADER_CHUNK_SIZE, SyncUtxosTask},
+            },
         },
     },
     chain_storage::{BlockAddResult, BlockchainBackend, async_db::AsyncBlockchainDb},
@@ -71,14 +74,23 @@ pub struct BaseNodeSyncRpcService<B> {
     db: AsyncBlockchainDb<B>,
     active_sessions: Mutex<Vec<Weak<NodeId>>>,
     base_node_service: LocalNodeCommsInterface,
+    /// Number of blocks to load and push to the stream before loading the next batch
+    block_batch_size: usize,
 }
 
 impl<B: BlockchainBackend + 'static> BaseNodeSyncRpcService<B> {
-    pub fn new(db: AsyncBlockchainDb<B>, base_node_service: LocalNodeCommsInterface) -> Self {
+    pub fn new(db: AsyncBlockchainDb<B>, base_node_service: LocalNodeCommsInterface, block_batch_size: usize) -> Self {
+        if block_batch_size == 0 {
+            warn!(
+                target: LOG_TARGET,
+                "blockchain_sync_config.rpc_block_batch_size is 0, using 1 instead"
+            );
+        }
         Self {
             db,
             active_sessions: Mutex::new(Vec::new()),
             base_node_service,
+            block_batch_size: cmp::max(block_batch_size, 1),
         }
     }
 
@@ -171,13 +183,12 @@ impl<B: BlockchainBackend + 'static> BaseNodeSyncService for BaseNodeSyncRpcServ
         );
 
         let session_token = self.try_add_exclusive_session(peer_node_id).await?;
-        // Number of blocks to load and push to the stream before loading the next batch
-        const BATCH_SIZE: usize = 2;
-        let (tx, rx) = mpsc::channel(BATCH_SIZE);
+        let (tx, rx) = mpsc::channel(self.block_batch_size);
 
         let span = span!(Level::TRACE, "sync_rpc::block_sync::inner_worker");
-        let iter = NonOverlappingIntegerPairIter::new(start_height, end_height.saturating_add(1), BATCH_SIZE)
-            .map_err(|e| RpcStatus::bad_request(&e))?;
+        let iter =
+            NonOverlappingIntegerPairIter::new(start_height, end_height.saturating_add(1), self.block_batch_size)
+                .map_err(|e| RpcStatus::bad_request(&e))?;
         task::spawn(
             async move {
                 // Move token into this task
@@ -204,10 +215,12 @@ impl<B: BlockchainBackend + 'static> BaseNodeSyncService for BaseNodeSyncRpcServ
                                     reorg_block.height(),
                                     peer_node_id
                                 );
-                                let _result = tx.send(Err(RpcStatus::conflict(&format!(
-                                    "Reorg at height {} detected",
-                                    reorg_block.height()
-                                ))));
+                                let _result = tx
+                                    .send(Err(RpcStatus::conflict(&format!(
+                                        "Reorg at height {} detected",
+                                        reorg_block.height()
+                                    ))))
+                                    .await;
                                 return;
                             }
                         }
@@ -502,6 +515,7 @@ impl<B: BlockchainBackend + 'static> BaseNodeSyncService for BaseNodeSyncRpcServ
         task::spawn(async move {
             // Move session token into task
             let peer_node_id = session_token;
+            let mut header_chunk = Vec::new().into_iter();
             while current_height <= end_height {
                 if tx.is_closed() {
                     break;
@@ -552,10 +566,20 @@ impl<B: BlockchainBackend + 'static> BaseNodeSyncService for BaseNodeSyncRpcServ
                 current_height = current_height.saturating_add(1);
 
                 if current_height <= end_height {
-                    let res = db
-                        .fetch_header(current_height)
-                        .await
-                        .map_err(RpcStatus::log_internal_error(LOG_TARGET));
+                    let res = match header_chunk.next() {
+                        Some(header) => Ok(Some(header)),
+                        None => {
+                            // Prefetch the next chunk of headers. The chunk stops early at the first missing header.
+                            let chunk_end = current_height.saturating_add(HEADER_CHUNK_SIZE - 1).min(end_height);
+                            db.fetch_headers(current_height..=chunk_end)
+                                .await
+                                .map_err(RpcStatus::log_internal_error(LOG_TARGET))
+                                .map(|headers| {
+                                    header_chunk = headers.into_iter();
+                                    header_chunk.next()
+                                })
+                        },
+                    };
                     match res {
                         Ok(Some(header)) => {
                             current_header_hash = header.hash();

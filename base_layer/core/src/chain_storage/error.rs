@@ -21,7 +21,10 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use lmdb_zero::error;
-use tari_common_types::{chain_metadata::ChainMetaDataError, types::FixedHashSizeError};
+use tari_common_types::{
+    chain_metadata::ChainMetaDataError,
+    types::{FixedHash, FixedHashSizeError},
+};
 use tari_mmr::{MerkleProofError, error::MerkleMountainRangeError, sparse_merkle_tree::SMTError};
 use tari_node_components::blocks::BlockError;
 use tari_storage::lmdb_store::LMDBError;
@@ -70,6 +73,11 @@ pub enum ChainStorageError {
         start_height: u64,
         target_height: u64,
     },
+    #[error(
+        "The body of block #{height} is not available because this node is pruned up to height {pruned_height}. Use \
+         an archival node."
+    )]
+    BlockBodyPruned { height: u64, pruned_height: u64 },
     #[error("Invalid argument `{arg}` in `{func}`: {message}")]
     InvalidArguments {
         func: &'static str,
@@ -95,6 +103,30 @@ pub enum ChainStorageError {
     #[error("Validation error: {source}")]
     ValidationError {
         #[from]
+        source: ValidationError,
+    },
+    /// A block of a fork chain failed body validation during a reorg. `body_verified` says whether its body is the one
+    /// its header commits to; an orphan's body was supplied by a peer and is only checked then.
+    ///
+    /// `add_block` returns this when the block being added was dropped with the failed block (it is that block, or
+    /// built on it) but its sender is not to blame: the body that failed may not be the one the sender sent, or the
+    /// verdict was a fault of ours (a storage error, say) rather than the block's. So it is never a ban.
+    #[error("Block {hash} failed validation during a reorg and was dropped (body verified: {body_verified}): {source}")]
+    HeldBlockInvalid {
+        hash: FixedHash,
+        body_verified: bool,
+        /// The block that failed is the block being added, with the body its sender just sent, and the verdict was a
+        /// fault of ours. For a locally mined block that is still worth telling the mempool about.
+        sent_body_failed: bool,
+        source: ValidationError,
+    },
+    /// The block being added builds on a block whose body matches its header and is invalid, so whoever sent it
+    /// relayed or mined an invalid chain.
+    #[error("Block {candidate} rejected: ancestor #{height} ({hash}) failed: {source}")]
+    AncestorBlockInvalid {
+        candidate: FixedHash,
+        hash: FixedHash,
+        height: u64,
         source: ValidationError,
     },
     #[error("The MMR root for {0} in the provided block header did not match the MMR root in the database")]
@@ -170,6 +202,19 @@ impl ChainStorageError {
         match self {
             ChainStorageError::ProofOfWorkError { source: e } => e.get_ban_reason(),
             ChainStorageError::ValidationError { source: e } => e.get_ban_reason(),
+            // The ban reason names the invalid block, not the one that was sent
+            ChainStorageError::AncestorBlockInvalid {
+                candidate,
+                hash,
+                height,
+                source,
+            } => source.get_ban_reason().map(|reason| BanReason {
+                reason: format!(
+                    "Block {candidate} builds on invalid block #{height} ({hash}): {}",
+                    reason.reason
+                ),
+                ban_duration: reason.ban_duration,
+            }),
             err @ ChainStorageError::UnspendableInput |
             err @ ChainStorageError::MerkleMountainRangeError { .. } |
             err @ ChainStorageError::MismatchedMmrRoot(_) |
@@ -212,7 +257,9 @@ impl ChainStorageError {
             _err @ ChainStorageError::MrHashError(_) |
             _err @ ChainStorageError::JellyfishMerkleTreeError(_) |
             _err @ ChainStorageError::PayRefIndexNotAvailable { .. } |
-            _err @ ChainStorageError::AccDataMigrationStillInProgress => None,
+            _err @ ChainStorageError::BlockBodyPruned { .. } |
+            _err @ ChainStorageError::AccDataMigrationStillInProgress |
+            _err @ ChainStorageError::HeldBlockInvalid { .. } => None,
         }
     }
 }

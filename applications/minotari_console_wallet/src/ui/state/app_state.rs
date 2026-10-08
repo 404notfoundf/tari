@@ -703,8 +703,7 @@ impl AppStateInner {
             ui_proofs.push(UiBurnProof {
                 id: proof.id,
                 proof: proof.burn_proof,
-                encoded_merkle_proof: proof.kernel_merkle_proof,
-                kernel: proof.kernel,
+                burn_output_proof: proof.burn_output_proof,
                 burned_at: proof.created_at,
             });
         }

@@ -1,12 +1,13 @@
 // Copyright 2025 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
+use tari_common_types::types::CompressedCommitment;
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::{
     MicroMinotari,
@@ -16,7 +17,7 @@ use tari_transaction_components::{
         models::{
             BlockHeader,
             FeePerGramStat,
-            GenerateKernelMerkleProofResponse,
+            GenerateBurnOutputProofResponse,
             GetUtxosDeletedInfoResponse,
             GetUtxosMinedInfoResponse,
             SyncUtxosByBlockResponseV0,
@@ -28,13 +29,30 @@ use tari_transaction_components::{
     },
     transaction_components::{Transaction, TransactionOutput},
 };
-use tari_utilities::hex::{Hex, to_hex};
+use tari_utilities::{
+    ByteArray,
+    hex::{Hex, to_hex},
+};
 use tokio::sync::{RwLock, mpsc};
 use url::Url;
 
 use crate::{BaseNodeWalletClient, JsonRpcResponse};
 
 const LOG_TARGET: &str = "tari::wallet::client::http";
+
+/// Upper bound on establishing a connection to the base node wallet service.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// reqwest `read_timeout`. Until the response headers arrive this is a single hard deadline started when the request
+/// is created, covering connect, send and the wait for the headers; after that it is an idle timeout, reset by every
+/// body frame. The base node builds each response (e.g. a `sync_utxos_by_block` page) as buffered JSON before sending
+/// the headers, so this must allow for a loaded node taking a long time to compute a page: a value that is too small
+/// fails that page on every retry and scanning never progresses past it. It still kills a dead or silent peer.
+/// This is deliberately longer than the wallet's shutdown drain (`WALLET_SHUTDOWN_DRAIN_TIMEOUT`, 30s): wallet tasks
+/// that await a request while holding a shutdown signal race it against that signal and drop it on shutdown - the
+/// per-request control calls (chain tip, headers, UTXO lookups, connectivity checks) are raced where they are awaited,
+/// and `sync_utxos_by_block` pages are raced inside the page task - so shutdown does not wait for this timeout (and
+/// the drain is bounded by its own timeout regardless).
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The base node rejects any batch query carrying more than `MAX_ALLOWED_QUERY_SIZE` items with a `400`. Fail here
 /// instead, so callers get an actionable error naming the limit rather than an opaque HTTP error body.
@@ -62,6 +80,8 @@ impl Client {
         let http_client_builder = reqwest::Client::builder();
         let http_client = http_client_builder
             .http2_initial_stream_window_size(4 * 1024 * 1024)
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(HTTP_READ_TIMEOUT)
             .build()
             .expect("http2 init");
         Self {
@@ -302,7 +322,7 @@ impl BaseNodeWalletClient for Client {
     async fn sync_utxos_by_block(
         &self,
         start_header_hash: Vec<u8>,
-        shutdown: ShutdownSignal,
+        mut shutdown: ShutdownSignal,
     ) -> Result<mpsc::Receiver<Result<SyncUtxosByBlockResponseV0, anyhow::Error>>, anyhow::Error> {
         debug!(
             target: LOG_TARGET,
@@ -327,21 +347,33 @@ impl BaseNodeWalletClient for Client {
                     format!("start_header_hash={start_header_hash_hex}&limit={limit}&page={page}&version=1").as_str(),
                 ));
                 debug!(target: LOG_TARGET, "Requesting UTXOs by block from Base Node wallet service at {target_url}");
-                match client.get(target_url.clone()).send().await {
-                    Ok(response) => match response.json::<SyncUtxosByBlockResponseV1>().await {
-                        Ok(response) => {
-                            has_next_page = response.has_next_page;
-                            debug!(target: LOG_TARGET, "Received UTXOs for page {page}");
-                            if let Err(send_error) = resp_tx.send(Ok(response.into())).await {
-                                error!(target: LOG_TARGET, "Error sending utxo response: {send_error:?}");
-                            }
-                        },
-                        Err(error) => {
-                            if let Err(send_error) = resp_tx.send(Err(error.into())).await {
-                                error!(target: LOG_TARGET, "Error sending error result: {send_error:?}");
-                            }
+                // A stalled request or body read fails after HTTP_READ_TIMEOUT and ends the sync like any other error.
+                // Shutdown is raced separately so this task releases its shutdown signal promptly regardless.
+                let fetch_page = async {
+                    client
+                        .get(target_url.clone())
+                        .send()
+                        .await?
+                        .json::<SyncUtxosByBlockResponseV1>()
+                        .await
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        info!(target: LOG_TARGET, "UTXO sync task shutdown triggered during a request, exiting loop");
+                        break;
+                    },
+                    result = fetch_page => result,
+                };
+                match result {
+                    Ok(response) => {
+                        has_next_page = response.has_next_page;
+                        debug!(target: LOG_TARGET, "Received UTXOs for page {page}");
+                        if let Err(send_error) = resp_tx.send(Ok(response.into())).await {
+                            // The receiver is gone, nobody wants the remaining pages
+                            error!(target: LOG_TARGET, "Error sending utxo response: {send_error:?}");
                             break;
-                        },
+                        }
                     },
                     Err(error) => {
                         if let Err(send_error) = resp_tx.send(Err(error.into())).await {
@@ -612,16 +644,15 @@ impl BaseNodeWalletClient for Client {
         Ok(stat)
     }
 
-    async fn get_kernel_merkle_proof(
+    async fn get_burn_output_proof(
         &self,
-        excess_sig_nonce: &[u8],
-        excess_sig: &[u8],
-    ) -> Result<GenerateKernelMerkleProofResponse, anyhow::Error> {
+        commitment: &CompressedCommitment,
+    ) -> Result<GenerateBurnOutputProofResponse, anyhow::Error> {
         let resp = self
-            .send_get_request("/generate_kernel_merkle_proof", &[
-                ("excess_sig_public_nonce", to_hex(excess_sig_nonce)),
-                ("excess_sig_signature", to_hex(excess_sig)),
-            ])
+            .send_get_request("/generate_burn_output_proof", &[(
+                "commitment",
+                to_hex(commitment.as_bytes()),
+            )])
             .await?;
 
         Ok(resp)

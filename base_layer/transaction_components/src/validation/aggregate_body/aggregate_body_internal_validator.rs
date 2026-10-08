@@ -23,6 +23,7 @@
 use std::{collections::HashSet, convert::TryInto};
 
 use log::*;
+use tari_common::configuration::Network;
 use tari_common_types::types::{
     CommitmentFactory,
     CompressedCommitment,
@@ -57,6 +58,7 @@ use crate::{
             check_covenant_length,
             check_permitted_output_types,
             check_permitted_range_proof_types,
+            check_sidechain_data_rules,
             check_tari_encrypted_data_byte_size,
             check_tari_script_byte_size,
             is_all_unique_and_sorted,
@@ -123,9 +125,13 @@ impl AggregateBodyInternalConsistencyValidator {
 
         validate_versions(body, constants)?;
 
+        let network = self.consensus_manager.network().as_network();
         for output in body.outputs() {
-            validate_individual_output(output, constants)?;
+            validate_individual_output(output, constants, network)?;
         }
+        // Every spent output had its script size checked when it was created, so this only rejects inputs that can
+        // never be valid. It runs before any input script is executed, to bound the cost of executing them.
+        check_input_script_sizes(body.inputs(), constants.max_script_byte_size())?;
 
         // Check that inputs are allowed to be spent
         check_maturity(height, body.inputs())?;
@@ -169,17 +175,21 @@ fn check_template_registration_utxo(sidechain_feature: &SideChainFeature) -> Res
     Ok(())
 }
 
+/// Validates a single output in isolation. `network` is the network the output is being validated for; validator node
+/// registration and exit signatures are bound to it.
 pub fn validate_individual_output(
     output: &TransactionOutput,
     consensus_constants: &ConsensusConstants,
+    network: Network,
 ) -> Result<(), AggregatedBodyValidationError> {
     check_permitted_output_types(consensus_constants, output)?;
     check_script_size(output, consensus_constants.max_script_byte_size())?;
     check_encrypted_data_byte_size(output, consensus_constants.max_extra_encrypted_data_byte_size())?;
     check_covenant_length(&output.covenant, consensus_constants.max_covenant_length())?;
     check_permitted_range_proof_types(consensus_constants, output)?;
+    check_sidechain_data_rules(output)?;
     output.verify_metadata_signature()?;
-    check_sidechain_features(consensus_constants, output)?;
+    check_sidechain_features(consensus_constants, output, network)?;
 
     Ok(())
 }
@@ -206,6 +216,23 @@ fn check_script_size(output: &TransactionOutput, max_script_size: usize) -> Resu
         );
         e
     })
+}
+
+/// Verify that no input's TariScript is larger than the max size
+fn check_input_script_sizes(
+    inputs: &[TransactionInput],
+    max_script_size: usize,
+) -> Result<(), AggregatedBodyValidationError> {
+    for input in inputs {
+        check_tari_script_byte_size(input.script()?, max_script_size).map_err(|e| {
+            warn!(
+                target: LOG_TARGET,
+                "input ({input}) script size exceeded max size {e:?}."
+            );
+            e
+        })?;
+    }
+    Ok(())
 }
 
 /// Verify that the TariScript is not larger than the max size
@@ -442,14 +469,15 @@ fn check_total_burned(body: &AggregateBody) -> Result<(), AggregatedBodyValidati
 fn check_sidechain_features(
     constants: &ConsensusConstants,
     output: &TransactionOutput,
+    network: Network,
 ) -> Result<(), AggregatedBodyValidationError> {
     let Some(sidechain_feature) = output.features.sidechain_feature.as_ref() else {
         return Ok(());
     };
     check_sidechain_id_proof_of_knowledge(sidechain_feature)?;
-    check_validator_node_registration_utxo(constants, output, sidechain_feature)?;
+    check_validator_node_registration_utxo(constants, output, sidechain_feature, network)?;
     check_template_registration_utxo(sidechain_feature)?;
-    check_validator_node_exit_utxo(sidechain_feature)?;
+    check_validator_node_exit_utxo(sidechain_feature, network)?;
 
     Ok(())
 }
@@ -467,6 +495,7 @@ fn check_validator_node_registration_utxo(
     consensus_constants: &ConsensusConstants,
     utxo: &TransactionOutput,
     sidechain_feature: &SideChainFeature,
+    network: Network,
 ) -> Result<(), AggregatedBodyValidationError> {
     let Some(reg) = sidechain_feature.validator_node_registration() else {
         return Ok(());
@@ -487,19 +516,28 @@ fn check_validator_node_registration_utxo(
         });
     }
 
-    if !reg.is_valid_signature_for(sidechain_feature.sidechain_id.as_ref().map(|id| id.public_key())) {
+    if !reg.is_valid_signature_for(
+        network.as_byte(),
+        sidechain_feature.sidechain_id.as_ref().map(|id| id.public_key()),
+    ) {
         return Err(AggregatedBodyValidationError::InvalidValidatorNodeSignature);
     }
 
     Ok(())
 }
 
-fn check_validator_node_exit_utxo(sidechain_feature: &SideChainFeature) -> Result<(), AggregatedBodyValidationError> {
+fn check_validator_node_exit_utxo(
+    sidechain_feature: &SideChainFeature,
+    network: Network,
+) -> Result<(), AggregatedBodyValidationError> {
     let Some(exit) = sidechain_feature.validator_node_exit() else {
         return Ok(());
     };
 
-    if !exit.is_valid_signature_for(sidechain_feature.sidechain_id.as_ref().map(|id| id.public_key())) {
+    if !exit.is_valid_signature_for(
+        network.as_byte(),
+        sidechain_feature.sidechain_id.as_ref().map(|id| id.public_key()),
+    ) {
         return Err(AggregatedBodyValidationError::InvalidValidatorNodeSignature);
     }
 

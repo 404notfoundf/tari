@@ -25,6 +25,7 @@ use log::*;
 use primitive_types::U512;
 use rand::Rng;
 use tari_common_types::{
+    burn_proof::BurnOutputProof,
     chain_metadata::ChainMetadata,
     epoch::VnEpoch,
     types::{
@@ -47,16 +48,16 @@ use tari_node_components::blocks::{
     NewBlockTemplate,
 };
 use tari_transaction_components::{
-    tari_proof_of_work::PowAlgorithm,
+    tari_proof_of_work::{Difficulty, PowAlgorithm},
     transaction_components::{OutputType, TransactionInput, TransactionKernel, TransactionOutput},
 };
 use tari_utilities::epoch_time::EpochTime;
 
-use super::{BlockchainCheckStatus, MinedInfo, TemplateRegistrationEntry, ValidatorNodeRegistrationInfo};
+use super::{BlockchainCheckStatus, MinedInfo, ValidatorNodeRegistrationInfo};
 use crate::{
     blocks::{BlockAccumulatedData, UpdateBlockAccumulatedData},
     chain_storage::{
-        BlockAddResult,
+        AddBlockOutcome,
         BlockchainBackend,
         BlockchainDatabase,
         ChainStorageError,
@@ -69,7 +70,6 @@ use crate::{
         MmrTree,
         TargetDifficulties,
         blockchain_database::MmrRoots,
-        kernel_merkle_proof::KernelMerkleProof,
         utxo_mined_info::{InputMinedInfo, OutputMinedInfo},
     },
     common::rolling_vec::RollingVec,
@@ -235,8 +235,8 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
     );
 
     make_async_fn!(
-        generate_kernel_merkle_proof(excess_sig: CompressedSignature) -> KernelMerkleProof,
-        "generate_kernel_merkle_proof"
+        generate_burn_output_proof(commitment: CompressedCommitment) -> BurnOutputProof,
+        "generate_burn_output_proof"
     );
 
     //---------------------------------- MMR --------------------------------------------//
@@ -301,7 +301,7 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
     );
 
     //---------------------------------- Block --------------------------------------------//
-    make_async_fn!(add_block(block: Arc<Block>) -> BlockAddResult, "add_block");
+    make_async_fn!(add_block(block: Arc<Block>) -> AddBlockOutcome, "add_block");
 
     make_async_fn!(cleanup_orphans() -> (), "cleanup_orphans");
 
@@ -395,6 +395,11 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
     );
 
     make_async_fn!(
+        fetch_adjusted_target_difficulty(block_hash: HashOutput) -> Difficulty,
+        "fetch_adjusted_target_difficulty"
+    );
+
+    make_async_fn!(
         fetch_block_hashes_from_header_tip(n: usize, offset: usize) -> Vec<HashOutput>,
         "fetch_block_hashes_from_header_tip"
     );
@@ -440,9 +445,7 @@ impl<B: BlockchainBackend + 'static> AsyncBlockchainDb<B> {
         "get_validator_node"
     );
 
-    make_async_fn!(fetch_template_registrations<T: RangeBounds<u64>>(range: T) -> Vec<TemplateRegistrationEntry>, "fetch_template_registrations");
-
-    make_async_fn!(swap_to_highest_pow_chain() -> (), "swap to highest proof-of-work chain");
+    make_async_fn!(swap_to_highest_pow_chain() -> AddBlockOutcome, "swap to highest proof-of-work chain");
 
     make_async_fn!(
         fetch_mined_info_by_payref(payref: FixedHash) -> MinedInfo,
@@ -565,15 +568,6 @@ impl<'a, B: BlockchainBackend + 'static> AsyncDbTransaction<'a, B> {
     ) -> &mut Self {
         self.transaction
             .prune_output_from_all_dbs(output_hash, commitment, output_type);
-        self
-    }
-
-    pub fn delete_validator_node(
-        &mut self,
-        sidechain_public_key: Option<CompressedPublicKey>,
-        public_key: CompressedPublicKey,
-    ) -> &mut Self {
-        self.transaction.delete_validator_node(sidechain_public_key, public_key);
         self
     }
 

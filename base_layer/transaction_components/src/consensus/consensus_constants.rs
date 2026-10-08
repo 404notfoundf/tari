@@ -237,6 +237,12 @@ pub struct ConsensusConstants {
     /// release and therefore the binary most nodes will be upgrading from.
     #[serde(default = "pow_backoff_disabled")]
     pow_backoff_cap: u64,
+    /// The maximum size, in bytes, of a block body serialised in its compact form. See [MAX_BLOCK_BODY_BYTES].
+    ///
+    /// Defaulted for the same reason as `pow_backoff_cap`: the JSON written before this field existed does not carry
+    /// it. The binaries that wrote that file had no limit, so a missing field reads as `usize::MAX`.
+    #[serde(default = "unlimited_block_body_bytes")]
+    max_block_body_bytes: usize,
 }
 
 /// The pre-TIP-RFC-MT-0004 value of `pow_backoff_cap`, used as its serde default so that a
@@ -244,6 +250,12 @@ pub struct ConsensusConstants {
 /// running rather than as `0`.
 fn pow_backoff_disabled() -> u64 {
     POW_BACKOFF_DISABLED
+}
+
+/// The serde default of `max_block_body_bytes`: a `consensus_constants.json` written before the field existed reads
+/// back as the rules that binary was really running, which had no block body byte limit.
+fn unlimited_block_body_bytes() -> usize {
+    usize::MAX
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +300,16 @@ pub const MAINNET_PRE_MINE_VALUE: MicroMinotari = MicroMinotari((21_000_000_000 
 pub const POW_BACKOFF_CAP: u64 = 32;
 /// A `pow_backoff_cap` of 1 disables the same-algorithm backoff, which is the pre-TIP-RFC-MT-0004 behaviour.
 pub const POW_BACKOFF_DISABLED: u64 = 1;
+
+/// The maximum size, in bytes, of a block body serialised (borsh) in its compact form, i.e. with every input reduced to
+/// the hash of the output it spends. This is the form in which blocks are stored and synced, and a block is synced in a
+/// single RPC response, so a block body larger than that response cannot be synced by anyone.
+///
+/// This is a fixed consensus value rather than a reference to the networking frame sizes, so that a networking change
+/// cannot silently change which blocks are valid. It is the 8 MiB messaging frame minus 1 MiB of headroom for the
+/// header, the protobuf envelope and the response overhead; `tari_core` asserts at compile time that it stays below
+/// both the messaging and the RPC frame. Every network uses this value, from genesis.
+pub const MAX_BLOCK_BODY_BYTES: usize = 7 * 1024 * 1024;
 /// The LWMA difficulty block window after TIP-RFC-MT-0004 activates (shortened from 90 for faster response to hash
 /// rate swings).
 pub const TIP004_DIFFICULTY_BLOCK_WINDOW: u64 = 45;
@@ -515,14 +537,29 @@ impl ConsensusConstants {
 
     /// All consensus constants entries for a network, in the order they become effective.
     pub fn for_network(network: Network) -> Vec<Self> {
-        match network {
+        let constants = match network {
             Network::LocalNet => ConsensusConstants::localnet(),
             Network::Igor => ConsensusConstants::igor(),
             Network::MainNet => ConsensusConstants::mainnet(),
             Network::Esmeralda => ConsensusConstants::esmeralda(),
             Network::StageNet => ConsensusConstants::stagenet(),
             Network::NextNet => ConsensusConstants::nextnet(),
+        };
+        for c in &constants {
+            c.debug_assert_validator_node_exit_rules();
         }
+        constants
+    }
+
+    /// A network that permits `ValidatorNodeExit` outputs must allow at least one exit per epoch. With zero, every exit
+    /// is rejected at validation (`ValidatorNodeExitNotPermitted`), and before that check existed it aborted the block
+    /// at commit time instead. Networks that do not permit the output type keep zero.
+    fn debug_assert_validator_node_exit_rules(&self) {
+        debug_assert!(
+            !self.permitted_output_types.contains(&OutputType::ValidatorNodeExit) ||
+                self.vn_registration_max_exits_per_epoch > 0,
+            "ValidatorNodeExit is a permitted output type but vn_registration_max_exits_per_epoch is 0"
+        );
     }
 
     /// The single authoritative answer to "which constants are in force at `height`".
@@ -689,6 +726,11 @@ impl ConsensusConstants {
         self.max_script_byte_size
     }
 
+    /// The maximum size, in bytes, of a block body serialised in its compact form
+    pub fn max_block_body_bytes(&self) -> usize {
+        self.max_block_body_bytes
+    }
+
     /// The maximum serialized byte size of TariScript
     pub fn max_extra_encrypted_data_byte_size(&self) -> usize {
         self.max_extra_encrypted_data_byte_size
@@ -820,6 +862,26 @@ impl ConsensusConstants {
         self.bipartite_cuckaroo_verification
     }
 
+    /// The first height in `constants` at which the bipartite Cuckaroo verifier is in force, or
+    /// [`UNSCHEDULED_ACTIVATION_HEIGHT`] if no entry ever turns it on.
+    ///
+    /// This is the height of the GHSA-3qmx-q9pv-f3m4 fork, and therefore the height from which stored
+    /// `target_difficulty` values may have been computed under rules that no longer apply: the activation entry is
+    /// also where a network may change `difficulty_block_window` or `pow_backoff_cap`, and `target_difficulty` is
+    /// the only quantity that accumulates, so one stale entry poisons chain strength for every block above it. The
+    /// accumulated-data rebuild migration keys on this height.
+    ///
+    /// Derived from the constants vector rather than declared as a separate per-network constant, for the same
+    /// reason as [`ConsensusConstants::derived_monero_coinbase_activation_height`]: whatever height the entry that
+    /// carries the rule is scheduled at *is* the activation height, by construction, so it cannot go stale. The
+    /// vector is sorted by effective height (`active_at_height` relies on that), so the first match is the earliest.
+    pub fn bipartite_cuckaroo_activation_height(constants: &[ConsensusConstants]) -> u64 {
+        constants
+            .iter()
+            .find(|c| c.bipartite_cuckaroo_verification)
+            .map_or(UNSCHEDULED_ACTIVATION_HEIGHT, |c| c.effective_from_height)
+    }
+
     /// True once the aux-chain merkle proof's branch length must equal the length an honest proof for the
     /// independently derived leaf position in a tree of `number_of_chains` leaves would have. False below the fork
     /// height selects the pre-fork behaviour, which accepted any branch length up to the generic cap.
@@ -925,7 +987,7 @@ impl ConsensusConstants {
             input_version_range,
             output_version_range,
             kernel_version_range,
-            permitted_output_types: OutputType::all(),
+            permitted_output_types: OutputType::all().to_vec(),
             permitted_range_proof_types: Self::all_range_proof_types(),
             max_covenant_length: 100,
             vn_epoch_length: 10,
@@ -950,6 +1012,7 @@ impl ConsensusConstants {
             // Same reasoning: LocalNet never uses the legacy Monero coinbase wire format at all.
             derive_monero_coinbase_hasher: true,
             pow_backoff_cap: POW_BACKOFF_CAP,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         }];
         consensus_constants
     }
@@ -1012,7 +1075,7 @@ impl ConsensusConstants {
             output_version_range,
             kernel_version_range,
             // igor is the first network to support the new output types
-            permitted_output_types: OutputType::all(),
+            permitted_output_types: OutputType::all().to_vec(),
             permitted_range_proof_types: Self::all_range_proof_types(),
             max_covenant_length: 100,
             vn_epoch_length: 10,
@@ -1032,6 +1095,7 @@ impl ConsensusConstants {
             strict_merkle_tree_parameter_decoding: false,
             derive_monero_coinbase_hasher: false,
             pow_backoff_cap: POW_BACKOFF_DISABLED,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         };
 
         // All five GHSA-3qmx-q9pv-f3m4 rules share one flag day, so they share one entry: their activation
@@ -1114,6 +1178,7 @@ impl ConsensusConstants {
             strict_merkle_tree_parameter_decoding: false,
             derive_monero_coinbase_hasher: false,
             pow_backoff_cap: POW_BACKOFF_DISABLED,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         };
 
         let mut con2 = consensus_constants1.clone();
@@ -1260,6 +1325,7 @@ impl ConsensusConstants {
             strict_merkle_tree_parameter_decoding: false,
             derive_monero_coinbase_hasher: false,
             pow_backoff_cap: POW_BACKOFF_DISABLED,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         };
 
         // All five GHSA-3qmx-q9pv-f3m4 rules share one flag day, so they share one entry: their activation
@@ -1335,6 +1401,7 @@ impl ConsensusConstants {
             strict_merkle_tree_parameter_decoding: false,
             derive_monero_coinbase_hasher: false,
             pow_backoff_cap: POW_BACKOFF_DISABLED,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         };
         let mut con_2 = con_1.clone();
         con_2.coinbase_min_maturity = 120;
@@ -1471,6 +1538,7 @@ impl ConsensusConstants {
             strict_merkle_tree_parameter_decoding: false,
             derive_monero_coinbase_hasher: false,
             pow_backoff_cap: POW_BACKOFF_DISABLED,
+            max_block_body_bytes: MAX_BLOCK_BODY_BYTES,
         };
         let mut con_2 = con_1.clone();
         con_2.coinbase_min_maturity = 540; // 18 hours
@@ -1664,6 +1732,11 @@ impl ConsensusConstantsBuilder {
         self
     }
 
+    pub fn with_max_block_body_bytes(mut self, byte_size: usize) -> Self {
+        self.consensus.max_block_body_bytes = byte_size;
+        self
+    }
+
     pub fn with_max_block_transaction_weight(mut self, weight: u64) -> Self {
         self.consensus.max_block_transaction_weight = weight;
         self
@@ -1783,6 +1856,7 @@ impl ConsensusConstantsBuilder {
     }
 
     pub fn build(self) -> ConsensusConstants {
+        self.consensus.debug_assert_validator_node_exit_rules();
         self.consensus
     }
 }
@@ -2205,11 +2279,12 @@ mod activation_test {
     fn the_previous_releases_json_shape_still_deserializes_with_pre_fork_defaults() {
         // v5.6.0 is the last public release, and therefore the binary most nodes upgrade from; `pow_backoff_cap`
         // arrived after it, on the 5.7.0 pre-release line.
-        const FIELDS_ABSENT_FROM_THE_LAST_RELEASE: [&str; 4] = [
+        const FIELDS_ABSENT_FROM_THE_LAST_RELEASE: [&str; 5] = [
             "bipartite_cuckaroo_verification",
             "aux_chain_merkle_proof_depth_binding",
             "derive_monero_coinbase_hasher",
             "pow_backoff_cap",
+            "max_block_body_bytes",
         ];
 
         for network in ALL_NETWORKS {
@@ -2248,13 +2323,36 @@ mod activation_test {
                     POW_BACKOFF_DISABLED,
                     "{network} entry {index}: must default to the backoff being disabled, never to 0"
                 );
+                assert_eq!(
+                    constants.max_block_body_bytes(),
+                    usize::MAX,
+                    "{network} entry {index}: must default to no block body byte limit"
+                );
                 // Everything else must survive the round trip untouched, or the defaults are masking a real change.
                 let mut expected = current.get(index).expect("same length").clone();
                 expected.bipartite_cuckaroo_verification = false;
                 expected.aux_chain_merkle_proof_depth_binding = false;
                 expected.derive_monero_coinbase_hasher = false;
                 expected.pow_backoff_cap = POW_BACKOFF_DISABLED;
+                expected.max_block_body_bytes = usize::MAX;
                 assert_eq!(constants, &expected, "{network} entry {index}");
+            }
+        }
+    }
+
+    /// The block body byte limit is a consensus value: pin it as a literal, and check that every network applies it
+    /// from genesis (it has no activation height).
+    #[test]
+    fn every_network_limits_the_block_body_bytes_from_genesis() {
+        assert_eq!(MAX_BLOCK_BODY_BYTES, 7_340_032);
+        for network in ALL_NETWORKS {
+            for constants in ConsensusConstants::for_network(network) {
+                assert_eq!(
+                    constants.max_block_body_bytes(),
+                    MAX_BLOCK_BODY_BYTES,
+                    "{network} entry at height {}",
+                    constants.effective_from_height()
+                );
             }
         }
     }
@@ -2640,6 +2738,196 @@ mod test {
         transaction_components::{OutputType, RangeProofType},
     };
 
+    /// Every network that permits `ValidatorNodeExit` outputs must allow at least one exit per epoch; with zero,
+    /// every exit is rejected. Public networks keep zero and do not permit the output type.
+    #[test]
+    fn validator_node_exit_networks_allow_at_least_one_exit_per_epoch() {
+        use tari_common::configuration::Network;
+
+        for network in [
+            Network::MainNet,
+            Network::StageNet,
+            Network::NextNet,
+            Network::LocalNet,
+            Network::Igor,
+            Network::Esmeralda,
+        ] {
+            for c in ConsensusConstants::for_network(network) {
+                if c.permitted_output_types().contains(&OutputType::ValidatorNodeExit) {
+                    assert!(c.vn_registration_max_exits_per_epoch() > 0, "{network}");
+                } else {
+                    assert_eq!(c.vn_registration_max_exits_per_epoch(), 0, "{network}");
+                }
+            }
+        }
+    }
+
+    /// The decode-time size bounds in this crate and `tari_script` are applied when a value is decoded, before any
+    /// consensus rule runs. Where a bound backs a consensus limit (CoinBaseExtra, EncryptedData, `MAX_SCRIPT_BYTES`,
+    /// `MAX_COVENANT_TOKENS`), it must be at least as large as that limit for every network and every consensus
+    /// constants epoch; otherwise values that are valid by the consensus rules could not even be decoded, which would
+    /// be a silent consensus change.
+    ///
+    /// `MAX_COVENANT_BYTES` and `MAX_SCRIPT_OPCODES` back no consensus constant; they are stand-alone decode rules and
+    /// are only pinned to their current values here. The `PowData` bound is checked in tari_core
+    /// (`pow_data_decode_bound_covers_every_per_algorithm_limit`).
+    #[test]
+    fn decode_bounds_cover_every_consensus_limit() {
+        use tari_common::configuration::Network;
+        use tari_common_types::tari_address::MAX_PAYMENT_ID_SIZE;
+        use tari_script::{MAX_SCRIPT_BYTES, MAX_SCRIPT_OPCODES, MAX_STACK_SIZE};
+
+        use crate::transaction_components::{
+            CoinBaseExtra,
+            covenants::{MAX_BYTES_ARG_SIZE, MAX_COVENANT_BYTES, MAX_COVENANT_TOKENS},
+            encrypted_data::{MAX_ENCRYPTED_DATA_SIZE, STATIC_ENCRYPTED_DATA_SIZE_TOTAL},
+        };
+
+        let coinbase_extra_max = CoinBaseExtra::default().max_size();
+        assert_eq!(coinbase_extra_max, 258);
+        // The payment id carried by encrypted data is exactly what fits after the fixed part
+        assert_eq!(
+            MAX_ENCRYPTED_DATA_SIZE,
+            MAX_PAYMENT_ID_SIZE + STATIC_ENCRYPTED_DATA_SIZE_TOTAL
+        );
+        // A bytes argument lives inside a covenant, so the covenant byte limit is the effective one
+        const { assert!(MAX_BYTES_ARG_SIZE >= MAX_COVENANT_BYTES) };
+        // There is no consensus constant for the covenant byte size: `max_covenant_length` counts tokens. The byte
+        // cap is therefore not "covered" by anything here; it is its own decode-time rule and is only pinned so a
+        // change to it is visible.
+        const { assert!(MAX_COVENANT_BYTES == 4096) };
+        // The script opcode cap does NOT cover `max_script_byte_size`: the smallest opcode encodes to one byte, so a
+        // script of `max_script_byte_size` (512) bytes could hold up to 512 opcodes, but every decoder rejects more
+        // than `MAX_SCRIPT_OPCODES` (128). That makes the opcode cap a separate, stricter consensus rule rather than
+        // a decode bound backing a consensus limit. It is applied equally by every node, so it is not a split risk,
+        // but it is consensus critical in its own right and pinned here so a change is visible. The per-epoch
+        // assertion below checks it really is the binding limit, keeping this comment honest.
+        const { assert!(MAX_SCRIPT_OPCODES == 128) };
+        // The execution stack item cap is a stand-alone consensus rule with no `ConsensusConstants` counterpart.
+        const { assert!(MAX_STACK_SIZE == 255) };
+        /// The smallest encoded size of a single opcode (e.g. `Nop`, `Dup`, `Drop`)
+        const MIN_OPCODE_ENCODED_SIZE: usize = 1;
+
+        for network in [
+            Network::MainNet,
+            Network::StageNet,
+            Network::NextNet,
+            Network::LocalNet,
+            Network::Igor,
+            Network::Esmeralda,
+        ] {
+            let all = ConsensusConstants::for_network(network);
+            assert!(!all.is_empty());
+            for (epoch, c) in all.iter().enumerate() {
+                assert!(
+                    coinbase_extra_max >= c.coinbase_output_features_extra_max_length() as usize,
+                    "{network} epoch {epoch}: CoinBaseExtra bound is smaller than \
+                     coinbase_output_features_extra_max_length"
+                );
+                assert!(
+                    MAX_ENCRYPTED_DATA_SIZE >=
+                        c.max_extra_encrypted_data_byte_size() + STATIC_ENCRYPTED_DATA_SIZE_TOTAL,
+                    "{network} epoch {epoch}: EncryptedData bound is smaller than max_extra_encrypted_data_byte_size"
+                );
+                assert!(
+                    MAX_SCRIPT_BYTES >= c.max_script_byte_size(),
+                    "{network} epoch {epoch}: MAX_SCRIPT_BYTES is smaller than max_script_byte_size"
+                );
+                assert!(
+                    MAX_SCRIPT_OPCODES * MIN_OPCODE_ENCODED_SIZE < c.max_script_byte_size(),
+                    "{network} epoch {epoch}: MAX_SCRIPT_OPCODES is no longer the binding script limit; update the \
+                     comment above"
+                );
+                assert!(
+                    MAX_COVENANT_TOKENS >= c.max_covenant_length() as usize,
+                    "{network} epoch {epoch}: MAX_COVENANT_TOKENS is smaller than max_covenant_length"
+                );
+            }
+        }
+    }
+
+    /// The boundary the accumulated-data repair migration keys on.
+    ///
+    /// MainNet's GHSA-3qmx-q9pv-f3m4 entry also takes `difficulty_block_window` from 90 to 45, which makes the fix
+    /// retroactive for anyone already past the fork: their stored `target_difficulty` was computed with the long
+    /// window and no longer recomputes to the same value. `pow_backoff_cap` deliberately does *not* move with it -
+    /// MainNet carries half a TIP-004 activation, with `MAINNET_TIP004_ACTIVATION_HEIGHT` still unscheduled - and
+    /// if it is ever scheduled that is a second retroactive target change needing a second migration.
+    ///
+    /// `pow_backoff.rs::activation_matches_the_agreed_network_rollout` pins the window at height 0 and at the
+    /// TIP-004 fork. MainNet now changes its window at a *different* height from that fork, so this boundary is
+    /// not covered there.
+    #[test]
+    fn mainnet_narrows_the_difficulty_window_at_the_c29_fork_without_touching_the_backoff() {
+        use tari_common::configuration::Network;
+
+        use crate::consensus::consensus_constants::{
+            MAINNET_C29_BIPARTITE_ACTIVATION_HEIGHT,
+            POW_BACKOFF_DISABLED,
+            TIP004_DIFFICULTY_BLOCK_WINDOW,
+            UNSCHEDULED_ACTIVATION_HEIGHT,
+        };
+
+        const ACTIVATION: u64 = MAINNET_C29_BIPARTITE_ACTIVATION_HEIGHT;
+
+        for height in [0, 1, ACTIVATION - 1] {
+            let below = ConsensusConstants::for_network_at_height(Network::MainNet, height);
+            assert_eq!(below.difficulty_block_window(), 90, "MainNet window at {height}");
+            assert_eq!(below.pow_backoff_cap(), POW_BACKOFF_DISABLED, "MainNet cap at {height}");
+            assert!(
+                !below.bipartite_cuckaroo_verification(),
+                "MainNet bipartite verifier at {height}"
+            );
+        }
+
+        for height in [ACTIVATION, ACTIVATION + 1, ACTIVATION + 1_000_000] {
+            let at_or_above = ConsensusConstants::for_network_at_height(Network::MainNet, height);
+            assert_eq!(
+                at_or_above.difficulty_block_window(),
+                TIP004_DIFFICULTY_BLOCK_WINDOW,
+                "MainNet window at {height}"
+            );
+            // Deliberately unchanged across the boundary: the C29 entry narrows the window without scheduling the
+            // TIP-004 backoff.
+            assert_eq!(
+                at_or_above.pow_backoff_cap(),
+                POW_BACKOFF_DISABLED,
+                "MainNet cap at {height}"
+            );
+            assert!(
+                at_or_above.bipartite_cuckaroo_verification(),
+                "MainNet bipartite verifier at {height}"
+            );
+        }
+
+        // The migration derives the fork height off the constants vector rather than off a per-network constant, so
+        // it cannot go stale. Pin what it derives for every network.
+        assert_eq!(
+            ConsensusConstants::bipartite_cuckaroo_activation_height(&ConsensusConstants::mainnet()),
+            ACTIVATION
+        );
+        // LocalNet is ephemeral and carries the rule on its height-0 entry, so there is nothing to repair there.
+        assert_eq!(
+            ConsensusConstants::bipartite_cuckaroo_activation_height(&ConsensusConstants::localnet()),
+            0
+        );
+        assert_eq!(
+            ConsensusConstants::bipartite_cuckaroo_activation_height(&ConsensusConstants::esmeralda()),
+            crate::consensus::consensus_constants::ESMERALDA_C29_BIPARTITE_ACTIVATION_HEIGHT
+        );
+        // Unscheduled networks: the migration skips them entirely.
+        for constants in [
+            ConsensusConstants::igor(),
+            ConsensusConstants::stagenet(),
+            ConsensusConstants::nextnet(),
+        ] {
+            assert_eq!(
+                ConsensusConstants::bipartite_cuckaroo_activation_height(&constants),
+                UNSCHEDULED_ACTIVATION_HEIGHT
+            );
+        }
+    }
+
     #[test]
     fn hybrid_pow_constants_are_well_formed() {
         ConsensusConstants::localnet();
@@ -2796,9 +3084,33 @@ mod test {
         }
     }
 
+    /// Code template registration is deprecated: no network permits its output type in any entry.
+    #[test]
+    fn no_network_permits_code_template_registration_outputs() {
+        use tari_common::configuration::Network;
+
+        for network in [
+            Network::LocalNet,
+            Network::Igor,
+            Network::Esmeralda,
+            Network::NextNet,
+            Network::StageNet,
+            Network::MainNet,
+        ] {
+            for (index, constants) in ConsensusConstants::for_network(network).iter().enumerate() {
+                assert!(
+                    !constants
+                        .permitted_output_types()
+                        .contains(&OutputType::CodeTemplateRegistration),
+                    "{network} entry {index}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn range_proof_types_coverage() {
-        let output_type_variants = OutputType::all();
+        let output_type_variants = OutputType::all().to_vec();
         let range_proof_type_variants = RangeProofType::all();
 
         let permitted_range_proof_types = ConsensusConstants::current_permitted_range_proof_types().to_vec();

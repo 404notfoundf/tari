@@ -21,6 +21,20 @@
 //! `exclude`d from the root workspace and is its own workspace root. Do not move it back into `members`; see the
 //! comment on `[workspace] exclude` in the repository root `Cargo.toml`.
 //!
+//! # Its one dependent in the root workspace
+//!
+//! `tari_transaction_components` links this crate for its key manager suite (`tests/ledger_key_manager`), which
+//! drives the `ledger_*_wrapper` methods of `manager.rs` against a simulator. It does so as a **dev**-dependency in
+//! a `[target.'cfg(tari_ledger_speculos)'.dev-dependencies]` table:
+//!
+//! * a dev-dependency is never resolved by a non-test build, so no binary - shipped or not - can link this crate;
+//! * the custom cfg is set only by `scripts/ledger_speculos.sh` (through `RUSTFLAGS`, into its own target directory),
+//!   so without it the table does not exist, and `cargo test --workspace`, `cargo ci-test` and `cargo ci-clippy` never
+//!   resolve this crate either.
+//!
+//! A plain dev-dependency would have failed the second half and made the first check below print a line. The
+//! comment on that table in `base_layer/transaction_components/Cargo.toml` has the rest.
+//!
 //! # The check that keeps that true
 //!
 //! Both of these must be run **without `-p`**. A `-p` narrows feature resolution and hides exactly the problem
@@ -74,10 +88,30 @@
 //!
 //! The simulator is deliberately **not** restarted between scenarios. See
 //! [`approver::SpeculosApprover::expect_home`] for what a restart would destroy.
+//!
+//! # The scenarios themselves
+//!
+//! Everything above is apparatus. [`scenarios`] is what it is for: one library of assertions, run by two frontends
+//! that share it completely.
+//!
+//! * `tests/speculos_scenarios.rs` runs every scenario against a simulator, unattended, on every model and seed.
+//! * `examples/ledger_demo.rs` runs **the same scenarios with the same assertions** against real hardware.
+//!
+//! A scenario declares whether it needs approval and nothing else varies between them, which is affordable because
+//! exactly one instruction shows a screen. Two supporting modules:
+//!
+//! * [`raw`] - the only place in this crate that builds an APDU, and the seam a shared wire-format codec would replace.
+//!   Rejection scenarios have to send bytes no accessor method would, because the accessors mirror the device's rules
+//!   and refuse them before opening the transport.
+//! * [`fixtures`] - the inputs, hand built from `tari_crypto` rather than through the key manager, and the host side
+//!   arithmetic that checks what comes back.
 
 pub mod approver;
+pub mod fixtures;
 pub mod oracle;
+pub mod raw;
 pub mod review;
+pub mod scenarios;
 pub mod seeds;
 pub mod simulator;
 pub mod speculos_api;

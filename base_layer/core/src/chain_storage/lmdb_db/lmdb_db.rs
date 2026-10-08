@@ -86,7 +86,7 @@
 #![allow(clippy::mutable_key_type)]
 
 use std::{
-    cmp::max,
+    cmp::{max, min},
     convert::TryFrom,
     fmt,
     fs::{self, File},
@@ -132,12 +132,14 @@ use tari_common_types::{
     },
 };
 use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
-use tari_sidechain::ShardGroup;
 use tari_storage::lmdb_store::{BYTES_PER_MB, LMDBBuilder, LMDBConfig, LMDBStore, db};
 use tari_transaction_components::{
     MicroMinotari,
     aggregated_body::AggregateBody,
-    consensus::{ConsensusConstants, consensus_constants::BlockVersion},
+    consensus::{
+        ConsensusConstants,
+        consensus_constants::{BlockVersion, UNSCHEDULED_ACTIVATION_HEIGHT},
+    },
     tari_proof_of_work::{AccumulatedDifficulty, Difficulty, PowAlgorithm},
     transaction_components::{
         OutputType,
@@ -157,8 +159,6 @@ use tari_utilities::{
 use tokio::sync::watch;
 
 use super::{
-    cursors::KeyPrefixCursor,
-    lmdb::lmdb_get_prefix_cursor,
     lmdb_tree_reader::{LmdbTreeReader, OwnedLmdbTreeReader},
     lmdb_tree_writer::LmdbTreeWriter,
     stats_collector::{DatabaseStats, LMDBStatsCollector, MigrationPhase},
@@ -177,7 +177,6 @@ use crate::{
         MmrTree,
         Optional,
         Reorg,
-        TemplateRegistrationEntry,
         ValidatorNodeEntry,
         ValidatorNodeRegistrationInfo,
         db_transaction::{
@@ -296,6 +295,8 @@ const LMDB_DB_REORGS: &str = "reorgs";
 const LMDB_DB_VALIDATOR_NODES: &str = "validator_nodes";
 const LMDB_DB_VALIDATOR_NODES_ACTIVATION: &str = "validator_nodes_activation_queue";
 const LMDB_DB_VALIDATOR_NODES_EXIT: &str = "validator_nodes_exit";
+const LMDB_DB_VALIDATOR_NODES_CANCELLED: &str = "validator_nodes_cancelled";
+/// Retired: code template registrations are no longer indexed. Only opened by the v9 migration, which drops it.
 const LMDB_DB_TEMPLATE_REGISTRATIONS: &str = "template_registrations";
 const LMDB_DB_UTXO_SMT: &str = "utxo_smt";
 const LMDB_DB_JMT_VALUE_DATA_V1: &str = "jmt_value_data";
@@ -339,17 +340,26 @@ pub fn get_all_database_names() -> Vec<&'static str> {
         LMDB_DB_VALIDATOR_NODES,
         LMDB_DB_VALIDATOR_NODES_ACTIVATION,
         LMDB_DB_VALIDATOR_NODES_EXIT,
-        LMDB_DB_TEMPLATE_REGISTRATIONS,
+        LMDB_DB_VALIDATOR_NODES_CANCELLED,
         LMDB_DB_UTXO_SMT,
         LMDB_DB_JMT_VALUE_DATA_V2,
         LMDB_DB_JMT_NODE_DATA_V2,
     ]
 }
 
+/// Returns the names of retired LMDB databases that may still exist in databases that have not yet been migrated.
+/// These are not opened by a running node, but diagnostic tools can use them to inspect older databases.
+pub fn get_legacy_database_names() -> Vec<&'static str> {
+    vec![
+        LMDB_DB_TEMPLATE_REGISTRATIONS,
+        LMDB_DB_JMT_VALUE_DATA_V1,
+        LMDB_DB_JMT_NODE_DATA_V1,
+        LMDB_DB_JMT_UNIQUE_KEY_DATA,
+    ]
+}
+
 /// HeaderHash(32), mmr_pos(8), hash(32)
 type KernelKey = CompositeKey<72>;
-/// Height(8), Hash(32)
-type CodeTemplateRegistrationKey = CompositeKey<40>;
 /// Core database creation logic shared between public functions.
 ///
 /// Exposed `pub(crate)` so tests can open an LMDB at a known path with the exact same
@@ -407,7 +417,7 @@ pub(crate) fn build_lmdb_store<P: AsRef<Path>>(
         .add_database(LMDB_DB_VALIDATOR_NODES, flags)
         .add_database(LMDB_DB_VALIDATOR_NODES_ACTIVATION, flags | db::DUPSORT | db::DUPFIXED)
         .add_database(LMDB_DB_VALIDATOR_NODES_EXIT, flags)
-        .add_database(LMDB_DB_TEMPLATE_REGISTRATIONS, flags | db::DUPSORT)
+        .add_database(LMDB_DB_VALIDATOR_NODES_CANCELLED, flags)
         .add_database(LMDB_DB_UTXO_SMT, flags)
         .add_database(LMDB_DB_JMT_VALUE_DATA_V2, flags)
         .add_database(LMDB_DB_JMT_NODE_DATA_V2, flags)
@@ -874,8 +884,9 @@ pub struct LMDBDatabase {
     validator_nodes_activation_queue: DatabaseRef,
     /// Maps <VN Public Key, Height, Commitment> -> ValidatorNodeEntry
     validator_nodes_exit_queue: DatabaseRef,
-    /// Maps CodeTemplateRegistration <block_height, output hash> -> TemplateRegistration
-    template_registrations: DatabaseRef,
+    /// Maps <spent registration output hash> -> ValidatorNodeEntry removed when a pending registration was cancelled
+    /// by spending its output, so that rewinding the spend can restore it
+    validator_nodes_cancelled: DatabaseRef,
     /// Stores a cache of the sparse merkle tree on the latest mod 1000 height
     utxo_smt: DatabaseRef,
     jmt_value_data: DatabaseRef,
@@ -938,7 +949,7 @@ impl LMDBDatabase {
             validator_nodes: get_database(store, LMDB_DB_VALIDATOR_NODES)?,
             validator_nodes_activation_queue: get_database(store, LMDB_DB_VALIDATOR_NODES_ACTIVATION)?,
             validator_nodes_exit_queue: get_database(store, LMDB_DB_VALIDATOR_NODES_EXIT)?,
-            template_registrations: get_database(store, LMDB_DB_TEMPLATE_REGISTRATIONS)?,
+            validator_nodes_cancelled: get_database(store, LMDB_DB_VALIDATOR_NODES_CANCELLED)?,
             utxo_smt: get_database(store, LMDB_DB_UTXO_SMT)?,
             jmt_value_data: get_database(store, LMDB_DB_JMT_VALUE_DATA_V2)?,
             jmt_node_data: get_database(store, LMDB_DB_JMT_NODE_DATA_V2)?,
@@ -1047,6 +1058,18 @@ impl LMDBDatabase {
                         "orphan_chain_tips_db",
                     )?;
                 },
+                DeleteOrphanChainTipIfExists(hash) => {
+                    lmdb_delete_if_exists(&write_txn, &self.orphan_chain_tips_db, hash.deref())?;
+                },
+                SetAccumulatedDataRebuildStatus(status) => {
+                    lmdb_replace(
+                        &write_txn,
+                        &self.metadata_db,
+                        &MetadataKey::AccumulatedDataRebuildStatus.as_u32(),
+                        &MetadataValue::AccumulatedDataRebuildStatus(status.clone()),
+                        None,
+                    )?;
+                },
                 InsertOrphanChainTip(hash, total_accumulated_difficulty) => {
                     lmdb_insert(
                         &write_txn,
@@ -1096,13 +1119,6 @@ impl LMDBDatabase {
                     output_type,
                 } => {
                     self.prune_output_from_all_dbs(&write_txn, output_hash, commitment, *output_type)?;
-                },
-                DeleteValidatorNode {
-                    sidechain_public_key,
-                    public_key,
-                } => {
-                    self.validator_node_store(&write_txn)
-                        .delete(sidechain_public_key.as_ref(), public_key)?;
                 },
                 DeleteAllKernelsInBlock { block_hash } => {
                     self.delete_all_kernels_in_block(&write_txn, block_hash)?;
@@ -1262,7 +1278,7 @@ impl LMDBDatabase {
                 &self.validator_nodes_activation_queue,
             ),
             (LMDB_DB_VALIDATOR_NODES_EXIT, &self.validator_nodes_exit_queue),
-            (LMDB_DB_TEMPLATE_REGISTRATIONS, &self.template_registrations),
+            (LMDB_DB_VALIDATOR_NODES_CANCELLED, &self.validator_nodes_cancelled),
             (LMDB_DB_UTXO_SMT, &self.utxo_smt),
             (LMDB_DB_JMT_VALUE_DATA_V2, &self.jmt_value_data),
             (LMDB_DB_JMT_NODE_DATA_V2, &self.jmt_node_data),
@@ -1825,36 +1841,30 @@ impl LMDBDatabase {
                 },
             }
 
-            // If an output was already spent in the block, it was never created as unspent, so don't delete it as it
-            // does not exist here
-            if inputs.iter().any(|(_, r)| r.input.output_hash() == output_hash) {
-                trace!(target: LOG_TARGET, "Not deleting UTXO `{output_hash}` - immediate spend");
-                continue;
-            }
-
+            // The sidechain effects are undone for every output, including one spent in this same block: applying the
+            // block ran `handle_sidechain_utxo` for every output, whether or not it was also spent here.
             if let Some(sidechain_features) = utxo.output.features.sidechain_feature.as_ref() {
                 match &sidechain_features.data {
                     SideChainFeatureData::ValidatorNodeRegistration(vn_reg) => {
-                        self.validator_node_store(txn)
-                            .delete(sidechain_features.sidechain_public_key(), vn_reg.public_key())?;
-                    },
-                    SideChainFeatureData::CodeTemplateRegistration(_) => {
-                        let key = CodeTemplateRegistrationKey::try_from_parts(&[
-                            height.to_be_bytes().as_slice(),
-                            output_hash.as_slice(),
-                        ])?;
-                        lmdb_delete(txn, &self.template_registrations, &key, "template_registrations")?;
-                    },
-                    SideChainFeatureData::ConfidentialOutput(_) => {
-                        // Nothing to do
-                    },
-                    SideChainFeatureData::EvictionProof(evict) => {
-                        let next_epoch = constants.block_height_to_epoch(height).saturating_add(VnEpoch(1));
-                        self.validator_node_store(txn).undo_exit(
+                        // Every later block has been rewound already, so the entry this output created should be back
+                        // in the registered set (an exit is undone with `undo_exit`, and a spend never removes it).
+                        // Checked by commitment, and tolerant so that an unexpected state cannot abort the reorg.
+                        if !self.validator_node_store(txn).delete_registration(
                             sidechain_features.sidechain_public_key(),
-                            next_epoch,
-                            evict.node_to_evict(),
-                        )?;
+                            vn_reg.public_key(),
+                            &utxo.output.commitment,
+                        )? {
+                            warn!(
+                                target: LOG_TARGET,
+                                "Rewinding validator node registration {} in block {}: no matching validator node \
+                                 entry to remove",
+                                vn_reg.public_key(),
+                                block_hash.to_hex()
+                            );
+                        }
+                    },
+                    SideChainFeatureData::CodeTemplateRegistration(_) | SideChainFeatureData::ConfidentialOutput(_) => {
+                        // Nothing to do
                     },
                     SideChainFeatureData::ValidatorNodeExit(vn_exit) => {
                         // The exit must be on or after the next epoch
@@ -1866,6 +1876,13 @@ impl LMDBDatabase {
                         )?;
                     },
                 }
+            }
+
+            // If an output was already spent in the block, it was never created as unspent, so don't delete it as it
+            // does not exist here
+            if inputs.iter().any(|(_, r)| r.input.output_hash() == output_hash) {
+                trace!(target: LOG_TARGET, "Not deleting UTXO `{output_hash}` - immediate spend");
+                continue;
             }
 
             // If an output was burned, it was never created as an unspent utxo
@@ -1892,7 +1909,8 @@ impl LMDBDatabase {
             )?;
         }
         // Move inputs in this block back into the unspent set, any outputs spent within this block they will be removed
-        // by deleting all the block's outputs below
+        // by deleting all the block's outputs below. A spend that cancelled a pending validator node registration is
+        // undone by restoring the recorded entry.
         for (_, row) in inputs {
             // If input spends an output in this block, don't add it to the utxo set
             let output_hash = row.input.output_hash();
@@ -1919,6 +1937,22 @@ impl LMDBDatabase {
                     field: "hash",
                     value: output_hash.to_hex(),
                 })?;
+
+            if utxo_mined_info
+                .output
+                .features
+                .sidechain_feature
+                .as_ref()
+                .is_some_and(|f| f.validator_node_registration().is_some()) &&
+                self.validator_node_store(txn)
+                    .undo_cancel_registration(block_hash.as_slice(), output_hash.as_slice())?
+            {
+                debug!(
+                    target: LOG_TARGET,
+                    "Restored validator node registration {} whose cancelling spend was rewound",
+                    output_hash.to_hex()
+                );
+            }
 
             let smt_key = KeyHash(
                 utxo_mined_info
@@ -2236,12 +2270,31 @@ impl LMDBDatabase {
             );
             batch.push((smt_key, None));
 
+            // Spending a registration output that is still pending activation cancels the registration: its entry is
+            // removed from the registered set and recorded against the spent output so that rewinding the spend
+            // restores it. Validation rejects spending an active registration (see
+            // `check_validator_node_registration_spend`), and a registration whose exit has taken effect is no longer
+            // in the registered set, so for those this is a no-op.
             let features = input_with_output_data.features()?;
             if let Some(sidechain_feature) = features.sidechain_feature.as_ref() &&
                 let Some(vn_reg) = sidechain_feature.validator_node_registration()
             {
-                self.validator_node_store(txn)
-                    .delete(sidechain_feature.sidechain_public_key(), vn_reg.public_key())?;
+                let output_hash = input_with_output_data.output_hash();
+                if self.validator_node_store(txn).cancel_registration(
+                    sidechain_feature.sidechain_public_key(),
+                    vn_reg.public_key(),
+                    input_with_output_data.commitment()?,
+                    block_hash.as_slice(),
+                    output_hash.as_slice(),
+                )? {
+                    info!(
+                        target: LOG_TARGET,
+                        "Validator node registration {} cancelled by spending output {} in block {}",
+                        vn_reg.public_key(),
+                        output_hash.to_hex(),
+                        current_header_at_height.height,
+                    );
+                }
             }
             trace!(
                 target: LOG_TARGET,
@@ -2318,6 +2371,7 @@ impl LMDBDatabase {
             self.validator_nodes.clone(),
             self.validator_nodes_activation_queue.clone(),
             self.validator_nodes_exit_queue.clone(),
+            self.validator_nodes_cancelled.clone(),
         )
     }
 
@@ -2343,36 +2397,8 @@ impl LMDBDatabase {
                     vn_reg,
                 )?;
             },
-            SideChainFeatureData::CodeTemplateRegistration(template_reg) => {
-                let output_hash = output.hash();
-                let record = TemplateRegistrationEntry {
-                    registration_data: template_reg.clone(),
-                    output_hash,
-                    block_height: header.height,
-                    block_hash: header.hash(),
-                };
-
-                self.insert_template_registration(txn, &record)?;
-            },
-            SideChainFeatureData::ConfidentialOutput(_) => {
+            SideChainFeatureData::CodeTemplateRegistration(_) | SideChainFeatureData::ConfidentialOutput(_) => {
                 // Nothing to do
-            },
-            SideChainFeatureData::EvictionProof(proof) => {
-                let store = self.validator_node_store(txn);
-                let evict_node = proof.node_to_evict();
-                let constants = self.get_consensus_constants(header.height);
-                let next_epoch = constants
-                    .block_height_to_epoch(header.height)
-                    .saturating_add(VnEpoch(1));
-                let sidechain_pk = sidechain_feature.sidechain_id().map(|id| id.public_key());
-                info!(
-                    target: LOG_TARGET,
-                    "Evicting ValidatorNode in {}: public_key: {}, sidechain_public_key: {:?}",
-                    next_epoch,
-                    evict_node,
-                    sidechain_pk.map(|pk| pk.to_hex()),
-                );
-                store.exit(sidechain_pk, evict_node, next_epoch)?;
             },
             SideChainFeatureData::ValidatorNodeExit(exit) => {
                 let store = self.validator_node_store(txn);
@@ -2883,24 +2909,6 @@ impl LMDBDatabase {
         debug!(target: LOG_TARGET, "Cleaned out {num_deleted} stale bad blocks");
 
         Ok(())
-    }
-
-    fn insert_template_registration(
-        &self,
-        txn: &WriteTransaction<'_>,
-        template_registration: &TemplateRegistrationEntry,
-    ) -> Result<(), ChainStorageError> {
-        let key = CodeTemplateRegistrationKey::try_from_parts(&[
-            template_registration.block_height.to_le_bytes().as_slice(),
-            template_registration.output_hash.as_slice(),
-        ])?;
-        lmdb_insert(
-            txn,
-            &self.template_registrations,
-            &key,
-            template_registration,
-            "template_registrations",
-        )
     }
 
     /// Fetches every output indexed under `output_hash`. A hash may map to multiple indexes (e.g. the
@@ -3697,6 +3705,22 @@ impl BlockchainBackend for LMDBDatabase {
         }
     }
 
+    fn set_accumulated_data_rebuild_status(
+        &self,
+        status: AccumulatedDataRebuildStatus,
+    ) -> Result<(), ChainStorageError> {
+        let write_txn = self.write_transaction()?;
+        lmdb_replace(
+            &write_txn,
+            &self.metadata_db,
+            &MetadataKey::AccumulatedDataRebuildStatus.as_u32(),
+            &MetadataValue::AccumulatedDataRebuildStatus(status),
+            None,
+        )?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
     // Returns the burn commitment index rebuild status.
     fn fetch_burn_commitment_rebuild_status(&self) -> Result<BurnCommitmentRebuildStatus, ChainStorageError> {
         let txn = self.read_transaction()?;
@@ -4028,6 +4052,17 @@ impl BlockchainBackend for LMDBDatabase {
             })?)
         }
         Ok(res)
+    }
+
+    fn fetch_orphan_hashes_at_or_above(&self, height: u64) -> Result<Vec<HashOutput>, ChainStorageError> {
+        let txn = self.read_transaction()?;
+        lmdb_filter_map_values(&txn, &self.orphans_db, |block: Block| {
+            if block.header.height >= height {
+                Some(block.hash())
+            } else {
+                None
+            }
+        })
     }
 
     fn fetch_orphan_chain_block(&self, hash: HashOutput) -> Result<Option<ChainBlock>, ChainStorageError> {
@@ -4420,26 +4455,26 @@ impl BlockchainBackend for LMDBDatabase {
         Ok(is_active)
     }
 
-    fn validator_node_is_active_for_shard_group(
+    fn fetch_validator_node_entry(
         &self,
         sidechain_pk: Option<&CompressedPublicKey>,
-        end_epoch: VnEpoch,
-        validator_node_pk: &CompressedPublicKey,
-        _shard_group: ShardGroup,
-    ) -> Result<bool, ChainStorageError> {
-        // TODO: account for shard group
-        self.validator_node_is_active(sidechain_pk, end_epoch, validator_node_pk)
+        public_key: &CompressedPublicKey,
+    ) -> Result<Option<ValidatorNodeEntry>, ChainStorageError> {
+        let txn = self.read_transaction()?;
+        let store = self.validator_node_store(&txn);
+        store.get(sidechain_pk, public_key)
     }
 
-    fn validator_nodes_count_for_shard_group(
+    fn validator_node_has_pending_exit(
         &self,
         sidechain_pk: Option<&CompressedPublicKey>,
-        end_epoch: VnEpoch,
-        _shard_group: ShardGroup,
-    ) -> Result<usize, ChainStorageError> {
+        public_key: &CompressedPublicKey,
+        commitment: &CompressedCommitment,
+        epoch: VnEpoch,
+    ) -> Result<bool, ChainStorageError> {
         let txn = self.read_transaction()?;
-        let vn_store = self.validator_node_store(&txn);
-        vn_store.count_active_validators(sidechain_pk, end_epoch)
+        let store = self.validator_node_store(&txn);
+        store.has_pending_exit(sidechain_pk, public_key, commitment, epoch)
     }
 
     fn get_validator_node(
@@ -4491,24 +4526,6 @@ impl BlockchainBackend for LMDBDatabase {
             original_registration: reg.clone(),
             minimum_value_promise: vn.minimum_value_promise,
         }))
-    }
-
-    fn fetch_template_registrations(
-        &self,
-        start_height: u64,
-        end_height: u64,
-    ) -> Result<Vec<TemplateRegistrationEntry>, ChainStorageError> {
-        let txn = self.read_transaction()?;
-        let mut result = vec![];
-        for _ in start_height..=end_height {
-            let height = start_height.to_le_bytes();
-            let mut cursor: KeyPrefixCursor<TemplateRegistrationEntry> =
-                lmdb_get_prefix_cursor(&txn, &self.template_registrations, &height)?;
-            while let Some((_, val)) = cursor.next()? {
-                result.push(val);
-            }
-        }
-        Ok(result)
     }
 
     fn set_stats_total_height(&self, total: u64) {
@@ -5037,11 +5054,32 @@ impl fmt::Display for MetadataValue {
     }
 }
 
+/// Rewind the recorded migration version, so that reopening the same directory runs the migrations from
+/// `version` again.
+///
+/// Migrations are the one piece of startup behaviour a test cannot reach by building a database and looking at it:
+/// they run once, inside `LMDBDatabase::new`, and a database built by a test is already at the current version by
+/// the time the test can touch it. Meeting a migration the way the field meets it - an existing chain, opened by a
+/// binary that has moved on - means putting the version back first.
+#[cfg(test)]
+pub(crate) fn rewind_migration_version_for_test(db: &LMDBDatabase, version: u64) -> Result<(), ChainStorageError> {
+    let txn = db.write_transaction()?;
+    lmdb_replace(
+        &txn,
+        &db.metadata_db,
+        &MetadataKey::MigrationVersion.as_u32(),
+        &MetadataValue::MigrationVersion(version),
+        None,
+    )?;
+    txn.commit()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
     let _unused = verify_metadata_keys(db);
 
-    const MIGRATION_VERSION: u64 = 8;
+    const MIGRATION_VERSION: u64 = 10;
     db.stats_collector().set_target_db_version(MIGRATION_VERSION);
     let txn = db.read_transaction()?;
     let k = MetadataKey::MigrationVersion;
@@ -5409,6 +5447,173 @@ fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
             write_txn.commit()?;
         }
 
+        // MIGRATION: Repair `target_difficulty`, and everything that accumulates out of it, at and above the
+        // GHSA-3qmx-q9pv-f3m4 activation height.
+        //
+        // That activation entry is a consensus change which is retroactive for any node that already synced past
+        // it. The entry may also move `difficulty_block_window` (MainNet takes it from 90 to 45 at height 350,000,
+        // to halve the recovery time from the hash rate the fix costs the network), so a node that walked those
+        // heights on a pre-fork binary computed each target under the old window and persisted it, while the new
+        // binary computes a different answer for the same header.
+        //
+        // This is worse than a stale display field, because `target_difficulty` is the only quantity that
+        // accumulates: `BlockHeaderAccumulatedDataBuilder::build` sums the unadjusted per-algo target into
+        // `total_accumulated_difficulty`, so one wrong entry corrupts chain strength for every block above it. It
+        // is also self-propagating, because `target_difficulty_for_next_block` reads stored targets out of the
+        // window as its inputs, so a wrong entry poisons the next `difficulty_block_window` targets as well.
+        //
+        // Rather than walking the chain inline and holding up startup, this arms the existing
+        // `rebuild_accumulated_data_background_task` by pushing its watermark back to just below the activation
+        // height. That task already recomputes and rewrites the accumulated data per height, resumably, and it
+        // gains a strict mode at and above the activation height: full header validation, and a rewind if a block
+        // no longer validates under the post-fork rules.
+        //
+        // Deliberately not wrapped in `continue` on the skip path, unlike the earlier migrations: skipping the version
+        // bump below would leave the database at version 8 and re-run this block on the next startup.
+        if migrate_from_version == 8 {
+            let activation = ConsensusConstants::bipartite_cuckaroo_activation_height(
+                db.consensus_manager.consensus_constants_vec(),
+            );
+            // The tip that decides whether there is anything to repair is the *header* tip, not the block tip.
+            // `fetch_chain_height` reads `MetadataKey::ChainHeight`, which is the height of the last *block*, and
+            // header sync routinely runs ahead of block sync - that is its normal steady state, not an edge case.
+            // A node whose blocks stop at 349,990 while its headers already reach 350,053 has post-fork
+            // accumulated data on disk, written by the old binary under the old window, and skipping here would
+            // leave it there forever: header sync never re-validates or rewrites a header it already has, and
+            // block sync writes the stored `BlockHeaderAccumulatedData` back verbatim as each body arrives,
+            // promoting its inflated `total_accumulated_difficulty` straight into chain metadata.
+            //
+            // `max` rather than just the header tip so that a database which somehow has a block tip above its
+            // last header still arms rather than silently skipping.
+            let tip = {
+                let txn = db.read_transaction()?;
+                let block_tip = fetch_chain_height(&txn, &db.metadata_db).ok();
+                let header_tip = db.fetch_last_header_in_txn(&txn)?.map(|header| header.height);
+                block_tip.into_iter().chain(header_tip).max()
+            };
+
+            // Reasons there is nothing to repair:
+            // - The fork is not scheduled on this network (Igor / Stagenet / NextNet), so no stored target was ever
+            //   computed under rules that have since changed.
+            // - The fork is active from height 0 (LocalNet), so nothing was ever mined under the old rules.
+            // - There is no chain, or the highest header this node holds has not reached the fork (Esmeralda today).
+            //   Everything synced from here on is computed under the new rules by the normal add-block and header sync
+            //   paths.
+            // `==` rather than `>=`: `UNSCHEDULED_ACTIVATION_HEIGHT` is `u64::MAX`, so the two are the same
+            // test and clippy rejects the inequality as absurd.
+            let skip_reason = if activation == UNSCHEDULED_ACTIVATION_HEIGHT {
+                Some("the fork is not scheduled on this network".to_string())
+            } else if activation == 0 {
+                Some("the fork has been active since the genesis block".to_string())
+            } else {
+                match tip {
+                    None => Some("this database holds no chain".to_string()),
+                    Some(tip) if tip < activation => Some(format!(
+                        "the highest header {tip} is below the activation height {activation}"
+                    )),
+                    Some(_) => None,
+                }
+            };
+
+            let existing = db.fetch_accumulated_data_rebuild_status()?;
+
+            if let Some(reason) = skip_reason {
+                // The skip path must leave the row exactly as it found it. Every migration block runs inside the
+                // same `run_migrations` loop, so a database at version 5 reaches this block in the same call that
+                // armed the v5 repair a few iterations earlier, and `is_rebuilt: true` is a one-way latch - the
+                // background task returns immediately on it and nothing ever sets it back. Writing "rebuilt" here
+                // because *this* fork has nothing to repair would therefore silently abandon an unrelated repair
+                // that is still owed, on exactly the nodes that need it: a NextNet node at v5 (unscheduled fork),
+                // or a MainNet node whose tip is still below 350,000.
+                info!(
+                    target: LOG_TARGET,
+                    "[MIGRATIONS] v{migrate_from_version}: No accumulated data repair needed - {reason} \
+                    (leaving the rebuild status untouched: {existing:?})"
+                );
+            } else {
+                // The `min` is load-bearing, but only against a rebuild that is still in flight. A node part way
+                // through the v5 rebuild carries a watermark far below the activation height, and overwriting it
+                // with `activation - 1` would silently abandon the rest of that repair; taking the minimum lets
+                // that walk continue uninterrupted and roll into strict mode by itself once it reaches the
+                // activation height.
+                //
+                // A *finished* rebuild is the opposite case and must not be folded in.
+                // `update_accumulated_difficulty` records `is_rebuilt: height == last_chain_header.height()`, so
+                // the watermark a completed rebuild leaves behind is the tip as it was when that rebuild
+                // finished, which may be a hundred thousand blocks below today's tip. Folding that in would send
+                // the walk back over a prefix that is already correct - heights below the fork were computed
+                // under rules that have not changed - at 100 ms per height.
+                let watermark = if existing.is_rebuilt {
+                    activation.saturating_sub(1)
+                } else {
+                    min(
+                        existing.last_rebuild_height.unwrap_or(u64::MAX),
+                        activation.saturating_sub(1),
+                    )
+                };
+                let status = AccumulatedDataRebuildStatus {
+                    is_rebuilt: false,
+                    last_rebuild_height: Some(watermark),
+                };
+                info!(
+                    target: LOG_TARGET,
+                    "[MIGRATIONS] v{migrate_from_version}: Arming the accumulated data rebuild from height \
+                    {watermark} for the fork at height {activation} (previous status: {existing:?})"
+                );
+                let write_txn = db.write_transaction()?;
+                lmdb_replace(
+                    &write_txn,
+                    &db.metadata_db,
+                    &MetadataKey::AccumulatedDataRebuildStatus.as_u32(),
+                    &MetadataValue::AccumulatedDataRebuildStatus(status),
+                    None,
+                )?;
+                write_txn.commit()?;
+
+                // Purge every orphan at or above the activation height, along with its accumulated data, its
+                // parent-map entry and its chain tip entry (`delete_orphan` does all four, and promotes the parent
+                // to a tip where that applies).
+                //
+                // A stale orphan tip carries a `total_accumulated_difficulty` built from pre-fork targets, and can
+                // therefore win an `AccumulatedDifficultySquaredComparer` comparison it should lose - the node
+                // would reorg onto a stale-target side chain the moment the main chain is repaired. Discarding an
+                // orphan is safe: it is re-fetched if it ever mattered. Orphans below the activation height are
+                // left alone; their accumulated data was computed under the rules in force at their height.
+                //
+                // This is only the *first* of two purges. Arming and finishing are hours apart on a real node, and
+                // an ordinary reorg in between seeds the orphan pool with exactly the same hazard all over again -
+                // `rewind_to_height` stores the heights it removes as chained orphans carrying their unrepaired
+                // accumulated data. So the walk runs the same scan again in the transaction that writes
+                // `is_rebuilt: true` (`finish_rebuild` in `blockchain_database.rs`), which is what makes the latch
+                // a statement about the orphan pool and not only about the main chain. Both purges go through
+                // `fetch_orphan_hashes_at_or_above` so the two can never drift apart.
+                let orphan_hashes: Vec<HashOutput> = db.fetch_orphan_hashes_at_or_above(activation)?;
+                if orphan_hashes.is_empty() {
+                    info!(
+                        target: LOG_TARGET,
+                        "[MIGRATIONS] v{migrate_from_version}: No orphans at or above height {activation} to purge"
+                    );
+                } else {
+                    let write_txn = db.write_transaction()?;
+                    for hash in &orphan_hashes {
+                        db.delete_orphan(&write_txn, hash)?;
+                    }
+                    write_txn.commit()?;
+                    info!(
+                        target: LOG_TARGET,
+                        "[MIGRATIONS] v{migrate_from_version}: Purged {} orphan(s) at or above height {activation}",
+                        orphan_hashes.len()
+                    );
+                }
+            }
+        }
+
+        // MIGRATION: Drop the retired `template_registrations` table. Code template registrations are no longer
+        // indexed, and new databases never create the table.
+        if migrate_from_version == 9 {
+            drop_template_registrations_db(db)?;
+        }
+
         // Let's update the migration version
         {
             let migrated_to_version = migrate_from_version.saturating_add(1);
@@ -5427,6 +5632,23 @@ fn run_migrations(db: &mut LMDBDatabase) -> Result<(), ChainStorageError> {
         }
     }
     Ok(())
+}
+
+fn drop_template_registrations_db(db: &LMDBDatabase) -> Result<(), ChainStorageError> {
+    let name = LMDB_DB_TEMPLATE_REGISTRATIONS;
+    match Database::open(db.env.clone(), Some(name), &DatabaseOptions::defaults()) {
+        Ok(legacy) => {
+            legacy.delete().map_err(|e| {
+                ChainStorageError::AccessError(format!("Failed to delete legacy database `{name}`: {e}"))
+            })?;
+            info!(target: LOG_TARGET, "[MIGRATIONS] v9: Dropped legacy database `{name}`");
+            Ok(())
+        },
+        Err(LmdbError::Code(code)) if code == NOTFOUND => Ok(()),
+        Err(e) => Err(ChainStorageError::AccessError(format!(
+            "Could not open legacy database `{name}`: {e}"
+        ))),
+    }
 }
 
 /// Rebuild the JMT from the canonical UTXO set under the new v2 layout and drop the legacy
@@ -6229,5 +6451,55 @@ fn summarize_value(v: &MetadataValue) -> String {
         },
         MetadataValue::JMTVersion(v) => format!("{v}"),
         MetadataValue::BurnCommitmentRebuildStatus(s) => format!("{s:?}"),
+    }
+}
+
+#[cfg(test)]
+mod template_registrations_migration_test {
+    use lmdb_zero::put;
+
+    use super::*;
+    use crate::test_helpers::{blockchain::TempDatabase, create_consensus_rules};
+
+    fn legacy_table_exists(db: &LMDBDatabase) -> bool {
+        match Database::open(
+            db.env.clone(),
+            Some(LMDB_DB_TEMPLATE_REGISTRATIONS),
+            &DatabaseOptions::defaults(),
+        ) {
+            Ok(_) => true,
+            Err(LmdbError::Code(code)) if code == NOTFOUND => false,
+            Err(e) => panic!("Could not open `{LMDB_DB_TEMPLATE_REGISTRATIONS}`: {e}"),
+        }
+    }
+
+    #[test]
+    fn v9_migration_drops_the_template_registrations_table() {
+        let path = tari_test_utils::paths::create_temporary_data_path();
+        {
+            let mut temp = TempDatabase::from_path_with_rules(&path, create_consensus_rules());
+            temp.disable_delete_on_drop();
+            let db = temp.db();
+            assert!(!legacy_table_exists(db), "a new database must not create the table");
+
+            // Put the database back to how a node running the previous release left it
+            let legacy = Database::open(
+                db.env.clone(),
+                Some(LMDB_DB_TEMPLATE_REGISTRATIONS),
+                &DatabaseOptions::new(db::CREATE | db::DUPSORT),
+            )
+            .unwrap();
+            let txn = db.write_transaction().unwrap();
+            txn.access()
+                .put(&legacy, b"key", b"value", put::Flags::empty())
+                .unwrap();
+            txn.commit().unwrap();
+            drop(legacy);
+            assert!(legacy_table_exists(db));
+            rewind_migration_version_for_test(db, 9).unwrap();
+        }
+
+        let temp = TempDatabase::from_path_with_rules(&path, create_consensus_rules());
+        assert!(!legacy_table_exists(temp.db()));
     }
 }

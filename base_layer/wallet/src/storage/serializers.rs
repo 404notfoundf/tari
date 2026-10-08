@@ -67,4 +67,40 @@ mod tests {
 
         assert_eq!(signature, decoded);
     }
+
+    #[test]
+    fn burn_output_proof_bincode_round_trips() {
+        use tari_common_types::{
+            burn_proof::{BurnOutputProof, MmrInclusionProof, OutputHashPreimage},
+            types::FixedHash,
+        };
+
+        let mmr_proof = MmrInclusionProof {
+            leaf_index: 1,
+            mmr_size: 3,
+            path: vec![FixedHash::from([2u8; 32])],
+            peaks: vec![],
+        };
+        let proof = BurnOutputProof {
+            block_hash: FixedHash::from([1u8; 32]),
+            block_height: 10,
+            output: OutputHashPreimage {
+                version: 1,
+                features: vec![1, 2, 3],
+                commitment: Default::default(),
+                rangeproof_hash: FixedHash::from([3u8; 32]),
+                script: vec![4],
+                sender_offset_public_key: Default::default(),
+                metadata_signature: Default::default(),
+                covenant: vec![0],
+                encrypted_data: vec![5; 80],
+                minimum_value_promise: 7,
+            },
+            normal_output_proof: mmr_proof.clone(),
+            normal_output_mr: FixedHash::from([6u8; 32]),
+            block_output_proof: mmr_proof,
+        };
+        let decoded: BurnOutputProof = bincode_decode(&bincode_encode(&proof).unwrap()).unwrap();
+        assert_eq!(decoded, proof);
+    }
 }

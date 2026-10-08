@@ -52,10 +52,10 @@ use futures::{
 };
 use log::*;
 use prost::Message;
-use tari_shutdown::{Shutdown, ShutdownSignal, oneshot_trigger::OneshotSignal};
+use tari_shutdown::{Shutdown, ShutdownReason, ShutdownSignal, oneshot_trigger::OneshotSignal};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time,
 };
 use tower::{Service, ServiceExt};
@@ -268,6 +268,26 @@ impl<TClient> RpcClientBuilder<TClient> {
         self
     }
 
+    /// Set the number of streamed responses that are buffered for the caller before the client stops reading from
+    /// the substream. A larger buffer lets the server keep sending while the caller processes earlier responses.
+    /// Values below 1 are treated as 1.
+    /// Default: 5
+    pub fn with_stream_buffer_size(mut self, size: usize) -> Self {
+        self.config.stream_buffer_size = size;
+        self
+    }
+
+    /// Set the largest payload, in bytes, accepted for each streamed item, i.e. each response that does not end the
+    /// request. A streamed item over this size ends the request with an error and closes the session, since the
+    /// rest of that stream is still in flight. With [`with_stream_buffer_size`](Self::with_stream_buffer_size) this
+    /// bounds the memory a peer can make the client hold for one stream. The final response of a request (which is
+    /// the only response of a non-streaming call) is not capped by this, only by the frame size.
+    /// Default: [`RPC_MAX_FRAME_SIZE`](rpc::RPC_MAX_FRAME_SIZE), i.e. no limit beyond the frame size
+    pub fn with_max_response_size(mut self, size: usize) -> Self {
+        self.config.max_response_size = size;
+        self
+    }
+
     /// Set the protocol ID associated with this client. This is used for logging purposes only.
     pub fn with_protocol_id(mut self, protocol_id: ProtocolId) -> Self {
         self.protocol_id = Some(protocol_id);
@@ -320,6 +340,10 @@ pub struct RpcClientConfig {
     pub deadline: Option<Duration>,
     pub deadline_grace_period: Duration,
     pub handshake_timeout: Duration,
+    /// The number of streamed responses buffered for the caller per request
+    pub stream_buffer_size: usize,
+    /// The largest payload accepted for each streamed item (see `RpcClientBuilder::with_max_response_size`)
+    pub max_response_size: usize,
 }
 
 impl RpcClientConfig {
@@ -340,6 +364,8 @@ impl Default for RpcClientConfig {
             deadline: Some(Duration::from_secs(120)),
             deadline_grace_period: Duration::from_secs(60),
             handshake_timeout: Duration::from_secs(90),
+            stream_buffer_size: 5,
+            max_response_size: rpc::RPC_MAX_FRAME_SIZE,
         }
     }
 }
@@ -348,7 +374,8 @@ impl Default for RpcClientConfig {
 pub struct ClientConnector {
     inner: mpsc::Sender<ClientRequest>,
     last_request_latency_rx: watch::Receiver<Option<Duration>>,
-    shutdown: Arc<Mutex<Shutdown>>,
+    /// Shared by every clone: `close` on any clone shuts the session down, as does dropping the last clone.
+    shutdown: Shutdown,
 }
 
 impl ClientConnector {
@@ -360,13 +387,18 @@ impl ClientConnector {
         Self {
             inner: sender,
             last_request_latency_rx,
-            shutdown: Arc::new(Mutex::new(shutdown)),
+            shutdown,
         }
     }
 
+    /// Close the RPC session immediately. Any in-flight server stream is cut off and its receiver sees the end of the
+    /// stream.
+    ///
+    /// This differs from dropping the last `ClientConnector`/`RpcClient` clone: a drop lets in-flight streams run
+    /// until the server ends them (a streaming response holds no client clone, so callers commonly drop the client
+    /// while still reading the stream), and only then stops the worker.
     pub async fn close(&mut self) {
-        let mut lock = self.shutdown.lock().await;
-        lock.trigger();
+        self.shutdown.trigger();
     }
 
     pub fn get_last_request_latency(&mut self) -> Option<Duration> {
@@ -430,9 +462,15 @@ struct RpcClientWorker<TSubstream> {
     next_request_id: u16,
     ready_tx: Option<oneshot::Sender<Result<(), RpcError>>>,
     protocol_id: ProtocolId,
+    /// Resolves on `ClientConnector::close` (`ShutdownReason::Triggered`) or when the last client handle drops
+    /// (`ShutdownReason::Dropped`). Both stop the worker between requests, but only `Triggered` interrupts an
+    /// in-flight server stream.
     shutdown_signal: ShutdownSignal,
     terminate_signal: Option<OneshotSignal<NodeId>>,
     session_state: Arc<AtomicBool>,
+    /// Looked up once per connector rather than for every received message.
+    #[cfg(feature = "metrics")]
+    inbound_response_bytes: tari_metrics::Histogram,
 }
 
 impl<TSubstream> RpcClientWorker<TSubstream>
@@ -458,6 +496,8 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
             next_request_id: 0,
             ready_tx: Some(ready_tx),
             last_request_latency_tx,
+            #[cfg(feature = "metrics")]
+            inbound_response_bytes: metrics::inbound_response_bytes(&protocol_id),
             protocol_id,
             shutdown_signal,
             terminate_signal,
@@ -697,7 +737,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
             );
         }
 
-        let (response_tx, response_rx) = mpsc::channel(5);
+        let (response_tx, response_rx) = mpsc::channel(self.config.stream_buffer_size.max(1));
         if let Err(mut rx) = reply.send(response_rx) {
             warn!(
                 target: LOG_TARGET,
@@ -727,12 +767,18 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
         let mut terminate_signal_fut = terminate_signal
             .map(|f| f.boxed())
             .unwrap_or_else(|| future::pending::<Option<NodeId>>().boxed());
+        // Watched while waiting for each frame, so an explicit `close()` interrupts a stream that is waiting on a slow
+        // frame rather than taking effect only once the next frame arrives.
+        let mut close_signal = self.shutdown_signal.clone();
         loop {
-            if self.shutdown_signal.is_triggered() {
+            // Only an explicit `close()` cuts a stream short. When the last client handle is dropped
+            // (`ShutdownReason::Dropped`) the stream is still being read by its `ClientStreaming` receiver, so let it
+            // finish; the main loop's select on `shutdown_signal` stops the worker afterwards.
+            if self.shutdown_signal.reason() == Some(ShutdownReason::Triggered) {
                 debug!(
                     target: LOG_TARGET,
-                    "[peer: {}, protocol: {}, stream_id: {}, req_id: {}] Client connector closed. Quitting stream \
-                     early",
+                    "[peer: {}, protocol: {}, stream_id: {}, req_id: {}] Client connector explicitly closed. Quitting \
+                     stream early",
                     self.node_id,
                     self.protocol_name(),
                     self.stream_id(),
@@ -749,9 +795,25 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
                 tokio::pin!(resp_fut);
                 let closed_fut = response_tx.closed();
                 tokio::pin!(closed_fut);
+                // Resolves only for an explicit `close()`. A `Dropped` resolution must not interrupt the stream (see
+                // above), so in that case this stays pending and the stream is read to the end.
+                let explicit_close_fut = async {
+                    (&mut close_signal).await;
+                    if close_signal.reason() != Some(ShutdownReason::Triggered) {
+                        future::pending::<()>().await;
+                    }
+                };
 
                 tokio::select! {
                     biased;
+                    _ = explicit_close_fut => {
+                        debug!(
+                            target: LOG_TARGET,
+                            "(stream={stream_id}) Client connector explicitly closed while waiting for a response to \
+                             request {request_id}. Quitting stream early",
+                        );
+                        break;
+                    }
                     node_id = &mut terminate_signal_fut => {
                         debug!(
                             target: LOG_TARGET,
@@ -823,6 +885,33 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
                     return Err(err);
                 },
             };
+
+            // Check the size before the item is queued for the caller: with a deep stream buffer, oversized items are
+            // what a peer would use to make this client hold a lot of memory. The final (FIN) response is never
+            // queued behind others, so it is only bounded by the frame size. That lets a peer add at most one
+            // frame-sized OK item with FIN set per stream, whose payload `ClientStreaming` discards unread.
+            let is_fin = resp.flags().map(|flags| flags.is_fin()).unwrap_or(false);
+            if !is_fin && resp.payload.len() > self.config.max_response_size {
+                let err = RpcError::MaxResponseSizeExceeded {
+                    got: resp.payload.len(),
+                    expected: self.config.max_response_size,
+                };
+                warn!(
+                    target: LOG_TARGET,
+                    "(stream={}) Request {} (method={}) to peer {}: {}",
+                    self.stream_id(),
+                    request_id,
+                    method,
+                    self.node_id,
+                    err
+                );
+                if !response_tx.is_closed() {
+                    let _result = response_tx.send(Err(RpcStatus::protocol_error(&err.to_string()))).await;
+                }
+                // The rest of the stream is still on its way, so end the session rather than leave those frames to be
+                // read as responses to the next request
+                return Err(err);
+            }
 
             match Self::convert_to_result(resp) {
                 Ok(Ok(resp)) => {
@@ -901,7 +990,6 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
         request_id: u16,
     ) -> Result<(proto::rpc::RpcResponse, Option<Duration>), RpcError> {
         let stream_id = self.stream_id();
-        let protocol_name = self.protocol_name().to_string();
 
         let mut reader = RpcResponseReader::new(&mut self.framed, self.config, request_id);
         let mut num_ignored = 0usize;
@@ -912,11 +1000,12 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + StreamId
                         target: LOG_TARGET,
                         "(stream: {}, {}) Received body len = {}",
                         stream_id,
-                        protocol_name,
+                        // Only evaluated when trace logging is enabled
+                        String::from_utf8_lossy(&self.protocol_id),
                         reader.bytes_read()
                     );
                     #[cfg(feature = "metrics")]
-                    metrics::inbound_response_bytes(&self.protocol_id).observe(reader.bytes_read() as f64);
+                    self.inbound_response_bytes.observe(reader.bytes_read() as f64);
                     let time_to_first_msg = reader.time_to_first_msg();
                     break (resp, time_to_first_msg);
                 },

@@ -24,15 +24,15 @@
 use std::convert::{TryFrom, TryInto};
 use std::{
     cmp::max,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use log::*;
 use strum_macros::Display;
-use tari_common_types::types::{BlockHash, FixedHash, HashOutput};
-use tari_comms::{connectivity::ConnectivityRequester, peer_manager::NodeId};
+use tari_common_types::types::{BlockHash, FixedHash, HashOutput, PrivateKey};
+use tari_comms::{connectivity::ConnectivityRequester, peer_manager::NodeId, protocol::messaging::MAX_FRAME_LENGTH};
 use tari_node_components::blocks::{
     Block,
     BlockBuilder,
@@ -44,11 +44,16 @@ use tari_node_components::blocks::{
 };
 use tari_transaction_components::{
     aggregated_body::AggregateBody,
-    consensus::ConsensusConstants,
+    consensus::{ConsensusConstants, consensus_constants::MAX_BLOCK_BODY_BYTES},
+    helpers::borsh::SerializedSize,
     tari_proof_of_work::{PowAlgorithm, PowError},
+    transaction_components::{Transaction, TransactionOutput},
 };
 use tari_utilities::hex::Hex;
-use tokio::sync::{RwLock, watch};
+use tokio::{
+    sync::{RwLock, watch},
+    task,
+};
 
 #[cfg(feature = "metrics")]
 use crate::base_node::metrics;
@@ -62,7 +67,19 @@ use crate::{
         error::CommsInterfaceError,
         local_interface::BlockEventSender,
     },
-    chain_storage::{BlockAddResult, BlockchainBackend, ChainStorageError, MinedInfo, async_db::AsyncBlockchainDb},
+    chain_storage::{
+        AddBlockOutcome,
+        BlockAddResult,
+        BlockchainBackend,
+        ChainStorageError,
+        DbKey,
+        DbValue,
+        MinedInfo,
+        RejectedBlock,
+        async_db::AsyncBlockchainDb,
+        body_matches_header,
+        inputs_and_outputs_match_header,
+    },
     consensus::BaseNodeConsensusManager,
     mempool::{Mempool, MempoolLastSeen},
     proof_of_work::{
@@ -84,6 +101,130 @@ const MAX_MEMPOOL_TIMEOUT: u64 = 150;
 #[cfg(feature = "metrics")]
 const DIFF_INDICATOR_LAG: u64 = 25;
 
+/// How many held orphans `hydrate_block` walks back through, from a block's parent towards the main chain, to find the
+/// outputs the block spends. A relayed fork block is normally a short way ahead of what we hold; a deeper fork is
+/// resolved through sync, and the walk reads whole blocks, so it is kept short.
+const MAX_ORPHAN_ANCESTORS: usize = 16;
+/// The walk also stops once it has read this much orphan data (measured as the borsh size of each orphan), because
+/// orphans can be up to the block body byte limit each.
+const MAX_ORPHAN_ANCESTOR_BYTES: usize = 2 * MAX_BLOCK_BODY_BYTES;
+
+/// The outputs of the held orphans that a block with parent `prev_hash` builds on: the parent if it is a held orphan,
+/// its parent if that is one too, and so on, within [MAX_ORPHAN_ANCESTORS] and [MAX_ORPHAN_ANCESTOR_BYTES]. Orphans
+/// are stored with their outputs bound to their headers by the arrival check, so these are the outputs those blocks
+/// were mined with.
+///
+/// Also returns whether the walk ended at a block whose outputs we hold completely (see
+/// [main_chain_outputs_are_complete]), i.e. whether every output an honest block on this chain could spend was found.
+fn held_orphan_ancestor_outputs<B: BlockchainBackend>(
+    db: &B,
+    mut prev_hash: HashOutput,
+) -> Result<(HashMap<HashOutput, TransactionOutput>, bool), ChainStorageError> {
+    let mut outputs = HashMap::new();
+    let mut orphans_read = 0usize;
+    let mut bytes_read = 0usize;
+    loop {
+        if !db.contains(&DbKey::OrphanBlock(prev_hash))? {
+            let complete = main_chain_outputs_are_complete(db, prev_hash)?;
+            return Ok((outputs, complete));
+        }
+        if orphans_read >= MAX_ORPHAN_ANCESTORS || bytes_read >= MAX_ORPHAN_ANCESTOR_BYTES {
+            return Ok((outputs, false));
+        }
+        let Some(DbValue::OrphanBlock(orphan)) = db.fetch(&DbKey::OrphanBlock(prev_hash))? else {
+            return Ok((outputs, false));
+        };
+        orphans_read = orphans_read.saturating_add(1);
+        bytes_read = bytes_read.saturating_add(orphan.get_serialized_size().unwrap_or(MAX_ORPHAN_ANCESTOR_BYTES));
+        let (header, _, orphan_outputs, _) = orphan.dissolve();
+        prev_hash = header.prev_hash;
+        for output in orphan_outputs {
+            outputs.entry(output.hash()).or_insert(output);
+        }
+    }
+}
+
+/// Whether `hash` is a block on our main chain for which we hold every output a child block could spend: at or below
+/// our best block (header sync stores headers ahead of their bodies), and at or above our pruned height (a pruned node
+/// deletes outputs spent at or below it, and an output spent on our chain after the block may still be spent by a
+/// child of it).
+fn main_chain_outputs_are_complete<B: BlockchainBackend>(db: &B, hash: HashOutput) -> Result<bool, ChainStorageError> {
+    let metadata = db.fetch_chain_metadata()?;
+    let height = match db.fetch(&DbKey::HeaderHash(hash))? {
+        Some(DbValue::HeaderHash(header)) => header.height,
+        _ => return Ok(false),
+    };
+    Ok(height >= metadata.pruned_height() && height <= metadata.best_block_height())
+}
+
+/// Room left in the messaging frame for the DHT envelope around a base node service response
+const DHT_ENVELOPE_ALLOWANCE: usize = 64 * 1024;
+
+/// An upper bound on how much larger the protobuf encoding of one block component (the header, an input, an output or a
+/// kernel) is than its borsh encoding: field tags, length prefixes and wider varints, over a few dozen fields at most.
+const PROTO_OVERHEAD_PER_ITEM: usize = 1024;
+
+/// An upper bound on the size of the base node service response that carries `block`, computed without encoding (or
+/// cloning) the block.
+fn block_response_size_bound(block: &Block) -> Option<usize> {
+    let items = block
+        .body
+        .inputs()
+        .len()
+        .saturating_add(block.body.outputs().len())
+        .saturating_add(block.body.kernels().len())
+        .saturating_add(1);
+    let borsh_bytes = block.get_serialized_size().ok()?;
+    Some(borsh_bytes.saturating_add(items.saturating_mul(PROTO_OVERHEAD_PER_ITEM)))
+}
+
+/// The form in which to serve an orphan block. Orphans are stored with hydrated inputs, which lets a peer on another
+/// chain accept the block even when it spends outputs that peer has never seen, so an orphan is served hydrated
+/// whenever it fits in the messaging frame. The hydrated form of a block within the consensus byte limit can exceed the
+/// frame, and then the orphan is served in the compact form that main chain blocks are served in.
+fn orphan_block_to_serve(block: Block, max_frame_length: usize) -> Block {
+    match block_response_size_bound(&block) {
+        Some(bytes) if bytes.saturating_add(DHT_ENVELOPE_ALLOWANCE) <= max_frame_length => block,
+        _ => block.to_compact(),
+    }
+}
+
+/// Log the blocks that failed while `block` was added that its sender is not to blame for, and return the one that
+/// dropped `block` itself, if any (it is the one its sender is to blame for, if there is one). A held block that failed
+/// on its own account says nothing about who sent `block`, so it is only logged. It is already dropped, and recorded as
+/// bad if its body matches its header.
+fn log_unblamed_rejections(
+    block: &Block,
+    source_peer: Option<&NodeId>,
+    rejected: Vec<RejectedBlock>,
+) -> Option<RejectedBlock> {
+    let mut dropped_block = None;
+    for rejection in rejected {
+        if rejection.blame_sender {
+            dropped_block = Some(rejection);
+        } else {
+            if rejection.dropped_candidate && dropped_block.is_none() {
+                dropped_block = Some(rejection);
+                continue;
+            }
+            warn!(
+                target: LOG_TARGET,
+                "Block #{} ({}) from {} linked held block #{} ({}), which failed validation and was dropped. The sender \
+                 is not to blame: {}",
+                block.header.height,
+                block.hash().to_hex(),
+                source_peer
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<local request>".to_string()),
+                rejection.height,
+                rejection.hash.to_hex(),
+                rejection.error
+            );
+        }
+    }
+    dropped_block
+}
+
 /// Events that can be published on the Validated Block Event Stream
 /// Broadcast is to notify subscribers if this is a valid propagated block event
 #[derive(Debug, Clone, Display)]
@@ -93,8 +234,11 @@ pub enum BlockEvent {
         block: Arc<Block>,
         source_peer: Option<NodeId>,
     },
+    /// Adding the block failed for a reason other than a validation error (e.g. a storage error at commit time).
+    /// `source_peer` is `None` for a locally submitted block (e.g. a mined block template).
     AddBlockErrored {
         block: Arc<Block>,
+        source_peer: Option<NodeId>,
     },
     BlockSyncComplete(Arc<ChainBlock>, u64),
     BlockSyncRewind(Vec<Arc<ChainBlock>>),
@@ -473,7 +617,7 @@ where B: BlockchainBackend + 'static
 
                             None
                         },
-                        Some,
+                        |block| Some(orphan_block_to_serve(block, MAX_FRAME_LENGTH)),
                     ),
                     Some(block) => Some(block.into_block()),
                 };
@@ -519,18 +663,6 @@ where B: BlockchainBackend + 'static
             } => {
                 let vn = self.blockchain_db.get_validator_node(sidechain_id, public_key).await?;
                 Ok(NodeCommsResponse::GetValidatorNode(vn))
-            },
-            NodeCommsRequest::FetchTemplateRegistrations {
-                start_height,
-                end_height,
-            } => {
-                let template_registrations = self
-                    .blockchain_db
-                    .fetch_template_registrations(start_height..=end_height)
-                    .await?;
-                Ok(NodeCommsResponse::FetchTemplateRegistrationsResponse(
-                    template_registrations,
-                ))
             },
             NodeCommsRequest::FetchUnspentUtxosInBlock { block_hash } => {
                 let utxos = self.blockchain_db.fetch_outputs_in_block(block_hash).await?;
@@ -633,15 +765,28 @@ where B: BlockchainBackend + 'static
             return Ok(());
         }
 
+        // The ban that follows a rejected proof of work records the peer and the error but not the block, so name
+        // both here. The header is not linked to our chain yet, so its height is only the peer's claim.
+        let log_pow_rejection = |e: &CommsInterfaceError| {
+            if e.get_ban_reason().is_some() {
+                warn!(
+                    target: LOG_TARGET,
+                    "{} (from peer {})",
+                    helpers::pow_rejection_message(&block_hash, &new_block.header, true, e),
+                    source_peer
+                );
+            }
+        };
+
         // GHSA-3qmx-q9pv-f3m4. The canonical `pow_data` test reads at most one byte and needs no chain state, so it
         // runs before the existence and bad-block lookups, before `fetch_last_chain_header` and the backwards chain
         // walk in `check_min_block_difficulty`, and before the RandomX VM hash. A zero-extended variant is free for
         // an attacker to mint, so it must be as close to free for us to discard.
         if new_block.header.pow_algo() == PowAlgorithm::RandomXT {
             let constants = self.consensus_manager.consensus_constants(new_block.header.height);
-            check_randomxt_pow_data(&new_block.header.pow, constants.require_canonical_randomxt_pow_data()).map_err(
-                |e| CommsInterfaceError::InvalidBlockHeader(BlockHeaderValidationError::ProofOfWorkError(e)),
-            )?;
+            check_randomxt_pow_data(&new_block.header.pow, constants.require_canonical_randomxt_pow_data())
+                .map_err(|e| CommsInterfaceError::InvalidBlockHeader(BlockHeaderValidationError::ProofOfWorkError(e)))
+                .inspect_err(log_pow_rejection)?;
         }
 
         // Lets check if the block exists before we try and ask for a complete block
@@ -655,7 +800,9 @@ where B: BlockchainBackend + 'static
         // blocks are not free to make, and that they are more expensive to make then they are to validate. As
         // soon as a block can be linked to the main chain, a proper full proof of work check will
         // be done before any other validation.
-        self.check_min_block_difficulty(&new_block).await?;
+        self.check_min_block_difficulty(&new_block)
+            .await
+            .inspect_err(log_pow_rejection)?;
 
         {
             // we use a double lock to make sure we can only reconcile one unique block at a time. We may receive the
@@ -763,13 +910,23 @@ where B: BlockchainBackend + 'static
                 .await?;
         }
         let achieved = match new_block.header.pow_algo() {
-            PowAlgorithm::RandomXM => monero_randomx_difficulty_at_rules_height(
-                &new_block.header,
-                &self.randomx_factory,
-                &gen_hash,
-                &self.consensus_manager,
-                rules_height,
-            )?,
+            PowAlgorithm::RandomXM => {
+                // A RandomX VM build can take most of a second, so keep it off the tokio worker threads
+                let header = new_block.header.clone();
+                let randomx_factory = self.randomx_factory.clone();
+                let consensus_manager = self.consensus_manager.clone();
+                task::spawn_blocking(move || {
+                    monero_randomx_difficulty_at_rules_height(
+                        &header,
+                        &randomx_factory,
+                        &gen_hash,
+                        &consensus_manager,
+                        rules_height,
+                    )
+                })
+                .await
+                .map_err(|e| CommsInterfaceError::InternalError(format!("RandomX difficulty task failed: {e}")))??
+            },
             PowAlgorithm::Sha3x => sha3x_difficulty(&new_block.header)?,
             PowAlgorithm::RandomXT => {
                 // GHSA-3qmx-q9pv-f3m4, belt and braces. `handle_new_block_message` already applied this before any
@@ -790,7 +947,11 @@ where B: BlockchainBackend + 'static
                     .fetch_chain_header(tari_rx_vm_key_height(new_block.header.height))
                     .await?
                     .hash();
-                tari_randomx_difficulty(&new_block.header, &self.randomx_factory, &vm_key)?
+                let header = new_block.header.clone();
+                let randomx_factory = self.randomx_factory.clone();
+                task::spawn_blocking(move || tari_randomx_difficulty(&header, &randomx_factory, &vm_key))
+                    .await
+                    .map_err(|e| CommsInterfaceError::InternalError(format!("RandomX difficulty task failed: {e}")))??
             },
             PowAlgorithm::Cuckaroo => {
                 // Same corroborated height as above, not the claimed one: `bipartite_cuckaroo_verification` is the
@@ -837,14 +998,10 @@ where B: BlockchainBackend + 'static
                 "Block with hash `{}` already validated as a bad block due to `{}`",
                 block.to_hex(), reason
             );
-            return Err(CommsInterfaceError::ChainStorageError(
-                ChainStorageError::ValidationError {
-                    source: ValidationError::BadBlockFound {
-                        hash: block.to_hex(),
-                        reason,
-                    },
-                },
-            ));
+            return Err(CommsInterfaceError::KnownBadBlock {
+                hash: block.to_hex(),
+                reason,
+            });
         }
         Ok(false)
     }
@@ -855,8 +1012,29 @@ where B: BlockchainBackend + 'static
         new_block: NewBlock,
     ) -> Result<(), CommsInterfaceError> {
         let block = self.reconcile_block(source_peer.clone(), new_block).await?;
+        self.check_body_matches_header(&block)?;
         self.handle_block(block, Some(source_peer)).await?;
         Ok(())
+    }
+
+    /// A block from a peer may be stored as an orphan without being validated, so check that its body is the one its
+    /// header commits to before it is handed on: completely if we hold its parent, otherwise as far as no chain state
+    /// is needed (its inputs and outputs, but not its kernels, which are then checked when it is validated).
+    fn check_body_matches_header(&self, block: &Block) -> Result<(), CommsInterfaceError> {
+        let db = self.blockchain_db.inner().db_read_access()?;
+        let matches = if db.fetch_block_accumulated_data(&block.header.prev_hash)?.is_some() {
+            body_matches_header(&*db, block)?
+        } else {
+            inputs_and_outputs_match_header(block)?
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(CommsInterfaceError::InvalidFullBlock {
+                hash: block.hash(),
+                details: "The block body is not the one its header commits to".to_string(),
+            })
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -874,11 +1052,24 @@ where B: BlockchainBackend + 'static
         // If the block is empty, we dont have to ask for the block, as we already have the full block available
         // to us.
         if excess_sigs.is_empty() {
+            let block_hash = header.hash();
             let block = BlockBuilder::new(header.version)
                 .add_outputs(coinbase_outputs)
                 .add_kernels(coinbase_kernels)
                 .with_header(header)
                 .build();
+            // A block can have inputs and outputs without a kernel of its own (the excess is absorbed into the total
+            // offset), and is then announced without excess signatures too. Its inputs and outputs are not in the
+            // announcement, so fetch the full block.
+            if !inputs_and_outputs_match_header(&block)? {
+                debug!(
+                    target: LOG_TARGET,
+                    "Block {} has more than its coinbase. Requesting the full block from peer '{}'.",
+                    block_hash.to_hex(),
+                    source_peer
+                );
+                return self.request_full_block_from_peer(source_peer, block_hash).await;
+            }
             return Ok(block);
         }
 
@@ -932,6 +1123,7 @@ where B: BlockchainBackend + 'static
                 source_peer
             );
 
+            let requested_excess_sigs = missing_excess_sigs.iter().cloned().collect::<HashSet<_>>();
             let FetchMempoolTransactionsResponse {
                 transactions,
                 not_found,
@@ -939,6 +1131,22 @@ where B: BlockchainBackend + 'static
                 .outbound_nci
                 .request_transactions_by_excess_sig(source_peer.clone(), missing_excess_sigs)
                 .await?;
+
+            // Only keep transactions that we actually asked for. Anything else is dropped before it reaches the mempool
+            // (or the reconstructed block); if that leaves the block incomplete, the MMR root check below falls back to
+            // requesting the full block.
+            let (transactions, num_unrequested) = retain_requested_transactions(transactions, &requested_excess_sigs);
+            if num_unrequested > 0 {
+                warn!(
+                    target: LOG_TARGET,
+                    "Peer {} returned {} transaction(s) for block #{} ({}) with kernels that were not requested. \
+                     Ignoring them.",
+                    source_peer,
+                    num_unrequested,
+                    header.height,
+                    block_hash.to_hex(),
+                );
+            }
 
             // Add returned transactions to unconfirmed pool
             if !transactions.is_empty() {
@@ -1000,6 +1208,15 @@ where B: BlockchainBackend + 'static
             return Ok(block);
         }
 
+        // The block rebuilt from our mempool matches the header, so it is the block the peer announced. Reject it here
+        // if its body is over the consensus byte limit, before it is handed on to be hydrated and added.
+        let constants = self.consensus_manager.consensus_constants(header.height);
+        if let Err(source) = helpers::check_block_body_size(&block, constants) {
+            return Err(CommsInterfaceError::ChainStorageError(
+                ChainStorageError::ValidationError { source },
+            ));
+        }
+
         Ok(block)
     }
 
@@ -1013,6 +1230,10 @@ where B: BlockchainBackend + 'static
             .request_blocks_by_hashes_from_peer(block_hash, Some(source_peer.clone()))
             .await
         {
+            Ok(Some(block)) if block.hash() != block_hash => Err(CommsInterfaceError::InvalidFullBlock {
+                hash: block_hash,
+                details: format!("Peer sent block {} instead", block.hash()),
+            }),
             Ok(Some(block)) => Ok(block),
             Ok(None) => {
                 debug!(
@@ -1065,7 +1286,10 @@ where B: BlockchainBackend + 'static
         let add_block_result = self.blockchain_db.add_block(block.clone()).await;
         // Create block event on block event stream
         match add_block_result {
-            Ok(block_add_result) => {
+            Ok(AddBlockOutcome {
+                result: block_add_result,
+                rejected,
+            }) => {
                 debug!(
                     target: LOG_TARGET,
                     "Block #{} ({}) added ({}) to blockchain in {:.2?}",
@@ -1075,17 +1299,27 @@ where B: BlockchainBackend + 'static
                     timer.elapsed()
                 );
 
-                let should_propagate = match &block_add_result {
-                    BlockAddResult::Ok(_) => true,
-                    BlockAddResult::BlockExists => false,
-                    BlockAddResult::OrphanBlock => false,
-                    BlockAddResult::ChainReorg { .. } => true,
-                };
+                // The chain can change without this block becoming part of it: a reorg that failed on another block
+                // keeps the strongest valid chain, which need not include this one. Only a block on our chain is
+                // propagated.
+                let should_propagate = block_add_result
+                    .added_blocks()
+                    .iter()
+                    .any(|added| *added.hash() == block_hash);
 
+                // A metrics failure must not stop the chain change from being published, or a ban from being reported
                 #[cfg(feature = "metrics")]
-                self.update_block_result_metrics(&block_add_result).await?;
+                if let Err(e) = self.update_block_result_metrics(&block_add_result).await {
+                    warn!(target: LOG_TARGET, "Failed to update block metrics: {e}");
+                }
 
-                self.publish_block_event(BlockEvent::ValidBlockAdded(block.clone(), block_add_result));
+                // Listeners such as the mempool take a single added block from the event rather than the result, so
+                // the event names the block that was actually added.
+                let added_block = match &block_add_result {
+                    BlockAddResult::Ok(added) => added.to_arc_block(),
+                    _ => block.clone(),
+                };
+                self.publish_block_event(BlockEvent::ValidBlockAdded(added_block, block_add_result));
 
                 if should_propagate {
                     debug!(
@@ -1093,7 +1327,7 @@ where B: BlockchainBackend + 'static
                         "Propagate block ({}) to network.",
                         block_hash.to_hex()
                     );
-                    let exclude_peers = source_peer.into_iter().collect();
+                    let exclude_peers = source_peer.iter().cloned().collect();
                     let new_block_msg = NewBlock::from(&*block);
                     if let Err(e) = self.outbound_nci.propagate_block(new_block_msg, exclude_peers).await {
                         warn!(
@@ -1103,25 +1337,43 @@ where B: BlockchainBackend + 'static
                         );
                     }
                 }
+
+                // The block was dropped, but the chain changed as well (the blocks before the one that failed were
+                // valid and stronger). The change is published above, and the failure is reported as if nothing had
+                // changed: as an invalid block if the sender is to blame, and otherwise as `HeldBlockInvalid`, without
+                // a ban or an event.
+                if let Some(rejection) = log_unblamed_rejections(&block, source_peer.as_ref(), rejected) {
+                    let e = rejection.into_error(block_hash);
+                    self.report_invalid_block(block, source_peer, &e);
+                    return Err(e.into());
+                }
                 Ok(block_hash)
             },
 
-            Err(e @ ChainStorageError::ValidationError { .. }) => {
-                #[cfg(feature = "metrics")]
-                {
-                    let block_hash = block.hash();
-                    metrics::rejected_blocks(block.header.height, &block_hash).inc();
-                }
-                warn!(
+            // Marked bad since we checked in `check_exists_and_not_bad_block`
+            Err(ChainStorageError::ValidationError {
+                source: ValidationError::BadBlockFound { hash, reason },
+            }) => Err(CommsInterfaceError::KnownBadBlock { hash, reason }),
+
+            Err(
+                e @ (ChainStorageError::ValidationError { .. } |
+                ChainStorageError::AncestorBlockInvalid { .. } |
+                ChainStorageError::HeldBlockInvalid { .. }),
+            ) => {
+                self.report_invalid_block(block, source_peer, &e);
+                Err(e.into())
+            },
+
+            Err(e @ ChainStorageError::AddBlockOperationLocked) => {
+                // Nothing was attempted (the node is syncing), so this says nothing about the block or its
+                // transactions. Publishing `AddBlockErrored` would make the mempool evict and re-validate a local
+                // block's transactions under its write lock, which a miner client could trigger repeatedly.
+                debug!(
                     target: LOG_TARGET,
-                    "Peer {} sent an invalid block: {}",
-                    source_peer
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "<local request>".to_string()),
-                    e
+                    "Block #{} ({}) not added: adding blocks is disabled while syncing",
+                    block.header.height,
+                    block.hash().to_hex()
                 );
-                self.publish_block_event(BlockEvent::AddBlockValidationFailed { block, source_peer });
                 Err(e.into())
             },
 
@@ -1129,15 +1381,76 @@ where B: BlockchainBackend + 'static
                 #[cfg(feature = "metrics")]
                 metrics::rejected_blocks(block.header.height, &block.hash()).inc();
 
-                self.publish_block_event(BlockEvent::AddBlockErrored { block });
+                self.publish_block_event(BlockEvent::AddBlockErrored { block, source_peer });
                 Err(e.into())
             },
         }
     }
 
+    /// Record that `block`, from `source_peer`, was rejected for `error`. `error` is a `ValidationError` for the block
+    /// itself or an `AncestorBlockInvalid` for an ancestor, which the sender is to blame for, and the metric names
+    /// whichever block was invalid. Or it is `HeldBlockInvalid`: the block was dropped with a block that failed during
+    /// a reorg, but its sender is not to blame (the body that failed may not be the one it sent, or the verdict was
+    /// a fault of ours). That is only logged: no metric and no event, as `AddBlockValidationFailed` or
+    /// `AddBlockErrored` would make the mempool clear a local block's transactions for a failure that is not
+    /// theirs.
+    ///
+    /// The one exception is a locally mined block whose own body failed for a fault of ours: `AddBlockErrored` is
+    /// published for it, as for any other local block that fails for a reason other than a validation error, so that
+    /// the mempool clears its transactions. A transaction that breaks every template it is in is cleared that way.
+    fn report_invalid_block(&self, block: Arc<Block>, source_peer: Option<NodeId>, error: &ChainStorageError) {
+        if let ChainStorageError::HeldBlockInvalid { sent_body_failed, .. } = error {
+            if *sent_body_failed && source_peer.is_none() {
+                self.publish_block_event(BlockEvent::AddBlockErrored {
+                    block: block.clone(),
+                    source_peer: None,
+                });
+            }
+            warn!(
+                target: LOG_TARGET,
+                "Block #{} ({}) from {} not added: {}",
+                block.header.height,
+                block.hash().to_hex(),
+                source_peer
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<local request>".to_string()),
+                error
+            );
+            return;
+        }
+        #[cfg(feature = "metrics")]
+        {
+            let (height, hash) = match error {
+                ChainStorageError::AncestorBlockInvalid { hash, height, .. } => (*height, *hash),
+                _ => (block.header.height, block.hash()),
+            };
+            metrics::rejected_blocks(height, &hash).inc();
+        }
+        warn!(
+            target: LOG_TARGET,
+            "Peer {} sent an invalid block: {}",
+            source_peer
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<local request>".to_string()),
+            error
+        );
+        self.publish_block_event(BlockEvent::AddBlockValidationFailed { block, source_peer });
+    }
+
     async fn hydrate_block(&mut self, block: Block) -> Result<Arc<Block>, CommsInterfaceError> {
         let block_hash = block.hash();
         let block_height = block.header.height;
+        // Reject an oversized body before doing any work per input. The limit is measured on the compact form, so this
+        // is the same check whether the inputs arrived compact or hydrated.
+        if let Err(source) =
+            helpers::check_block_body_size(&block, self.consensus_manager.consensus_constants(block_height))
+        {
+            return Err(CommsInterfaceError::ChainStorageError(
+                ChainStorageError::ValidationError { source },
+            ));
+        }
         if block.body.inputs().is_empty() {
             debug!(
                 target: LOG_TARGET,
@@ -1152,6 +1465,11 @@ where B: BlockchainBackend + 'static
         let (header, mut inputs, outputs, kernels) = block.dissolve();
 
         let db = self.blockchain_db.inner().db_read_access()?;
+        // The hashes of the block's own outputs, computed on the first input that is not in the database
+        let mut block_outputs: Option<HashMap<HashOutput, &TransactionOutput>> = None;
+        // The outputs of the held orphans this block builds on, fetched on the first input found in neither
+        let mut orphan_outputs: Option<HashMap<HashOutput, TransactionOutput>> = None;
+        let mut orphan_search_complete = false;
         for input in &mut inputs {
             if !input.is_compact() {
                 continue;
@@ -1159,16 +1477,47 @@ where B: BlockchainBackend + 'static
 
             // Only the output's contents are used to hydrate the input, and those are identical for
             // every index entry of the same output hash, so taking any entry is equivalent.
-            let output_mined_info = db
-                .fetch_outputs(&input.output_hash())?
-                .into_iter()
-                .next()
-                .ok_or_else(|| CommsInterfaceError::InvalidFullBlock {
-                    hash: block_hash,
-                    details: format!("Output {} to be spent does not exist in db", input.output_hash()),
-                })?;
+            let output_hash = input.output_hash();
+            if let Some(output_mined_info) = db.fetch_outputs(&output_hash)?.into_iter().next() {
+                input.add_output_data(output_mined_info.output);
+                continue;
+            }
+            // An output created and spent in the same block
+            let block_outputs = block_outputs.get_or_insert_with(|| outputs.iter().map(|o| (o.hash(), o)).collect());
+            if let Some(output) = block_outputs.get(&output_hash) {
+                input.add_output_data((*output).clone());
+                continue;
+            }
+            // An output created in a held orphan this block builds on, e.g. a fork block we hold whose child is relayed
+            // to us by peers that have reorged to the fork
+            if orphan_outputs.is_none() {
+                let (outputs, complete) = held_orphan_ancestor_outputs(&*db, header.prev_hash)?;
+                orphan_outputs = Some(outputs);
+                orphan_search_complete = complete;
+            }
+            if let Some(output) = orphan_outputs.as_ref().and_then(|outputs| outputs.get(&output_hash)) {
+                input.add_output_data(output.clone());
+                continue;
+            }
 
-            input.add_output_data(output_mined_info.output);
+            let details = format!("Output {output_hash} to be spent does not exist in db");
+            // A block whose parent is on our main chain, with its outputs complete, can only spend outputs from our
+            // main chain or from itself, so it is invalid.
+            if main_chain_outputs_are_complete(&*db, header.prev_hash)? {
+                return Err(CommsInterfaceError::InvalidFullBlock {
+                    hash: block_hash,
+                    details,
+                });
+            }
+            // A block on another chain can spend outputs from that chain that we have never seen, which says nothing
+            // about the peer that sent it, so it is dropped without a ban. Unless we hold that chain all the way back
+            // to complete main chain state: then an honest block would have resolved, and the search was not free,
+            // so it is a short ban.
+            return Err(CommsInterfaceError::UnknownSpentOutputs {
+                hash: block_hash,
+                details,
+                fork_searched_to_main_chain: orphan_search_complete,
+            });
         }
         debug!(
             target: LOG_TARGET,
@@ -1329,6 +1678,27 @@ where B: BlockchainBackend + 'static
     }
 }
 
+/// Keeps only the transactions whose kernel excess signatures are all in `requested` (and that have at least one
+/// kernel). Returns the retained transactions and the number of transactions that were dropped.
+fn retain_requested_transactions(
+    transactions: Vec<Arc<Transaction>>,
+    requested: &HashSet<PrivateKey>,
+) -> (Vec<Arc<Transaction>>, usize) {
+    let total = transactions.len();
+    let retained = transactions
+        .into_iter()
+        .filter(|tx| {
+            let kernels = tx.body.kernels();
+            !kernels.is_empty() &&
+                kernels
+                    .iter()
+                    .all(|kernel| requested.contains(kernel.excess_sig.get_signature()))
+        })
+        .collect::<Vec<_>>();
+    let dropped = total.saturating_sub(retained.len());
+    (retained, dropped)
+}
+
 impl<B> Clone for InboundNodeCommsHandlers<B> {
     fn clone(&self) -> Self {
         Self {
@@ -1343,5 +1713,168 @@ impl<B> Clone for InboundNodeCommsHandlers<B> {
             mempool_last_seen: self.mempool_last_seen.clone(),
             mempool_sync_timeout: self.mempool_sync_timeout,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #![allow(clippy::indexing_slicing)]
+    use tari_transaction_components::{MicroMinotari, key_manager::KeyManager, tx};
+
+    use super::*;
+
+    fn create_tx(key_manager: &KeyManager) -> Arc<Transaction> {
+        Arc::new(
+            tx!(MicroMinotari(100_000), fee: MicroMinotari(5), inputs: 1, outputs: 1, key_manager)
+                .expect("Failed to get tx")
+                .0,
+        )
+    }
+
+    fn excess_sig(tx: &Transaction) -> PrivateKey {
+        tx.body.kernels()[0].excess_sig.get_signature().clone()
+    }
+
+    #[test]
+    fn orphans_are_served_hydrated_unless_that_does_not_fit_the_messaging_frame() {
+        use prost::Message;
+        use tari_transaction_components::aggregated_body::AggregateBody;
+
+        use crate::proto::{self, base_node::base_node_service_response::Response as ProtoNodeCommsResponse};
+
+        // A block of real transactions, with hydrated inputs
+        let key_manager = KeyManager::new_random().unwrap();
+        let (mut inputs, mut outputs, mut kernels) = (vec![], vec![], vec![]);
+        for _ in 0..3 {
+            let tx = tx!(MicroMinotari(100_000), fee: MicroMinotari(5), inputs: 2, outputs: 3, &key_manager)
+                .unwrap()
+                .0;
+            inputs.extend(tx.body.inputs().iter().cloned());
+            outputs.extend(tx.body.outputs().iter().cloned());
+            kernels.extend(tx.body.kernels().iter().cloned());
+        }
+        let block = Block::new(
+            BlockHeader::new(0),
+            AggregateBody::new_unsorted(inputs, outputs, kernels),
+        );
+        assert!(block.body.inputs().iter().all(|input| !input.is_compact()));
+
+        // The bound really bounds the response that goes on the wire
+        let bound = block_response_size_bound(&block).unwrap();
+        let response_bytes = proto::base_node::BaseNodeServiceResponse {
+            request_key: u64::MAX,
+            response: Some(ProtoNodeCommsResponse::BlockResponse(
+                Some(block.clone()).try_into().unwrap(),
+            )),
+            is_synced: true,
+        }
+        .encoded_len();
+        assert!(response_bytes <= bound, "{response_bytes} > {bound}");
+
+        // Fits, with room for the DHT envelope: served as stored
+        let frame = bound + DHT_ENVELOPE_ALLOWANCE;
+        let served = orphan_block_to_serve(block.clone(), frame);
+        assert!(served.body.inputs().iter().all(|input| !input.is_compact()));
+
+        // One byte short: served compact
+        let served = orphan_block_to_serve(block.clone(), frame - 1);
+        assert!(served.body.inputs().iter().all(|input| input.is_compact()));
+        assert_eq!(served, block.to_compact());
+    }
+
+    #[test]
+    fn only_requested_transactions_are_retained() {
+        let key_manager = KeyManager::new_random().unwrap();
+        let requested1 = create_tx(&key_manager);
+        let requested2 = create_tx(&key_manager);
+        let unrequested = create_tx(&key_manager);
+        // A transaction carrying a requested kernel alongside an unrequested one
+        let mixed = Arc::new(Transaction::new(
+            vec![],
+            vec![],
+            vec![
+                requested1.body.kernels()[0].clone(),
+                unrequested.body.kernels()[0].clone(),
+            ],
+            Default::default(),
+            Default::default(),
+        ));
+        // A transaction with no kernels at all
+        let empty = Arc::new(Transaction::new(
+            vec![],
+            vec![],
+            vec![],
+            Default::default(),
+            Default::default(),
+        ));
+        let requested = [excess_sig(&requested1), excess_sig(&requested2)]
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let (retained, dropped) = retain_requested_transactions(
+            vec![requested1.clone(), unrequested, requested2.clone(), mixed, empty],
+            &requested,
+        );
+        assert_eq!(retained, vec![requested1.clone(), requested2.clone()]);
+        assert_eq!(dropped, 3);
+
+        // Nothing to drop
+        let (retained, dropped) =
+            retain_requested_transactions(vec![requested1.clone(), requested2.clone()], &requested);
+        assert_eq!(retained, vec![requested1, requested2]);
+        assert_eq!(dropped, 0);
+
+        // Nothing requested
+        let (retained, dropped) = retain_requested_transactions(vec![create_tx(&key_manager)], &HashSet::new());
+        assert!(retained.is_empty());
+        assert_eq!(dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_block_refused_while_syncing_publishes_no_add_block_errored() {
+        use tari_comms::test_utils::mocks::create_connectivity_mock;
+        use tari_service_framework::reply_channel;
+        use tokio::sync::{broadcast, mpsc};
+
+        use crate::{
+            base_node::comms_interface::OutboundNodeCommsInterface,
+            mempool::MempoolConfig,
+            proof_of_work::randomx_factory::RandomXFactory,
+            test_helpers::{blockchain::create_new_blockchain, create_consensus_rules},
+            validation::mocks::MockValidator,
+        };
+
+        let db = create_new_blockchain();
+        let block = db.fetch_block(0, false).unwrap().into_block();
+        db.set_disable_add_block_flag();
+        let rules = create_consensus_rules();
+        let mempool = Mempool::new(
+            MempoolConfig::default(),
+            rules.clone(),
+            Box::new(MockValidator::new(true)),
+        );
+        let (block_event_sender, mut block_events) = broadcast::channel(50);
+        let (request_sender, _) = reply_channel::unbounded();
+        let (block_sender, _) = mpsc::unbounded_channel();
+        let (connectivity, _) = create_connectivity_mock();
+        let mut handlers = InboundNodeCommsHandlers::new(
+            block_event_sender,
+            db.into(),
+            mempool,
+            rules,
+            OutboundNodeCommsInterface::new(request_sender, block_sender),
+            connectivity,
+            RandomXFactory::new(1),
+        );
+
+        let result = handlers.handle_block(block, None).await;
+        assert!(matches!(
+            result,
+            Err(CommsInterfaceError::ChainStorageError(
+                ChainStorageError::AddBlockOperationLocked
+            ))
+        ));
+        // No event, so the mempool is left untouched (no eviction and re-validation)
+        assert!(block_events.try_recv().is_err());
     }
 }

@@ -7,7 +7,6 @@ use tari_common_types::{
     types::{BadBlock, CompressedCommitment, CompressedPublicKey, CompressedSignature, FixedHash, HashOutput},
 };
 use tari_node_components::blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader};
-use tari_sidechain::ShardGroup;
 use tari_transaction_components::transaction_components::{TransactionInput, TransactionKernel, TransactionOutput};
 
 use super::{
@@ -16,7 +15,7 @@ use super::{
     BurnCommitmentRebuildStatus,
     MinedInfo,
     PayrefRebuildStatus,
-    TemplateRegistrationEntry,
+    ValidatorNodeEntry,
     ValidatorNodeRegistrationInfo,
     lmdb_db::lmdb_tree_reader::OwnedLmdbTreeReader,
 };
@@ -174,6 +173,15 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     fn fetch_payref_rebuild_status(&self) -> Result<PayrefRebuildStatus, ChainStorageError>;
     /// Returns the stored accumulated data rebuild status.
     fn fetch_accumulated_data_rebuild_status(&self) -> Result<AccumulatedDataRebuildStatus, ChainStorageError>;
+    /// Stores the accumulated data rebuild status verbatim.
+    ///
+    /// [`BlockchainBackend::update_accumulated_difficulty`] derives the status from the height it just wrote, which
+    /// covers the ordinary forward walk. The strict-mode rewind path has no height to write - every height from the
+    /// failure upwards has just been deleted - so it needs to record where the walk stopped directly.
+    fn set_accumulated_data_rebuild_status(
+        &self,
+        status: AccumulatedDataRebuildStatus,
+    ) -> Result<(), ChainStorageError>;
     /// Returns the stored burn commitment index rebuild status.
     fn fetch_burn_commitment_rebuild_status(&self) -> Result<BurnCommitmentRebuildStatus, ChainStorageError>;
     /// Resets the stored blockchain consistency check status.
@@ -226,6 +234,14 @@ pub trait BlockchainBackend: Send + Sync + 'static {
     fn fetch_orphan_children_of(&self, hash: HashOutput) -> Result<Vec<Block>, ChainStorageError>;
 
     fn fetch_orphan_chain_block(&self, hash: HashOutput) -> Result<Option<ChainBlock>, ChainStorageError>;
+
+    /// Fetch the hash of every orphan block at or above `height`.
+    ///
+    /// Deliberately not `fetch_all_orphans`, which reconstructs a `ChainHeader` per orphan and therefore fails
+    /// outright on an orphan that has no accumulated data stored (an unchained one). The callers of this are
+    /// purging orphans, so an orphan with no accumulated data is one of the things they want to find, not a
+    /// reason to give up.
+    fn fetch_orphan_hashes_at_or_above(&self, height: u64) -> Result<Vec<HashOutput>, ChainStorageError>;
 
     /// Delete orphans according to age. Used to keep the orphan pool at a certain capacity
     fn delete_oldest_orphans(
@@ -301,31 +317,30 @@ pub trait BlockchainBackend: Send + Sync + 'static {
         validator_node_pk: &CompressedPublicKey,
     ) -> Result<bool, ChainStorageError>;
 
-    fn validator_node_is_active_for_shard_group(
+    /// Returns the stored validator node entry for the given sidechain and public key if the validator node is in the
+    /// registered validator node set. A validator node that has already been queued to exit is NOT returned.
+    fn fetch_validator_node_entry(
         &self,
         sidechain_pk: Option<&CompressedPublicKey>,
+        public_key: &CompressedPublicKey,
+    ) -> Result<Option<ValidatorNodeEntry>, ChainStorageError>;
+
+    /// Returns true if validator node `public_key` has an exit queued, created by the registration output with
+    /// `commitment`, that has not taken effect by `epoch`.
+    fn validator_node_has_pending_exit(
+        &self,
+        sidechain_pk: Option<&CompressedPublicKey>,
+        public_key: &CompressedPublicKey,
+        commitment: &CompressedCommitment,
         epoch: VnEpoch,
-        validator_node_pk: &CompressedPublicKey,
-        shard_group: ShardGroup,
     ) -> Result<bool, ChainStorageError>;
-    fn validator_nodes_count_for_shard_group(
-        &self,
-        sidechain_pk: Option<&CompressedPublicKey>,
-        end_epoch: VnEpoch,
-        shard_group: ShardGroup,
-    ) -> Result<usize, ChainStorageError>;
+
     /// Returns the validator node for the given sidechain and public key if it exists
     fn get_validator_node(
         &self,
         sidechain_pk: Option<&CompressedPublicKey>,
         public_key: CompressedPublicKey,
     ) -> Result<Option<ValidatorNodeRegistrationInfo>, ChainStorageError>;
-    /// Returns all template registrations within (inclusive) the given height range.
-    fn fetch_template_registrations(
-        &self,
-        start_height: u64,
-        end_height: u64,
-    ) -> Result<Vec<TemplateRegistrationEntry>, ChainStorageError>;
 
     /// Creates a reader to construct a JMT
     fn create_smt_reader(&self) -> Result<(OwnedLmdbTreeReader<'_>, u64), ChainStorageError>;

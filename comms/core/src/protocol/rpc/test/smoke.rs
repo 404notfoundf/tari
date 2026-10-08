@@ -172,7 +172,7 @@ pub(super) async fn setup_with_builder<T: GreetingRpc>(
 
 #[tokio::test]
 async fn request_response_errors_and_streaming() {
-    let (_inbound, outbound, server_hnd, node_identity, mut shutdown) = setup(GreetingService::default(), 1).await;
+    let (_inbound, outbound, server_hnd, node_identity, shutdown) = setup(GreetingService::default(), 1).await;
     let socket = outbound.get_yamux_control().open_stream().await.unwrap();
 
     let framed = framing::canonical(socket, 1024);
@@ -298,7 +298,8 @@ async fn response_too_big() {
     let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::new(&[]), 1).await;
     let socket = outbound.get_yamux_control().open_stream().await.unwrap();
 
-    let framed = framing::canonical(socket, rpc::max_request_size());
+    // The frame limit applies to what the client reads, i.e. responses (requests have their own, smaller cap)
+    let framed = framing::canonical(socket, rpc::RPC_MAX_FRAME_SIZE);
     let mut client = GreetingClient::builder()
         .with_deadline(Duration::from_secs(5))
         .connect(framed)
@@ -336,7 +337,7 @@ async fn ping_latency() {
 
 #[tokio::test]
 async fn server_shutdown_before_connect() {
-    let (_inbound, outbound, _, _, mut shutdown) = setup(GreetingService::new(&[]), 1).await;
+    let (_inbound, outbound, _, _, shutdown) = setup(GreetingService::new(&[]), 1).await;
     let socket = outbound.get_yamux_control().open_stream().await.unwrap();
     let framed = framing::canonical(socket, 1024);
     shutdown.trigger();
@@ -496,6 +497,103 @@ async fn stream_still_works_after_cancel() {
     resp.collect::<Vec<_>>().await.into_iter().for_each(|r| {
         r.unwrap();
     });
+}
+
+/// A server stream holds no client handle, so callers routinely drop the `RpcClient` and keep reading the stream (e.g.
+/// DHT network discovery's `get_peers`). Dropping the last client handle must not cut that stream short: every item and
+/// then the end of the stream must still arrive.
+#[tokio::test]
+async fn stream_completes_after_client_is_dropped() {
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+
+    let framed = framing::canonical(socket, 1024);
+    let mut client = GreetingClient::builder()
+        .with_deadline(Duration::from_secs(5))
+        .connect(framed)
+        .await
+        .unwrap();
+
+    const NUM_ITEMS: u32 = 20;
+    let stream = client
+        .slow_stream(SlowStreamRequest {
+            num_items: NUM_ITEMS,
+            item_size: 100,
+            delay_ms: 10,
+        })
+        .await
+        .unwrap();
+    drop(client);
+
+    let items = time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+        .await
+        .expect("stream did not end after the client was dropped");
+    assert_eq!(items.len(), NUM_ITEMS as usize);
+    for item in items {
+        assert_eq!(item.unwrap().len(), 100);
+    }
+}
+
+/// In contrast to dropping the client, an explicit `close()` cuts an in-flight stream short.
+#[tokio::test]
+async fn stream_ends_early_after_client_is_closed() {
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+
+    let framed = framing::canonical(socket, 1024);
+    let mut client = GreetingClient::builder()
+        .with_deadline(Duration::from_secs(5))
+        .connect(framed)
+        .await
+        .unwrap();
+
+    const NUM_ITEMS: u32 = 1000;
+    let stream = client
+        .slow_stream(SlowStreamRequest {
+            num_items: NUM_ITEMS,
+            item_size: 100,
+            delay_ms: 10,
+        })
+        .await
+        .unwrap();
+    client.close().await;
+
+    let items = time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+        .await
+        .expect("stream did not end after the client was closed");
+    assert!(items.len() < NUM_ITEMS as usize);
+}
+
+/// `close()` must interrupt a stream that is waiting for a slow frame, not only take effect when the next frame
+/// arrives.
+#[tokio::test]
+async fn close_interrupts_a_stream_waiting_for_a_slow_frame() {
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+
+    let framed = framing::canonical(socket, 1024);
+    let mut client = GreetingClient::builder()
+        .with_deadline(Duration::from_secs(30))
+        .connect(framed)
+        .await
+        .unwrap();
+
+    // The server sleeps this long before every item, so no frame arrives while the client is being closed
+    const FRAME_DELAY: Duration = Duration::from_secs(10);
+    let stream = client
+        .slow_stream(SlowStreamRequest {
+            num_items: 2,
+            item_size: 100,
+            delay_ms: u64::try_from(FRAME_DELAY.as_millis()).unwrap(),
+        })
+        .await
+        .unwrap();
+    client.close().await;
+
+    let items = time::timeout(Duration::from_secs(3), stream.collect::<Vec<_>>())
+        .await
+        .expect("close() did not interrupt a stream waiting for a slow frame");
+    assert!(items.is_empty());
 }
 
 /// A peer that opens a streaming request and then stops draining its yamux window used to park the
@@ -757,4 +855,184 @@ async fn max_per_client_sessions() {
         .connect(framed)
         .await
         .unwrap();
+}
+
+/// Requests larger than `RPC_MAX_REQUEST_SIZE` are answered with `BadRequest` before they are decoded; a request of
+/// exactly that size is handled normally, and the session carries on after a rejection.
+#[tokio::test]
+async fn oversized_requests_are_rejected_before_decoding() {
+    use futures::SinkExt;
+    use prost::Message;
+
+    use crate::{
+        proto,
+        protocol::rpc::{handshake::Handshake, message::RpcMessageFlags},
+    };
+
+    /// An encoded `say_hello` request (method 1) of exactly `size` bytes
+    fn say_hello_request(request_id: u32, size: usize) -> Vec<u8> {
+        let encode = |name_len: usize| {
+            let payload = SayHelloRequest {
+                name: "a".repeat(name_len),
+                language: 0,
+            }
+            .encode_to_vec();
+            proto::rpc::RpcRequest {
+                request_id,
+                method: 1,
+                flags: 0,
+                deadline: 10,
+                payload,
+            }
+            .encode_to_vec()
+        };
+        // Varint lengths make the overhead depend slightly on the size, so converge on it
+        let mut name_len = size;
+        loop {
+            let len = encode(name_len).len();
+            if len == size {
+                return encode(name_len);
+            }
+            name_len = (name_len + size).checked_sub(len).unwrap();
+        }
+    }
+
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+    let mut framed = framing::canonical(socket, rpc::RPC_MAX_FRAME_SIZE);
+    Handshake::new(&mut framed).perform_client_handshake().await.unwrap();
+
+    // One byte over the limit: rejected before it is decoded or passed to the service, with the request id echoed back
+    // so that the client can match the response
+    let oversized = say_hello_request(7, rpc::RPC_MAX_REQUEST_SIZE + 1);
+    framed.send(oversized.into()).await.unwrap();
+    let resp = proto::rpc::RpcResponse::decode(framed.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(resp.request_id, 7);
+    assert_eq!(RpcStatusCode::from(resp.status), RpcStatusCode::BadRequest);
+    assert!(
+        RpcMessageFlags::from_bits(u8::try_from(resp.flags).unwrap())
+            .unwrap()
+            .is_fin()
+    );
+    let details = String::from_utf8(resp.payload).unwrap();
+    assert!(details.contains("request size exceeded"), "{details}");
+
+    // Exactly at the limit: handled by the service
+    let at_limit = say_hello_request(8, rpc::RPC_MAX_REQUEST_SIZE);
+    assert_eq!(at_limit.len(), rpc::RPC_MAX_REQUEST_SIZE);
+    framed.send(at_limit.into()).await.unwrap();
+    let resp = proto::rpc::RpcResponse::decode(framed.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(resp.request_id, 8);
+    assert_eq!(RpcStatusCode::from(resp.status), RpcStatusCode::Ok);
+}
+
+/// An oversized message received while the server is streaming a response is ignored without being decoded, and the
+/// stream carries on.
+#[tokio::test]
+async fn oversized_messages_during_a_stream_are_ignored() {
+    use futures::SinkExt;
+    use prost::Message;
+
+    use crate::{
+        proto,
+        protocol::rpc::{handshake::Handshake, message::RpcMessageFlags},
+    };
+
+    // Enough items that the server reads the (large) interrupting frame completely while still streaming: it reads
+    // pending input once per streamed item
+    const NUM_ITEMS: u32 = 300;
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+    let mut framed = framing::canonical(socket, rpc::RPC_MAX_FRAME_SIZE);
+    Handshake::new(&mut framed).perform_client_handshake().await.unwrap();
+
+    // slow_stream (method 8)
+    let request = proto::rpc::RpcRequest {
+        request_id: 1,
+        method: 8,
+        flags: 0,
+        deadline: 10,
+        payload: SlowStreamRequest {
+            num_items: NUM_ITEMS,
+            item_size: 10,
+            delay_ms: 10,
+        }
+        .encode_to_vec(),
+    };
+    framed.send(request.encode_to_vec().into()).await.unwrap();
+    let first = proto::rpc::RpcResponse::decode(framed.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(RpcStatusCode::from(first.status), RpcStatusCode::Ok);
+
+    // A message larger than the request cap, mid-stream (not a FIN)
+    let oversized = proto::rpc::RpcRequest {
+        request_id: 2,
+        method: 1,
+        flags: 0,
+        deadline: 10,
+        payload: vec![0; rpc::RPC_MAX_REQUEST_SIZE],
+    };
+    framed.send(oversized.encode_to_vec().into()).await.unwrap();
+
+    // The rest of the stream still arrives
+    let mut items = 1;
+    loop {
+        let resp = proto::rpc::RpcResponse::decode(framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(RpcStatusCode::from(resp.status), RpcStatusCode::Ok);
+        if !resp.payload.is_empty() {
+            items += 1;
+        }
+        if RpcMessageFlags::from_bits(u8::try_from(resp.flags).unwrap())
+            .unwrap()
+            .is_fin()
+        {
+            break;
+        }
+    }
+    assert_eq!(items, NUM_ITEMS);
+}
+
+/// When the client reads slowly, sends block on the yamux window and the server holds the next item while it waits.
+/// Every item must still arrive exactly once and in order, followed by the end of the stream.
+#[tokio::test]
+async fn a_slow_reader_receives_every_item_of_a_prefetched_stream() {
+    const NUM_ITEMS: u32 = 20;
+    const ITEM_SIZE: u32 = 1024 * 1024;
+    let (_inbound, outbound, _, _, _shutdown) = setup(GreetingService::default(), 1).await;
+    let socket = outbound.get_yamux_control().open_stream().await.unwrap();
+    let framed = framing::canonical(socket, rpc::RPC_MAX_FRAME_SIZE);
+    let mut client = GreetingClient::builder()
+        .with_deadline(Duration::from_secs(10))
+        .with_stream_buffer_size(1)
+        .connect(framed)
+        .await
+        .unwrap();
+
+    let mut resp = client
+        .slow_stream(SlowStreamRequest {
+            num_items: NUM_ITEMS,
+            item_size: ITEM_SIZE,
+            delay_ms: 0,
+        })
+        .await
+        .unwrap();
+
+    // `slow_stream` stamps each item's index into its first 4 bytes
+    let mut indices = Vec::new();
+    while let Some(item) = resp.next().await {
+        let item = item.unwrap();
+        assert_eq!(item.len(), ITEM_SIZE as usize);
+        indices.push(u32::from_le_bytes(item[..4].try_into().unwrap()));
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(indices, (0..NUM_ITEMS).collect::<Vec<_>>());
+
+    // The session is still usable afterwards
+    let resp = client
+        .say_hello(SayHelloRequest {
+            name: "Ruby".to_string(),
+            language: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.greeting, "Sawubona Ruby");
 }

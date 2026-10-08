@@ -1,6 +1,83 @@
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
-# Changelog
+# Changelog## 
+[6.1.0](https://github.com/tari-project/tari/compare/v6.1.0...v6.1.0) (2026-10-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sidechain:** transaction commands carry their atom bytes (#8072)
+* consensus limit on block body bytes (#8079)
+* **sidechain:** commit to a transaction merkle root from protocol version 1 (#8076)
+* tari_common hardening (#8075)
+* update tari_crypto to 0.24 and return errors instead of Ok(false) from verification functions (#8074)
+* tari_hashing audit remediation (#8071)
+
+### Features
+
+* rebootstrap peers when the DHT connection pool is starved ([#8082](https://github.com/tari-project/tari/issues/8082)) ([3f1eaef](https://github.com/tari-project/tari/commit/3f1eaeffd00272e47d513ad6f875f18a9997e480))
+* **sidechain:** transaction commands carry their atom bytes ([#8072](https://github.com/tari-project/tari/issues/8072)) ([7fae2c7](https://github.com/tari-project/tari/commit/7fae2c7eb5195e6aa61410afaf187a35fcde926f))
+* display the TIP-004 backoff adjusted target difficulty ([#8070](https://github.com/tari-project/tari/issues/8070)) ([e943cd2](https://github.com/tari-project/tari/commit/e943cd2f3f570212263c16481986c6f789e9dcf3))
+* **sidechain:** commit to a transaction merkle root from protocol version 1 ([#8076](https://github.com/tari-project/tari/issues/8076)) ([827b85d](https://github.com/tari-project/tari/commit/827b85d0887e746d66a6a22f585b950c1e1be240))
+
+
+### Bug Fixes
+
+* blame the block that failed in a reorg and keep the strongest valid chain ([#8091](https://github.com/tari-project/tari/issues/8091)) ([542ce32](https://github.com/tari-project/tari/commit/542ce32b7510f50d44800e5d155d8119a53aeb63))
+* consensus limit on block body bytes ([#8079](https://github.com/tari-project/tari/issues/8079)) ([0f6b4ca](https://github.com/tari-project/tari/commit/0f6b4caba728440e12641494d8bd20f9efc61658))
+* **grpc:** bound the cost of GetTokensInCirculation ([#8081](https://github.com/tari-project/tari/issues/8081)) ([3640622](https://github.com/tari-project/tari/commit/364062213b7a9e67ba17a712657a3b1dcbfab902))
+* keep yamux connections moving when substreams back up ([#8089](https://github.com/tari-project/tari/issues/8089)) ([c66f7f8](https://github.com/tari-project/tari/commit/c66f7f84502fffa997ca39108da22c9ae04d51d7))
+* **minotari-utils:** fix three dbstats bugs affecting Windows and legacy chains ([#7866](https://github.com/tari-project/tari/issues/7866)) ([95d1fc2](https://github.com/tari-project/tari/commit/95d1fc224566f8717bbcc682cd2440514261e33e))
+* name the block, algorithm and peer when proof of work is rejected ([#8085](https://github.com/tari-project/tari/issues/8085)) ([55f0deb](https://github.com/tari-project/tari/commit/55f0deb7df1e91c7fd289fb5a386b565a05be30a))
+* narrow RandomX factory lock scope ([#8080](https://github.com/tari-project/tari/issues/8080)) ([4f2744a](https://github.com/tari-project/tari/commit/4f2744ae541eeb30ecf9cd4e0f1cfad2c1990888))
+* enforce decoder parity across serde, borsh and both protobuf families ([#8077](https://github.com/tari-project/tari/issues/8077)) ([bfda797](https://github.com/tari-project/tari/commit/bfda797d53f38b05a1bbdfd0f33cb67b4b4cb68f)), closes [#8058](https://github.com/tari-project/tari/issues/8058) [#6686](https://github.com/tari-project/tari/issues/6686) [/github.com/tari-project/tari/pull/8077#discussion_r4182090837](https://github.com/tari-project//github.com/tari-project/tari/pull/8077/issues/discussion_r4182090837)
+* tari script hardening ([#8065](https://github.com/tari-project/tari/issues/8065)) ([bc8ab3c](https://github.com/tari-project/tari/commit/bc8ab3cc53634615c0b7124c661cedcf97bbdd57))
+* tari_common hardening ([#8075](https://github.com/tari-project/tari/issues/8075)) ([22dbca2](https://github.com/tari-project/tari/commit/22dbca27fcab4c55683644012ae190e132f5883b)), closes [/github.com/tari-project/tari/pull/8075#discussion_r4166886971](https://github.com/tari-project//github.com/tari-project/tari/pull/8075/issues/discussion_r4166886971) [/github.com/tari-project/tari/pull/8075#discussion_r4166886981](https://github.com/tari-project//github.com/tari-project/tari/pull/8075/issues/discussion_r4166886981)
+* tari_hashing audit remediation ([#8071](https://github.com/tari-project/tari/issues/8071)) ([ddc22a2](https://github.com/tari-project/tari/commit/ddc22a26ead57bfdce56213023af58451c9ed5bf))
+* update tari_crypto to 0.24 and return errors instead of Ok(false) from verification functions ([#8074](https://github.com/tari-project/tari/issues/8074)) ([2907aa9](https://github.com/tari-project/tari/commit/2907aa95eecf4477ae033157503ab9113c5f457b))
+* **wallet:** consistent address and memo sizing ([#8068](https://github.com/tari-project/tari/issues/8068)) ([44a6373](https://github.com/tari-project/tari/commit/44a6373ff371ddf111f803bc32690deb9dfc9c40)), closes [/github.com/tari-project/tari/pull/8068#discussion_r4153796636](https://github.com/tari-project//github.com/tari-project/tari/pull/8068/issues/discussion_r4153796636)
+
+
+### [6.0.1](https://github.com/tari-project/tari/compare/v6.0.0...v6.0.1) (2026-10-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* side-chain data consensus rules (#8067)
+* remove code template registration support from the base node and wallet (#8064)
+* remove validator eviction from the base layer (#8062)
+* **jellyfish:** domain-separate leaf and internal node hashes (#8060)
+* **shutdown:** make drop, trigger and flag state agree; add reason and a bounded drain (#8061)
+* **core:** prove burn claims with a burn output proof instead of a kernel proof (#8054)
+* **wallet:** encode burn claim merkle proof as JSON instead of bincode (#8051)
+* 
+### Features
+
+* harden mempool ([#8055](https://github.com/tari-project/tari/issues/8055)) ([2a6170a](https://github.com/tari-project/tari/commit/2a6170aeb5a244e2285885d538c2a338d5db487a))
+* side-chain data consensus rules ([#8067](https://github.com/tari-project/tari/issues/8067)) ([19164b1](https://github.com/tari-project/tari/commit/19164b10196781dbad4a41856c805a6383889a3f))
+* **core:** prove burn claims with a burn output proof instead of a kernel proof ([#8054](https://github.com/tari-project/tari/issues/8054)) ([615b211](https://github.com/tari-project/tari/commit/615b21148b3259b9628bc31d05c0abae5ffc29cf))
+* **wallet:** encode burn claim merkle proof as JSON instead of bincode ([#8051](https://github.com/tari-project/tari/issues/8051)) ([49e8b3f](https://github.com/tari-project/tari/commit/49e8b3fa2538dd262c9255d7e09b31e5f99a4d24))
+
+
+### Bug Fixes
+
+* enforce decoder parity for bounded transaction types and validate every submission path ([#8058](https://github.com/tari-project/tari/issues/8058)) ([2a220ef](https://github.com/tari-project/tari/commit/2a220ef417bb93e25fcd06354fce0ba27cd24de5)), closes [#8055](https://github.com/tari-project/tari/issues/8055) [#8055](https://github.com/tari-project/tari/issues/8055)
+* **jellyfish:** domain-separate leaf and internal node hashes ([#8060](https://github.com/tari-project/tari/issues/8060)) ([bcf9ea9](https://github.com/tari-project/tari/commit/bcf9ea96e88d5e594da977a8c17a7c892d0a60f9))
+* **jellyfish:** harden deserialization and remove reachable panics ([#8059](https://github.com/tari-project/tari/issues/8059)) ([83586fd](https://github.com/tari-project/tari/commit/83586fd8a9523e9e4eaff4069130f84286bcb472))
+* **mempool:** match sync inventory in linear time ([#8057](https://github.com/tari-project/tari/issues/8057)) ([9c79982](https://github.com/tari-project/tari/commit/9c79982650840547d03ff32f60df2e86c01064ff)), closes [/github.com/tari-project/tari/pull/8057#discussion_r4131700817](https://github.com/tari-project//github.com/tari-project/tari/pull/8057/issues/discussion_r4131700817)
+* **shutdown:** make drop, trigger and flag state agree; add reason and a bounded drain ([#8061](https://github.com/tari-project/tari/issues/8061)) ([beffd2e](https://github.com/tari-project/tari/commit/beffd2ec5e4e38d5ca08694589a2275a440fc8d0))
+* **wallet:** wallet output state consistency ([#8066](https://github.com/tari-project/tari/issues/8066)) ([e485aaa](https://github.com/tari-project/tari/commit/e485aaa903c1f2b58d936a87683bccc6e4d2e7ef)), closes [/github.com/tari-project/tari/pull/8066#discussion_r4142979339](https://github.com/tari-project//github.com/tari-project/tari/pull/8066/issues/discussion_r4142979339) [/github.com/tari-project/tari/pull/8066#discussion_r4142979354](https://github.com/tari-project//github.com/tari-project/tari/pull/8066/issues/discussion_r4142979354) [/github.com/tari-project/tari/pull/8066#discussion_r4142979361](https://github.com/tari-project//github.com/tari-project/tari/pull/8066/issues/discussion_r4142979361)
+* **console-wallet:** --burn-proof-out sets the correct config key ([#8048](https://github.com/tari-project/tari/issues/8048)) ([9ac11ed](https://github.com/tari-project/tari/commit/9ac11ed8fd6171440eebb2e9c5218b54c381a903))
+* refresh ledger comms_testing lockfile ([#8047](https://github.com/tari-project/tari/issues/8047)) ([8b02895](https://github.com/tari-project/tari/commit/8b02895998ef928ae03a54a11520f0f0854fd17f))
+* **wallet:** use the wallet output's own commitment mask key id when signing a multisig withdrawal ([#8010](https://github.com/tari-project/tari/issues/8010)) ([584394d](https://github.com/tari-project/tari/commit/584394d2a880be961e8c53db8683741d786eefc1)), closes [#8009](https://github.com/tari-project/tari/issues/8009) [#8009](https://github.com/tari-project/tari/issues/8009) [#39](https://github.com/tari-project/tari/issues/39)
+* private builds ([#8045](https://github.com/tari-project/tari/issues/8045)) ([88bc501](https://github.com/tari-project/tari/commit/88bc501c52680aafa4f1565bf999a70ec37e8529))
+* stored target difficulty ([#8046](https://github.com/tari-project/tari/issues/8046)) ([d88fd75](https://github.com/tari-project/tari/commit/d88fd758e774b42a81abea0599a83acd2a3250ac))
+
+
+* remove code template registration support from the base node and wallet ([#8064](https://github.com/tari-project/tari/issues/8064)) ([5cd2364](https://github.com/tari-project/tari/commit/5cd236411905f2a6c84642254f9fff7a4ae13f93))
+* remove validator eviction from the base layer ([#8062](https://github.com/tari-project/tari/issues/8062)) ([ada0dd1](https://github.com/tari-project/tari/commit/ada0dd1905fb2e0eb5a7fb2d802ed1e29c5281ac))
+
+
 ## [6.0.0](https://github.com/tari-project/tari/compare/v5.6.0...v6.0.0) (2026-09-22)
 
 ### Features
