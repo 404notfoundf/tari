@@ -117,3 +117,5 @@ tikv-jemalloc-ctl= { version ="0.6", features = ["use_std","stats"] }
 tikv-jemalloc-sys= { version ="0.6", features = ["profiling"]}
 # 用于生成与 pprof 兼容的内存剖析数据
 jemalloc_pprof= { version ="0.8", features = ["symbolize", "flamegraph"]}
+# `test-util` enables tokio's paused clock, used to test the GetBlocks send timeout without real waits
+tokio = { workspace = true, features = ["test-util"] }

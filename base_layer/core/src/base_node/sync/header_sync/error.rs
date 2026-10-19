@@ -149,3 +149,69 @@ impl BlockHeaderSyncError {
         }
     }
 }
+
+#[cfg(test)]
+mod connect_error_test {
+    use tari_comms::{
+        PeerConnectionError,
+        YamuxControlError,
+        protocol::rpc::{HandshakeRejectReason, RpcError, RpcHandshakeError},
+    };
+
+    use super::*;
+
+    /// Our own connection refusing to open the RPC substream, because too many are open on it, is not the peer's fault
+    #[test]
+    fn a_locally_refused_substream_is_not_banned() {
+        let err = BlockHeaderSyncError::from_connect_error(RpcError::PeerConnectionError(
+            PeerConnectionError::YamuxControlError(YamuxControlError::TooManyStreams),
+        ));
+        assert!(err.get_ban_reason().is_none(), "{err} was banned");
+
+        // Other yamux errors while connecting are still banned
+        let err = BlockHeaderSyncError::from_connect_error(RpcError::PeerConnectionError(
+            PeerConnectionError::YamuxControlError(YamuxControlError::ConnectionError("broken".to_string())),
+        ));
+        assert!(err.get_ban_reason().is_some(), "{err} was not banned");
+    }
+
+    /// A sync peer that cannot take a session while connecting is skipped without a ban; one that misbehaves while
+    /// connecting, and any RPC error after connecting, is still banned
+    #[test]
+    fn only_a_busy_or_unreachable_sync_peer_escapes_the_ban() {
+        let unavailable = || {
+            vec![
+                RpcHandshakeError::Rejected(HandshakeRejectReason::NoServerSessionsAvailable("busy")),
+                RpcHandshakeError::Rejected(HandshakeRejectReason::NoClientSessionsAvailable("busy")),
+                RpcHandshakeError::ServerClosedRequest,
+                RpcHandshakeError::Io(std::io::ErrorKind::ConnectionReset.into()),
+            ]
+        };
+        for err in unavailable() {
+            let err = BlockHeaderSyncError::from_connect_error(RpcError::HandshakeError(err));
+            assert!(err.get_ban_reason().is_none(), "{err} was banned");
+        }
+
+        let misbehaving = vec![
+            RpcError::ReplyTimeout,
+            RpcError::HandshakeError(RpcHandshakeError::DecodeError(prost::DecodeError::new("bad"))),
+            RpcError::HandshakeError(RpcHandshakeError::FrameTooLarge { max: 1024 }),
+            RpcError::HandshakeError(RpcHandshakeError::Rejected(HandshakeRejectReason::UnsupportedVersion)),
+        ];
+        for err in misbehaving {
+            let err = BlockHeaderSyncError::from_connect_error(err);
+            assert!(err.get_ban_reason().is_some(), "{err} was not banned");
+        }
+
+        // After connecting, the same errors are still banned
+        for err in unavailable() {
+            let err = BlockHeaderSyncError::from(RpcError::HandshakeError(err));
+            assert!(err.get_ban_reason().is_some(), "{err} was not banned after connecting");
+        }
+        assert!(
+            BlockHeaderSyncError::from(RpcError::ServerClosedRequest)
+                .get_ban_reason()
+                .is_some()
+        );
+    }
+}
