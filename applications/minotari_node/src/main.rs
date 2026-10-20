@@ -100,16 +100,19 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// 配置 Jemalloc 内存分析参数
-#[unsafe(export_name ="malloc_conf")]
+// 配置 Jemalloc 内存分析参数。当前未把 jemalloc 设为全局分配器，这段配置不会作用到 Rust 堆。
+#[cfg(all(not(target_env = "msvc"), not(target_os = "windows"), not(feature = "dhat-heap")))]
+#[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
-#[cfg(not(target_env="msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env="msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+// 进程只能有一个全局分配器。mimalloc 已占用该位置，jemalloc 先停用，避免 cannot define a new global allocator。
+// 恢复内存剖析时再打开，并同时关掉上面的 mimalloc。
+// #[cfg(all(not(target_env = "msvc"), not(target_os = "windows"), not(feature = "dhat-heap")))]
+// use tikv_jemallocator::Jemalloc;
+//
+// #[cfg(all(not(target_env = "msvc"), not(target_os = "windows"), not(feature = "dhat-heap")))]
+// #[global_allocator]
+// static GLOBAL: Jemalloc = Jemalloc;
 
 const LOG_TARGET: &str = "minotari::base_node::app";
 
