@@ -338,7 +338,8 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
             conn.connect_rpc_using_builder::<rpc::BaseNodeSyncRpcClient>(config),
         )
         .await
-        .map_err(|_| HorizonSyncError::RpcError(RpcError::ReplyTimeout))??;
+        .map_err(|_| HorizonSyncError::RpcError(RpcError::ReplyTimeout))?
+        .map_err(HorizonSyncError::from_connect_error)?;
 
         let latency = client
             .get_last_request_latency()
@@ -959,7 +960,8 @@ impl<'a, B: BlockchainBackend + 'static> HorizonStateSynchronization<'a, B> {
                         if current_header.height == 0 {
                             continue;
                         }
-                        let output = TransactionOutput::try_from(output).map_err(HorizonSyncError::ConversionError)?;
+                        let output = TransactionOutput::try_from(output)
+                            .map_err(|e| HorizonSyncError::ConversionError(e.to_string()))?;
                         if !output.is_burned() {
                             utxo_counter = utxo_counter.saturating_add(1);
                             let output_hash = output.hash();

@@ -323,6 +323,30 @@ pub mod payload {
         data
     }
 
+    /// `GetOneSidedMetadataSignature`'s head, chunk 0, without the account the chunk prepends: `network(8) |
+    /// sender_offset_key_index(8) | sender_offset_branch(8) | value(8) | commitment_mask(32) | preimage_size(2) |
+    /// address_size(2) | receiver_address`. Only the refusal probes use it; the accepting path drives the accessor.
+    pub fn one_sided_metadata_signature_head(
+        network: u8,
+        sender_offset_key_index: u64,
+        sender_offset_branch: LedgerKeyBranch,
+        value: u64,
+        commitment_mask: &[u8; 32],
+        preimage_size: u16,
+        receiver_address: &[u8],
+    ) -> Vec<u8> {
+        let mut data = u64::from(network).to_le_bytes().to_vec();
+        data.extend_from_slice(&sender_offset_key_index.to_le_bytes());
+        data.extend_from_slice(&branch_bytes(sender_offset_branch));
+        data.extend_from_slice(&value.to_le_bytes());
+        data.extend_from_slice(commitment_mask);
+        data.extend_from_slice(&preimage_size.to_le_bytes());
+        let address_size = u16::try_from(receiver_address.len()).unwrap_or(u16::MAX);
+        data.extend_from_slice(&address_size.to_le_bytes());
+        data.extend_from_slice(receiver_address);
+        data
+    }
+
     /// `GetScriptSignatureManaged`, 168 bytes with the account: the common prefix then `branch(8) | index(8)`.
     pub fn script_signature_managed(
         network: u8,

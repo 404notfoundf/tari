@@ -557,7 +557,10 @@ async fn seed_peer_release() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn select_connections_is_served_while_the_peer_database_is_slow() {
     use diesel::connection::SimpleConnection;
-    use tari_common_sqlite::connection::{DbConnection, DbConnectionUrl};
+    use tari_common_sqlite::{
+        DbProfile,
+        connection::{DbConnection, DbConnectionUrl},
+    };
 
     use crate::peer_manager::database::{MIGRATIONS, PeerDatabaseSql};
 
@@ -570,9 +573,14 @@ async fn select_connections_is_served_while_the_peer_database_is_slow() {
     // write lock hold their pooled connections while they wait, so the pool empties and every
     // subsequent call - reads included, WAL or not - blocks on the r2d2 checkout instead. That is the
     // shape of the production failure: `is_peer_banned` is a read, and it still wedged the actor.
-    let db_connection =
-        DbConnection::connect_and_migrate_with_busy_timeout(&db_url, MIGRATIONS, Some(4), Duration::from_secs(15))
-            .unwrap();
+    let db_connection = DbConnection::connect_and_migrate_with_busy_timeout(
+        &db_url,
+        MIGRATIONS,
+        Some(4),
+        DbProfile::Cache,
+        Duration::from_secs(15),
+    )
+    .unwrap();
     let peers_db = PeerDatabaseSql::new(db_connection.clone(), &node_identity.to_peer()).unwrap();
     let peer_manager = Arc::new(PeerManager::new(peers_db, crate::types::TransportProtocol::get_all()).unwrap());
 
@@ -647,9 +655,17 @@ async fn select_connections_is_served_while_the_peer_database_is_slow() {
          saturated; it should shed the peer lookup, not park on it"
     );
 
+    // The dial is to a peer we are already connected to, so it is answered from the pool without asking the peer
+    // database - well within `PEER_LOOKUP_TIMEOUT`, while the database is still locked
+    let dialed = tokio::time::timeout(Duration::from_secs(2), dial)
+        .await
+        .expect("a dial to a connected peer waited on the slow peer database")
+        .unwrap()
+        .expect("a dial to a connected peer failed while the peer database was slow");
+    assert_eq!(dialed.peer_node_id(), &peers[0].node_id);
+
     lock_holder.batch_execute("COMMIT;").unwrap();
     drop(lock_holder);
-    let _result = dial.await.unwrap();
     for writer in writers {
         // Under this much artificial contention an individual write may legitimately give up with
         // "database is locked". What matters is that none of them took the actor down with them.

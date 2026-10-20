@@ -30,6 +30,7 @@ use tari_common_types::{
 
 use crate::{
     MicroMinotari,
+    helpers::terminal_safe::escape_str_for_terminal,
     transaction_components::{KernelFeatures, MemoField, OutputFeatures, Transaction, TransactionError, WalletOutput},
 };
 
@@ -50,15 +51,18 @@ pub trait HasVersion {
     fn get_version(&self) -> &Version;
 }
 
+/// serde errors can quote the input, so they are escaped before they can reach a terminal.
+fn parse_error(e: serde_json::Error) -> TransactionError {
+    TransactionError::SerializationError(escape_str_for_terminal(&e.to_string()).into_owned())
+}
+
 pub trait TransactionResult: HasVersion + Serialize + DeserializeOwned + Sized {
     fn from_json(s: &str) -> Result<Self, TransactionError> {
-        let value: serde_json::Value =
-            serde_json::from_str(s).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(s).map_err(parse_error)?;
         let version = value
             .get("version")
             .ok_or_else(|| TransactionError::SerializationError("Missing version".into()))?;
-        let version: Version =
-            serde_json::from_value(version.clone()).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
+        let version: Version = serde_json::from_value(version.clone()).map_err(parse_error)?;
         if !get_supported_versions().contains(&version) {
             return Err(TransactionError::SerializationError(format!(
                 "Unsupported version. Expected '{}', got '{}'",
@@ -67,8 +71,7 @@ pub trait TransactionResult: HasVersion + Serialize + DeserializeOwned + Sized {
             )));
         }
 
-        let deserialized_obj: Self =
-            serde_json::from_str(s).map_err(|e| TransactionError::SerializationError(e.to_string()))?;
+        let deserialized_obj: Self = serde_json::from_str(s).map_err(parse_error)?;
 
         Ok(deserialized_obj)
     }
@@ -98,7 +101,9 @@ pub trait TransactionResult: HasVersion + Serialize + DeserializeOwned + Sized {
 ///
 /// This signature is consequently a **transit-integrity** check, not an authenticity check.
 /// The authoritative authorisation step is the human operating the air-gapped signer
-/// confirming a [`crate::offline_signing::PayloadSummary`] of what is about to be signed.
+/// confirming a [`crate::offline_signing::PayloadSummary`] of what is about to be signed. The
+/// type system requires it: the `sign_locked_*` functions only accept a
+/// [`crate::offline_signing::ConfirmedPayload`], which is produced by confirming a presented summary.
 /// Closing the gap in the protocol itself requires a dedicated authentication key that is
 /// provisioned to the online wallet separately from the view key, which is a breaking change
 /// to the key-export format and the payload version.
@@ -273,6 +278,33 @@ impl HasVersion for PrepareWithdrawMultisigTransactionResult {
     }
 }
 
+/// What the offline signer hands back to the online wallet.
+///
+/// # Every signed transaction carries a change output
+///
+/// The offline signer refuses to sign any payload that would produce no change output, and returns
+/// [`crate::TransactionBuilderError::OfflineTransactionRequiresChange`] instead, before any sender offset key is
+/// generated. That is the case whenever what is left after the outputs and the fee is no more than a change output
+/// would cost. This wallet's transaction service refuses to prepare such a payload in the first place (the public
+/// `prepare_*` functions in [`crate::offline_signing::offline_signer`] do not check); a payload refused by the signer
+/// has to be prepared again with a smaller amount.
+///
+/// The rule closes one way for the online wallet, which holds the view key, to recover the spend key: through the
+/// script offset of a transaction without change. The transaction publishes
+/// `script offset = sum(input script keys) - sum(sender offset keys)`, and every input script key is
+/// `H(mask) + spend key` with a mask the online wallet knows. Each recipient output in `outputs` carries its sender
+/// offset key id inside its `commitment_mask_key_id` (the `DHCommitmentMask` wrapper), wrapped under the view key, so
+/// the online wallet can learn those sender offset keys. The
+/// change output's sender offset key is generated and used inside the signer and never leaves it (`change_output`
+/// carries only its public key), so with a change output present that sum always has a term the online wallet cannot
+/// learn, and it cannot solve for the spend key. Outputs that arrived fully formed in the payload also have their
+/// sender offset keys replaced inside the signer, and those are not returned either; the rule does not rely on them.
+///
+/// This only addresses recovery through the script offset. It does not make it safe to treat the online wallet as
+/// untrusted in general: anyone holding the view key can produce a payload that passes the integrity check, so the
+/// operator must still check every recipient, amount and "Other outputs" entry, and the fee, total spend and change,
+/// in the [`crate::offline_signing::PayloadSummary`] before approving. The `sign_locked_*` functions only accept a
+/// [`crate::offline_signing::ConfirmedPayload`], so a summary is always presented before signing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SignedTransaction {
     pub transaction: Transaction,

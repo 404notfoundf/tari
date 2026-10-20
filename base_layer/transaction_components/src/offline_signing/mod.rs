@@ -19,7 +19,6 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-pub mod marshal_output_pair;
 pub mod models;
 pub mod offline_signer;
 pub mod one_sided_signer;
@@ -34,7 +33,19 @@ pub use offline_signer::{
     sign_locked_transaction,
     sign_locked_withdraw_multisig_transaction,
 };
-pub use payload_summary::{OutputSummary, PayloadSummary, RecipientSummary};
+pub use payload_summary::{
+    Confirmation,
+    ConfirmationMode,
+    ConfirmedPayload,
+    OfflinePayload,
+    OutputSummary,
+    PayloadDetails,
+    PayloadKind,
+    PayloadNotConfirmed,
+    PayloadSummary,
+    RecipientSummary,
+    present_payload_summary,
+};
 
 #[cfg(test)]
 mod test {
@@ -57,6 +68,7 @@ mod test {
     use crate::{
         MicroMinotari,
         TransactionBuilder,
+        TransactionBuilderError,
         crypto_factories::CryptoFactories,
         fee::{Fee, addressed_output_memo, recipient_output_features_and_scripts_size},
         key_manager::{
@@ -69,11 +81,18 @@ mod test {
         },
         multisig::script::derive_multisig_ephemeral_pubkeys,
         offline_signing::{
+            ConfirmationMode,
+            ConfirmedPayload,
+            OfflinePayload,
+            PayloadSummary,
             PaymentRecipient,
+            models::SignedOneSidedTransactionResult,
             offline_signer::sign_locked_transaction,
+            one_sided_signer::{multisig_pending_output, withdraw_pending_output},
             prepare_deposit_multisig_transaction,
             prepare_one_sided_transaction_for_signing,
             prepare_withdraw_multisig_transaction,
+            present_payload_summary,
             sign_locked_deposit_multisig_transaction,
             sign_locked_withdraw_multisig_transaction,
         },
@@ -89,6 +108,17 @@ mod test {
         },
         validation::transaction::TransactionInternalConsistencyValidator,
     };
+
+    fn confirmed<P: OfflinePayload>(summary: PayloadSummary<P>) -> ConfirmedPayload<P> {
+        let c = present_payload_summary(
+            &summary,
+            ConfirmationMode::NonInteractive,
+            &mut Vec::new(),
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        summary.confirm(c).unwrap()
+    }
 
     fn create_view_key_manager(view_wallet: ViewWallet) -> Result<KeyManager, KeyManagerError> {
         let wallet = WalletType::ViewWallet(view_wallet);
@@ -191,7 +221,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_one_sided(init)),
         )
         .unwrap();
         assert!(signed.signed_transaction.change_output.is_some());
@@ -210,6 +240,291 @@ mod test {
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
     }
 
+    /// Prepare a one-sided payment of `amount` to `recipient` from a single input worth `input_value`, carrying
+    /// `payment_id`, and sign it with the spend key.
+    fn prepare_and_sign_one_sided(
+        spend_key_manager: &KeyManager,
+        view_key_manager: &KeyManager,
+        recipient: &TariAddress,
+        input_value: MicroMinotari,
+        amount: MicroMinotari,
+        payment_id: MemoField,
+    ) -> Result<SignedOneSidedTransactionResult, TransactionBuilderError> {
+        let rules = create_consensus_manager();
+        let input = create_test_input(input_value, 0, spend_key_manager, vec![], None);
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(20))
+            .with_input(input)
+            .unwrap();
+        let own_address = TariAddress::new_dual_address(
+            view_key_manager.get_view_key().pub_key,
+            view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount,
+            output_features: OutputFeatures::default(),
+            address: recipient.clone(),
+            payment_id: payment_id.clone(),
+        }];
+        let init = prepare_one_sided_transaction_for_signing(
+            view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            payment_id,
+            own_address,
+        )
+        .unwrap();
+        sign_locked_transaction(
+            spend_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(init)),
+        )
+    }
+
+    /// The signer must refuse any payload that would leave no change output, because the recipient outputs it
+    /// returns would then give the view-key holder every term of the script offset but the spend key. A payload one
+    /// microminotari over the boundary must sign, with that microminotari as change.
+    #[test]
+    fn offline_sign_requires_a_change_output() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let amount = MicroMinotari(5000);
+
+        // Measure the fee the payment carries without change, and what a change output would add to it, from a
+        // builder in the state the signer's builder is in when it makes the change decision.
+        let mut probe = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            alice_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        probe
+            .with_fee_per_gram(MicroMinotari(20))
+            .with_input(create_test_input(
+                MicroMinotari(100_000),
+                0,
+                &alice_key_manager,
+                vec![],
+                None,
+            ))
+            .unwrap();
+        probe
+            .add_stealth_recipient(
+                bob_address.clone(),
+                amount,
+                OutputFeatures::default(),
+                MemoField::new_empty(),
+            )
+            .unwrap();
+        probe.with_memo(MemoField::new_empty());
+        let fee = probe.get_fee_estimate_without_change().unwrap();
+        let change_fee = probe.get_change_output_fee(&[]).unwrap();
+        assert!(change_fee > MicroMinotari::zero());
+
+        // Inputs equal to amount plus fee: nothing is left for change.
+        let err = prepare_and_sign_one_sided(
+            &alice_key_manager,
+            &alice_view_key_manager,
+            &bob_address,
+            amount + fee,
+            amount,
+            MemoField::new_empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransactionBuilderError::OfflineTransactionRequiresChange { remainder, change_fee: c }
+                    if remainder == MicroMinotari::zero() && c == change_fee
+            ),
+            "expected the signer to refuse a payment without change, got {err:?}"
+        );
+
+        // A remainder that only covers the change output's own fee would leave a zero change, so it goes to the fee
+        // and the payment is still refused.
+        let err = prepare_and_sign_one_sided(
+            &alice_key_manager,
+            &alice_view_key_manager,
+            &bob_address,
+            amount + fee + change_fee,
+            amount,
+            MemoField::new_empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransactionBuilderError::OfflineTransactionRequiresChange { remainder, change_fee: c }
+                    if remainder == change_fee && c == change_fee
+            ),
+            "expected the signer to refuse a payment without change, got {err:?}"
+        );
+
+        // One microminotari more and the payment signs with that as its change.
+        let signed = prepare_and_sign_one_sided(
+            &alice_key_manager,
+            &alice_view_key_manager,
+            &bob_address,
+            amount + fee + change_fee + MicroMinotari(1),
+            amount,
+            MemoField::new_empty(),
+        )
+        .unwrap();
+        let signed_tx = &signed.signed_transaction;
+        assert_eq!(
+            signed_tx.change_output.as_ref().map(|o| o.value()),
+            Some(MicroMinotari(1))
+        );
+        assert_eq!(signed_tx.transaction.body.kernels()[0].fee, fee + change_fee);
+        assert_eq!(signed_tx.transaction.body.outputs().len(), 2);
+        let validator = TransactionInternalConsistencyValidator::new(false, rules, CryptoFactories::default());
+        validator
+            .validate(&signed_tx.transaction, None, None, u64::MAX)
+            .unwrap();
+    }
+
+    /// A payment id that fits the recipient's memo but leaves no room for the change memo, which also carries an
+    /// address, the amounts and the sent output hash, means no change output can be built. The signer must refuse
+    /// it while deciding fee and change, rather than sign the recipient output and fail on the change.
+    #[test]
+    fn offline_sign_refuses_a_payment_id_the_change_memo_cannot_carry() {
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let payment_id = MemoField::new_open_from_string(&"x".repeat(200), TxType::PaymentToOther).unwrap();
+
+        let err = prepare_and_sign_one_sided(
+            &alice_key_manager,
+            &alice_view_key_manager,
+            &bob_address,
+            MicroMinotari(100_000),
+            MicroMinotari(5000),
+            payment_id.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TransactionBuilderError::InvalidMemo(_)),
+            "expected the signer to refuse the change memo, got {err:?}"
+        );
+
+        // The refusal comes from the fee and change decision itself, which the reservation makes before it mints any
+        // sender offset key, and which the online wallet asks before it locks any input.
+        let rules = create_consensus_manager();
+        let builder_for = |input_value: MicroMinotari, amount: MicroMinotari| {
+            let mut builder = TransactionBuilder::new(
+                rules.consensus_constants(0).clone(),
+                alice_key_manager.clone(),
+                Network::LocalNet,
+            )
+            .unwrap();
+            builder
+                .with_fee_per_gram(MicroMinotari(20))
+                .with_input(create_test_input(input_value, 0, &alice_key_manager, vec![], None))
+                .unwrap();
+            builder
+                .add_stealth_recipient(
+                    bob_address.clone(),
+                    amount,
+                    OutputFeatures::default(),
+                    payment_id.clone(),
+                )
+                .unwrap();
+            builder.with_memo(payment_id.clone());
+            builder
+        };
+        let err = builder_for(MicroMinotari(100_000), MicroMinotari(5000))
+            .check_offline_payload(&[])
+            .unwrap_err();
+        assert!(matches!(err, TransactionBuilderError::InvalidMemo(_)), "got {err:?}");
+
+        // A payment that leaves nothing for change never needs the change memo, so it is not refused for it.
+        let fee = builder_for(MicroMinotari(100_000), MicroMinotari(5000))
+            .get_fee_estimate_without_change()
+            .unwrap();
+        let err = builder_for(MicroMinotari(5000) + fee, MicroMinotari(5000))
+            .check_offline_payload(&[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TransactionBuilderError::OfflineTransactionRequiresChange { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// The signer refuses a payload whose fee exceeds the amount it sends, even though it leaves change.
+    #[test]
+    fn offline_sign_refuses_a_fee_greater_than_the_amount() {
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+
+        let err = prepare_and_sign_one_sided(
+            &alice_key_manager,
+            &alice_view_key_manager,
+            &bob_address,
+            MicroMinotari(100_000),
+            MicroMinotari(1),
+            MemoField::new_empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TransactionBuilderError::FeeGreaterThanAmount { .. }),
+            "expected the signer to refuse the fee, got {err:?}"
+        );
+    }
+
     /// A payload carrying a directly-specified output must sign into a *valid* transaction.
     ///
     /// The output arrives with a metadata signature made against a sender offset key the signer does not hold, so the
@@ -220,10 +535,7 @@ mod test {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn offline_sign_with_a_custom_output_is_valid() {
-        use crate::{
-            offline_signing::PayloadSummary,
-            test_helpers::{TestParams, create_wallet_output_with_data},
-        };
+        use crate::test_helpers::{TestParams, create_wallet_output_with_data};
 
         let rules = create_consensus_manager();
         let alice_key_manager = KeyManager::new_random().unwrap();
@@ -305,7 +617,7 @@ mod test {
         assert_eq!(init.info.outputs.len(), 1);
 
         // The summary the operator approves must account for the custom output
-        let summary = PayloadSummary::from_one_sided(init.tx_id, &init.info);
+        let summary = PayloadSummary::from_one_sided(init.clone());
         assert_eq!(summary.total_output_amount, custom_value);
         assert_eq!(summary.total_spend(), amount + custom_value);
 
@@ -313,7 +625,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(summary),
         )
         .unwrap();
 
@@ -452,7 +764,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_one_sided(init)),
         )
         .unwrap();
         assert!(signed.signed_transaction.change_output.is_some());
@@ -551,7 +863,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_one_sided(init)),
         )
         .unwrap();
         assert!(signed.signed_transaction.change_output.is_some());
@@ -655,14 +967,14 @@ mod test {
         let init = prepare_deposit_multisig_transaction(
             &alice_view_key_manager,
             TxId::new_random(),
-            tx_builder,
+            tx_builder.clone(),
             amount,
-            payment_id,
-            output_features,
+            payment_id.clone(),
+            output_features.clone(),
             party_number,
-            multisignature_participiants,
-            alice_address,
-            bob_address,
+            multisignature_participiants.clone(),
+            alice_address.clone(),
+            bob_address.clone(),
         )
         .unwrap();
 
@@ -673,7 +985,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_multisig(init)),
         )
         .unwrap();
 
@@ -688,8 +1000,58 @@ mod test {
         assert_eq!(signed.signed_transaction.outputs.len(), 1);
         let tx = signed.signed_transaction.transaction.clone();
         let factories = CryptoFactories::default();
-        let validator = TransactionInternalConsistencyValidator::new(false, rules, factories);
+        let validator = TransactionInternalConsistencyValidator::new(false, rules.clone(), factories);
         assert!(validator.validate(&tx, None, None, u64::MAX).is_ok());
+
+        // The fee the signer charged is exactly the online estimate for the same declaration, change memo included.
+        let mut probe = tx_builder.clone();
+        probe.with_memo(payment_id.clone());
+        let pending = multisig_pending_output(
+            rules.consensus_constants(0),
+            &bob_address,
+            amount,
+            &output_features,
+            &payment_id,
+            party_number,
+            multisignature_participiants.len(),
+        )
+        .unwrap();
+        let change_fee = probe.get_change_output_fee(std::slice::from_ref(&pending)).unwrap();
+        let fee_without_change = probe.get_fee_estimate_with(&[pending]).unwrap();
+        assert_eq!(
+            signed.signed_transaction.transaction.body.kernels()[0].fee,
+            fee_without_change + change_fee
+        );
+
+        // The same deposit, sized to spend every input exactly, leaves no change and must be refused.
+        let init = prepare_deposit_multisig_transaction(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            MicroMinotari(27000) - fee_without_change,
+            payment_id,
+            output_features,
+            party_number,
+            multisignature_participiants,
+            alice_address,
+            bob_address,
+        )
+        .unwrap();
+        let err = sign_locked_deposit_multisig_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_multisig(init)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransactionBuilderError::OfflineTransactionRequiresChange { remainder, change_fee: c }
+                    if remainder == MicroMinotari::zero() && c == change_fee
+            ),
+            "expected the signer to refuse a deposit without change, got {err:?}"
+        );
     }
 
     #[test]
@@ -850,9 +1212,9 @@ mod test {
         let fee_calculator = Fee::new(*consensus_constants.transaction_weight_params());
         let script = push_pubkey_script(&Default::default());
 
-        // Mirror what `MultisigSession::spend_multisig_utxo` and `PrepareWithdrawMultisigTransaction` do: the whole
-        // input goes to one recipient output with no change, and that output carries an `AddressAndData` memo which
-        // the builder charges for. The memo records the fee being calculated here, so measure a zero-fee copy first.
+        // Mirror what `PrepareWithdrawMultisigTransaction` does: the input goes to one recipient output, and that
+        // output carries an `AddressAndData` memo which the builder charges for. The memo records the fee being
+        // calculated here, so measure a zero-fee copy first.
         let measured_memo = addressed_output_memo(
             MemoField::default(),
             bob_address.clone(),
@@ -877,8 +1239,52 @@ mod test {
             "the output memo must be non-empty, otherwise this test cannot tell whether the estimate counts it"
         );
 
-        let total_amount = amount.checked_sub(fee).unwrap();
         assert_eq!(alice_address, alice_address_s);
+
+        // Handing the whole input to the recipient leaves no change, and the signer must refuse it.
+        let init = prepare_withdraw_multisig_transaction(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder.clone(),
+            amount.checked_sub(fee).unwrap(),
+            output_payment_id.clone(),
+            output_features.clone(),
+            alice_address.clone(),
+            bob_address.clone(),
+        )
+        .unwrap();
+        let err = sign_locked_withdraw_multisig_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_withdraw_multisig(init)),
+        )
+        .unwrap_err();
+        // Measured the way the signer measures it: with the memo and the recipient declared.
+        let mut probe = tx_builder.clone();
+        probe.with_memo(output_payment_id.clone());
+        let recipient = PaymentRecipient {
+            amount: MicroMinotari::zero(),
+            output_features: output_features.clone(),
+            address: bob_address.clone(),
+            payment_id: output_payment_id.clone(),
+        };
+        let change_fee = probe
+            .get_change_output_fee(&[
+                withdraw_pending_output(consensus_constants, &recipient, &output_payment_id).unwrap(),
+            ])
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                TransactionBuilderError::OfflineTransactionRequiresChange { remainder, change_fee: c }
+                    if remainder == MicroMinotari::zero() && c == change_fee
+            ),
+            "expected the signer to refuse a withdrawal without change, got {err:?}"
+        );
+
+        // Leaving just enough for one microminotari of change after the change output's own fee signs.
+        let total_amount = amount - fee - change_fee - MicroMinotari(1);
         let init = prepare_withdraw_multisig_transaction(
             &alice_view_key_manager,
             TxId::new_random(),
@@ -896,12 +1302,19 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_withdraw_multisig(init)),
         )
         .unwrap();
-        assert_eq!(signed.signed_transaction.transaction.body.kernels()[0].fee, fee,);
+        assert_eq!(
+            signed.signed_transaction.transaction.body.kernels()[0].fee,
+            fee + change_fee
+        );
+        assert_eq!(
+            signed.signed_transaction.change_output.as_ref().map(|o| o.value()),
+            Some(MicroMinotari(1))
+        );
         assert_eq!(signed.signed_transaction.transaction.body.inputs().len(), 1);
-        assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 1);
+        assert_eq!(signed.signed_transaction.transaction.body.outputs().len(), 2);
         assert_eq!(signed.signed_transaction.sent_hashes.len(), 1);
         assert_eq!(signed.signed_transaction.outputs.len(), 1);
         let tx = signed.signed_transaction.transaction.clone();
@@ -979,7 +1392,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            init,
+            confirmed(PayloadSummary::from_one_sided(init)),
         )
         .unwrap();
         let tx = signed.signed_transaction.transaction.clone();
@@ -1122,7 +1535,7 @@ mod test {
                 &alice_view_key_manager,
                 rules.consensus_constants(0).clone(),
                 Network::LocalNet,
-                init
+                confirmed(PayloadSummary::from_one_sided(init))
             )
             .is_err()
         );
@@ -1217,7 +1630,7 @@ mod test {
             &alice_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            prepared,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
         );
         assert!(
             result.is_err(),
@@ -1228,6 +1641,98 @@ mod test {
             err_msg.contains("tampered") || err_msg.contains("integrity") || err_msg.contains("invalid"),
             "Expected an integrity-check error message, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn payload_parse_error_is_rendered_escaped() {
+        use crate::offline_signing::models::{PrepareOneSidedTransactionForSigningResult, TransactionResult};
+
+        // An unknown enum variant: serde quotes the decoded string in its error
+        let json =
+            r#"{"info":{"recipients":[{"output_features":{"output_type":"x\u001b[2J\u202e"}}]},"version":"5.0.0"}"#;
+        let err = PrepareOneSidedTransactionForSigningResult::from_json(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\\u{1b}[2J"), "{err}");
+        assert!(err.contains("\\u{202e}"), "{err}");
+        assert!(!err.chars().any(|c| c < ' ' || c == '\u{202e}'), "{err:?}");
+    }
+
+    #[test]
+    fn sign_locked_requires_confirmed_payload() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_keys = ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        );
+        let alice_view_key_manager = create_view_key_manager(alice_keys).unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+
+        let input = create_test_input(MicroMinotari(20000), 0, &alice_key_manager, vec![], None);
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            alice_view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(20))
+            .with_input(input)
+            .unwrap();
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let alice_address = TariAddress::new_dual_address(
+            alice_view_key_manager.get_view_key().pub_key,
+            alice_view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount: MicroMinotari(5000),
+            output_features: OutputFeatures::default(),
+            address: bob_address.clone(),
+            payment_id: MemoField::new_empty(),
+        }];
+        let prepared = prepare_one_sided_transaction_for_signing(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            MemoField::new_empty(),
+            alice_address,
+        )
+        .unwrap();
+
+        let summary = PayloadSummary::from_one_sided(prepared);
+        let mut out = Vec::new();
+        let confirmation = present_payload_summary(
+            &summary,
+            ConfirmationMode::NonInteractive,
+            &mut out,
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains(&bob_address.to_base58()), "{written}");
+        let confirmed = summary.confirm(confirmation).unwrap();
+
+        sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed,
+        )
+        .unwrap();
     }
 
     /// Verify that a payload signed by a *different* wallet's view key is
@@ -1302,7 +1807,7 @@ mod test {
             &bob_key_manager,
             rules.consensus_constants(0).clone(),
             Network::LocalNet,
-            prepared,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
         );
         assert!(
             result.is_err(),
@@ -1312,6 +1817,698 @@ mod test {
         assert!(
             err_msg.contains("view public key") || err_msg.contains("integrity") || err_msg.contains("tampered"),
             "Expected a view-key mismatch error, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload key id checks: the payload signature is made with the view key, so the online host can forge any
+    // payload. A forged output key id must not make the signer touch the spend key.
+    // -----------------------------------------------------------------------
+
+    /// A prepared payload re-signed by the view key holder (the online host) with `forged` added to its outputs.
+    fn forged_payload(
+        alice_key_manager: &KeyManager,
+        forged: impl FnOnce(&KeyManager) -> crate::transaction_components::WalletOutput,
+    ) -> crate::offline_signing::models::PrepareOneSidedTransactionForSigningResult {
+        let rules = create_consensus_manager();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+
+        let input = create_test_input(MicroMinotari(20000), 0, alice_key_manager, vec![], None);
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            alice_view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(5))
+            .with_input(input)
+            .unwrap();
+
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let alice_address = TariAddress::new_dual_address(
+            alice_view_key_manager.get_view_key().pub_key,
+            alice_view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount: MicroMinotari(1000),
+            output_features: OutputFeatures::default(),
+            address: bob_address,
+            payment_id: MemoField::new_empty(),
+        }];
+        let mut prepared = prepare_one_sided_transaction_for_signing(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            MemoField::new_empty(),
+            alice_address,
+        )
+        .unwrap();
+
+        // The host adds its output and re-signs: it holds the view key, so the payload signature still verifies.
+        prepared.info.outputs.push(forged(&alice_view_key_manager));
+        let canonical = crate::offline_signing::models::borsh_canonical_one_sided(
+            &prepared.version,
+            prepared.tx_id,
+            &prepared.info,
+        )
+        .unwrap();
+        prepared.payload_signature =
+            crate::offline_signing::offline_signer::sign_payload(&alice_view_key_manager, &canonical).unwrap();
+        prepared
+    }
+
+    /// A payload output with the given key ids, carrying a cached commitment so that no key manager call is needed
+    /// to build it.
+    fn output_with_key_ids(
+        key_manager: &KeyManager,
+        commitment_mask_key_id: TariKeyId,
+        script_key_id: TariKeyId,
+    ) -> crate::transaction_components::WalletOutput {
+        let features = OutputFeatures {
+            range_proof_type: crate::transaction_components::RangeProofType::RevealedValue,
+            ..Default::default()
+        };
+        crate::transaction_components::WalletOutput::new_from_parts(
+            Default::default(),
+            MicroMinotari(1000),
+            commitment_mask_key_id,
+            features,
+            push_pubkey_script(&key_manager.get_spend_key().pub_key),
+            ExecutionStack::default(),
+            script_key_id,
+            Default::default(),
+            Default::default(),
+            0,
+            Covenant::default(),
+            EncryptedData::default(),
+            MicroMinotari(1000),
+            None,
+            MemoField::new_empty(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    fn assert_key_id_refused(
+        result: Result<crate::offline_signing::models::SignedOneSidedTransactionResult, crate::TransactionBuilderError>,
+        expected_field: &str,
+    ) {
+        match result {
+            Err(crate::TransactionBuilderError::OfflinePayloadKeyIdNotAllowed { field, .. }) => {
+                assert_eq!(field, expected_field)
+            },
+            Err(e) => panic!("expected the payload key id to be refused, got: {e}"),
+            Ok(_) => panic!("expected the payload key id to be refused, but the payload was signed"),
+        }
+    }
+
+    /// The GHSA attack: a forged payload output whose commitment mask is the spend key. Before the fix the signer
+    /// encrypted the spend key into the output's recovery data, which the host decrypts with the view key.
+    #[test]
+    fn sign_locked_transaction_refuses_a_spend_key_mask() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let prepared = forged_payload(&alice_key_manager, |km| {
+            let script_key = TariKeyId::Derived {
+                key: (&km.get_random_key(None, None).unwrap().key_id).into(),
+            };
+            output_with_key_ids(km, TariKeyId::SpendKey, script_key)
+        });
+
+        let result = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        );
+        assert_key_id_refused(result, "outputs[0].commitment_mask_key_id");
+    }
+
+    /// Every root-bearing key id is refused as a payload mask, and as a payload script key.
+    #[test]
+    fn sign_locked_transaction_refuses_root_bearing_payload_key_ids() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let good_mask = alice_key_manager.get_random_key(None, None).unwrap().key_id;
+        let bad_ids = [
+            TariKeyId::SpendKey,
+            TariKeyId::ViewKey,
+            TariKeyId::CodeTemplateAuthor,
+            TariKeyId::Zero,
+            TariKeyId::Derived {
+                key: (&good_mask).into(),
+            },
+        ];
+        for bad in bad_ids {
+            let mask_bad = bad.clone();
+            let prepared = forged_payload(&alice_key_manager, |km| {
+                output_with_key_ids(km, mask_bad, TariKeyId::Derived {
+                    key: (&good_mask).into(),
+                })
+            });
+            let result = sign_locked_transaction(
+                &alice_key_manager,
+                rules.consensus_constants(0).clone(),
+                Network::LocalNet,
+                confirmed(PayloadSummary::from_one_sided(prepared)),
+            );
+            assert_key_id_refused(result, "outputs[0].commitment_mask_key_id");
+
+            // `Derived` over a mask is exactly what a script key is, and the spend key is allowed as the script key of
+            // a `PushPubKey(<our spend key>)` script (the script `output_with_key_ids` uses); both are covered below
+            if matches!(bad, TariKeyId::Derived { .. } | TariKeyId::SpendKey) {
+                continue;
+            }
+            let script_bad = bad.clone();
+            let prepared = forged_payload(&alice_key_manager, |km| {
+                output_with_key_ids(km, good_mask.clone(), script_bad)
+            });
+            let result = sign_locked_transaction(
+                &alice_key_manager,
+                rules.consensus_constants(0).clone(),
+                Network::LocalNet,
+                confirmed(PayloadSummary::from_one_sided(prepared)),
+            );
+            assert_key_id_refused(result, "outputs[0].script_key_id");
+        }
+    }
+
+    /// Key ids nested too deep are refused, whether the nesting is hidden under an otherwise valid mask branch or
+    /// stacked as `Derived` script keys.
+    #[test]
+    fn sign_locked_transaction_refuses_deeply_nested_payload_key_ids() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let good_mask = alice_key_manager.get_random_key(None, None).unwrap().key_id;
+
+        // An `Encrypted` mask whose encryption key is a three-deep `Derived` chain
+        let deep_mask: TariKeyId = "encrypted.0102.derived.derived.derived.spend_key".parse().unwrap();
+        let script_key = TariKeyId::Derived {
+            key: (&good_mask).into(),
+        };
+        let prepared = forged_payload(&alice_key_manager, |km| output_with_key_ids(km, deep_mask, script_key));
+        let result = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        );
+        assert_key_id_refused(result, "outputs[0].commitment_mask_key_id");
+
+        // A three-deep `Derived` script key
+        let deep_script_key: TariKeyId = format!("derived.derived.derived.{good_mask}").parse().unwrap();
+        let prepared = forged_payload(&alice_key_manager, |km| {
+            output_with_key_ids(km, good_mask.clone(), deep_script_key)
+        });
+        let result = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        );
+        assert_key_id_refused(result, "outputs[0].script_key_id");
+    }
+
+    /// A key id longer than 1 KiB is refused even when its branch and nesting are fine.
+    #[test]
+    fn sign_locked_transaction_refuses_an_oversized_payload_key_id() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let good_mask = alice_key_manager.get_random_key(None, None).unwrap().key_id;
+        let huge_mask = TariKeyId::Encrypted {
+            encrypted: vec![1u8; 600],
+            key: (&TariKeyId::ViewKey).into(),
+        };
+        let script_key = TariKeyId::Derived {
+            key: (&good_mask).into(),
+        };
+        let prepared = forged_payload(&alice_key_manager, |km| output_with_key_ids(km, huge_mask, script_key));
+        let result = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        );
+        match result {
+            Err(crate::TransactionBuilderError::OfflinePayloadKeyIdNotAllowed { field, key_id }) => {
+                assert_eq!(field, "outputs[0].commitment_mask_key_id");
+                // The refused id is echoed redacted, not as the 1200+ characters of ciphertext the payload carried
+                assert_eq!(key_id, "encrypted.[600 bytes].view_key");
+            },
+            Err(e) => panic!("expected the payload key id to be refused, got: {e}"),
+            Ok(_) => panic!("expected the payload key id to be refused, but the payload was signed"),
+        }
+    }
+
+    /// Forged inputs are checked too.
+    #[test]
+    fn sign_locked_transaction_refuses_a_spend_key_input_mask() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let mut prepared = forged_payload(&alice_key_manager, |km| {
+            let mask = km.get_random_key(None, None).unwrap().key_id;
+            let script_key = TariKeyId::Derived { key: (&mask).into() };
+            output_with_key_ids(km, mask, script_key)
+        });
+        let script_key = prepared.info.inputs[0].script_key_id().clone();
+        prepared.info.inputs[0] = output_with_key_ids(&alice_key_manager, TariKeyId::SpendKey, script_key);
+        let canonical = crate::offline_signing::models::borsh_canonical_one_sided(
+            &prepared.version,
+            prepared.tx_id,
+            &prepared.info,
+        )
+        .unwrap();
+        prepared.payload_signature =
+            crate::offline_signing::offline_signer::sign_payload(&alice_key_manager, &canonical).unwrap();
+
+        let result = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        );
+        assert_key_id_refused(result, "inputs[0].commitment_mask_key_id");
+    }
+
+    /// A non-stealth output, as the wallet holds it: a `PushPubKey(<spend key>)`-style script with the spend key as
+    /// its script key.
+    fn non_stealth_input(
+        key_manager: &KeyManager,
+        amount: MicroMinotari,
+        script: TariScript,
+    ) -> crate::transaction_components::WalletOutput {
+        input_with_script_key(key_manager, amount, script, TariKeyId::SpendKey)
+    }
+
+    /// A signed wallet output with the given script and script key, under a fresh mask.
+    fn input_with_script_key(
+        key_manager: &KeyManager,
+        amount: MicroMinotari,
+        script: TariScript,
+        script_key: TariKeyId,
+    ) -> crate::transaction_components::WalletOutput {
+        let mask = key_manager.get_random_key(None, None).unwrap();
+        let sender_offset = key_manager.get_random_key(None, None).unwrap();
+        WalletOutputBuilder::new(amount, mask.key_id)
+            .with_script(script)
+            .encrypt_data_for_recovery(key_manager, None, MemoField::new_empty())
+            .unwrap()
+            .with_input_data(ExecutionStack::default())
+            .with_sender_offset_public_key(sender_offset.pub_key)
+            .with_script_key(script_key)
+            .sign_metadata_signature(key_manager, &sender_offset.key_id)
+            .unwrap()
+            .try_build(key_manager)
+            .unwrap()
+    }
+
+    /// Non-stealth outputs (for example non-stealth coinbases) carry the spend key as their script key. They are
+    /// ordinary wallet funds, so an offline payload spending one must still sign.
+    #[test]
+    fn sign_locked_transaction_signs_a_non_stealth_spend_key_script_input() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+
+        let input = non_stealth_input(
+            &alice_key_manager,
+            MicroMinotari(20000),
+            push_pubkey_script(&alice_key_manager.get_spend_key().pub_key),
+        );
+        assert_eq!(*input.script_key_id(), TariKeyId::SpendKey);
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            alice_view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(5))
+            .with_input(input)
+            .unwrap();
+
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let alice_address = TariAddress::new_dual_address(
+            alice_view_key_manager.get_view_key().pub_key,
+            alice_view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount: MicroMinotari(5000),
+            output_features: OutputFeatures::default(),
+            address: bob_address,
+            payment_id: MemoField::new_empty(),
+        }];
+        let prepared = prepare_one_sided_transaction_for_signing(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            MemoField::new_empty(),
+            alice_address,
+        )
+        .unwrap();
+
+        let signed = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        )
+        .unwrap();
+        let validator = TransactionInternalConsistencyValidator::new(false, rules, CryptoFactories::default());
+        validator
+            .validate(&signed.signed_transaction.transaction, None, None, u64::MAX)
+            .unwrap();
+    }
+
+    /// The spend key is only allowed as a script key when the script is exactly `PushPubKey(<our spend key>)`.
+    #[test]
+    fn sign_locked_transaction_refuses_a_spend_key_script_key_on_any_other_script() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let other_key = KeyManager::new_random().unwrap().get_spend_key().pub_key;
+        let scripts = [
+            TariScript::new(vec![Opcode::Nop]).unwrap(),
+            push_pubkey_script(&other_key),
+            TariScript::new(vec![
+                Opcode::PushPubKey(Box::new(alice_key_manager.get_spend_key().pub_key)),
+                Opcode::Nop,
+            ])
+            .unwrap(),
+        ];
+        for script in scripts {
+            let mut prepared = forged_payload(&alice_key_manager, |km| {
+                let mask = km.get_random_key(None, None).unwrap().key_id;
+                let script_key = TariKeyId::Derived { key: (&mask).into() };
+                output_with_key_ids(km, mask, script_key)
+            });
+            prepared.info.inputs[0] = non_stealth_input(&alice_key_manager, MicroMinotari(20000), script);
+            let canonical = crate::offline_signing::models::borsh_canonical_one_sided(
+                &prepared.version,
+                prepared.tx_id,
+                &prepared.info,
+            )
+            .unwrap();
+            prepared.payload_signature =
+                crate::offline_signing::offline_signer::sign_payload(&alice_key_manager, &canonical).unwrap();
+
+            let result = sign_locked_transaction(
+                &alice_key_manager,
+                rules.consensus_constants(0).clone(),
+                Network::LocalNet,
+                confirmed(PayloadSummary::from_one_sided(prepared)),
+            );
+            assert_key_id_refused(result, "inputs[0].script_key_id");
+        }
+    }
+
+    /// An imported output's script key id is `Encrypted` under the spend key, and the host sees it in any payload that
+    /// spends that output. Replayed as a forged output's mask, or under `Derived` as a script key, it must be refused;
+    /// so must a `DH*` mask over the spend key. As a plain script key it is allowed, see
+    /// `sign_locked_transaction_signs_an_imported_input`.
+    #[test]
+    fn sign_locked_transaction_refuses_key_ids_over_the_spend_key() {
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let good_mask = alice_key_manager.get_random_key(None, None).unwrap().key_id;
+        let good_script_key = TariKeyId::Derived {
+            key: (&good_mask).into(),
+        };
+        let imported_script_key = alice_key_manager
+            .create_encrypted_key(
+                tari_common_types::types::PrivateKey::from(7u64),
+                Some(alice_key_manager.get_spend_key().key_id),
+            )
+            .unwrap();
+        let dh_over_spend_key = TariKeyId::DHCommitmentMask {
+            public_key: alice_key_manager.get_spend_key().pub_key,
+            private_key: (&TariKeyId::SpendKey).into(),
+        };
+
+        let cases = [
+            (
+                imported_script_key.clone(),
+                good_script_key.clone(),
+                "outputs[0].commitment_mask_key_id",
+            ),
+            (
+                good_mask.clone(),
+                TariKeyId::Derived {
+                    key: (&imported_script_key).into(),
+                },
+                "outputs[0].script_key_id",
+            ),
+            (dh_over_spend_key, good_script_key, "outputs[0].commitment_mask_key_id"),
+        ];
+        for (mask, script_key, field) in cases {
+            let prepared = forged_payload(&alice_key_manager, |km| output_with_key_ids(km, mask, script_key));
+            let result = sign_locked_transaction(
+                &alice_key_manager,
+                rules.consensus_constants(0).clone(),
+                Network::LocalNet,
+                confirmed(PayloadSummary::from_one_sided(prepared)),
+            );
+            assert_key_id_refused(result, field);
+        }
+    }
+
+    /// An imported output, built the way `UnblindedOutput::to_wallet_output` builds it: mask `Encrypted` under the
+    /// view key, script key `Encrypted` under the spend key, script `PushPubKey(s·G)`. Spending it offline must still
+    /// sign.
+    #[test]
+    fn sign_locked_transaction_signs_an_imported_input() {
+        use tari_common_types::types::{CompressedPublicKey, PrivateKey};
+        use tari_crypto::keys::SecretKey;
+
+        let rules = create_consensus_manager();
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let alice_view_key_manager = create_view_key_manager(ViewWallet::new(
+            alice_key_manager.get_spend_key().pub_key,
+            alice_key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+
+        let mask = alice_key_manager
+            .create_encrypted_key(PrivateKey::random(&mut rand::rng()), None)
+            .unwrap();
+        let script_private_key = PrivateKey::random(&mut rand::rng());
+        let script_public_key = CompressedPublicKey::from_secret_key(&script_private_key);
+        let script_key = alice_key_manager
+            .create_encrypted_key(script_private_key, Some(alice_key_manager.get_spend_key().key_id))
+            .unwrap();
+        let sender_offset = alice_key_manager.get_random_key(None, None).unwrap();
+        let input = WalletOutputBuilder::new(MicroMinotari(20000), mask)
+            .with_script(push_pubkey_script(&script_public_key))
+            .encrypt_data_for_recovery(&alice_key_manager, None, MemoField::new_empty())
+            .unwrap()
+            .with_input_data(ExecutionStack::default())
+            .with_sender_offset_public_key(sender_offset.pub_key)
+            .with_script_key(script_key.clone())
+            .sign_metadata_signature(&alice_key_manager, &sender_offset.key_id)
+            .unwrap()
+            .try_build(&alice_key_manager)
+            .unwrap();
+
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            alice_view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(5))
+            .with_input(input)
+            .unwrap();
+
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let alice_address = TariAddress::new_dual_address(
+            alice_view_key_manager.get_view_key().pub_key,
+            alice_view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount: MicroMinotari(5000),
+            output_features: OutputFeatures::default(),
+            address: bob_address,
+            payment_id: MemoField::new_empty(),
+        }];
+        let prepared = prepare_one_sided_transaction_for_signing(
+            &alice_view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            MemoField::new_empty(),
+            alice_address,
+        )
+        .unwrap();
+        assert_eq!(*prepared.info.inputs[0].script_key_id(), script_key);
+
+        let signed = sign_locked_transaction(
+            &alice_key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        )
+        .unwrap();
+        let validator = TransactionInternalConsistencyValidator::new(false, rules, CryptoFactories::default());
+        validator
+            .validate(&signed.signed_transaction.transaction, None, None, u64::MAX)
+            .unwrap();
+    }
+
+    /// A payload spending `input`, prepared by a view wallet over `key_manager`'s keys and signed by `key_manager`.
+    fn sign_single_input_payload(
+        key_manager: &KeyManager,
+        input: crate::transaction_components::WalletOutput,
+    ) -> Result<crate::offline_signing::models::SignedOneSidedTransactionResult, crate::TransactionBuilderError> {
+        let rules = create_consensus_manager();
+        let view_key_manager = create_view_key_manager(ViewWallet::new(
+            key_manager.get_spend_key().pub_key,
+            key_manager.get_private_view_key(),
+            None,
+        ))
+        .unwrap();
+        let bob_key_manager = KeyManager::new_random().unwrap();
+        let mut tx_builder = TransactionBuilder::new(
+            rules.consensus_constants(0).clone(),
+            view_key_manager.clone(),
+            Network::LocalNet,
+        )
+        .unwrap();
+        tx_builder
+            .with_fee_per_gram(MicroMinotari(5))
+            .with_input(input)
+            .unwrap();
+        let bob_address = TariAddress::new_dual_address(
+            bob_key_manager.get_view_key().pub_key,
+            bob_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let sender_address = TariAddress::new_dual_address(
+            view_key_manager.get_view_key().pub_key,
+            view_key_manager.get_spend_key().pub_key,
+            Network::LocalNet,
+            TariAddressFeatures::create_one_sided_only(),
+            None,
+        )
+        .unwrap();
+        let recipients = [PaymentRecipient {
+            amount: MicroMinotari(5000),
+            output_features: OutputFeatures::default(),
+            address: bob_address,
+            payment_id: MemoField::new_empty(),
+        }];
+        let prepared = prepare_one_sided_transaction_for_signing(
+            &view_key_manager,
+            TxId::new_random(),
+            tx_builder,
+            &recipients,
+            MemoField::new_empty(),
+            sender_address,
+        )
+        .unwrap();
+        sign_locked_transaction(
+            key_manager,
+            rules.consensus_constants(0).clone(),
+            Network::LocalNet,
+            confirmed(PayloadSummary::from_one_sided(prepared)),
+        )
+    }
+
+    /// The legacy key conversion turns `derived.managed.comms.0` into `derived.spend_key`, so a migrated wallet can
+    /// hold unspent outputs with that script key. Spending one offline must still sign.
+    #[test]
+    fn sign_locked_transaction_signs_a_legacy_derived_spend_key_input() {
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let script_key = TariKeyId::Derived {
+            key: (&TariKeyId::SpendKey).into(),
+        };
+        let script_public_key = alice_key_manager.get_public_key_at_key_id(&script_key).unwrap();
+        let input = input_with_script_key(
+            &alice_key_manager,
+            MicroMinotari(20000),
+            push_pubkey_script(&script_public_key),
+            script_key,
+        );
+
+        let signed = sign_single_input_payload(&alice_key_manager, input).unwrap();
+        let validator =
+            TransactionInternalConsistencyValidator::new(false, create_consensus_manager(), CryptoFactories::default());
+        validator
+            .validate(&signed.signed_transaction.transaction, None, None, u64::MAX)
+            .unwrap();
+    }
+
+    /// `Derived` over the spend key is the only non-mask inner id a script key may have; `Derived` over the view key
+    /// is refused.
+    #[test]
+    fn sign_locked_transaction_refuses_a_derived_view_key_script_key() {
+        let alice_key_manager = KeyManager::new_random().unwrap();
+        let script_key = TariKeyId::Derived {
+            key: (&TariKeyId::ViewKey).into(),
+        };
+        let script_public_key = alice_key_manager.get_public_key_at_key_id(&script_key).unwrap();
+        let input = input_with_script_key(
+            &alice_key_manager,
+            MicroMinotari(20000),
+            push_pubkey_script(&script_public_key),
+            script_key,
+        );
+
+        assert_key_id_refused(
+            sign_single_input_payload(&alice_key_manager, input),
+            "inputs[0].script_key_id",
         );
     }
 }

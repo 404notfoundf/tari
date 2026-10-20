@@ -35,6 +35,7 @@ use tari_common::{
     exit_codes::{ExitCode, ExitError},
 };
 use tari_common_sqlite::{
+    DbProfile,
     connection::{DbConnection, DbConnectionUrl},
     error::StorageError,
 };
@@ -45,16 +46,18 @@ use tari_comms::{
     PeerManager,
     UnspawnedCommsNode,
     backoff::ConstantBackoff,
-    multiaddr::multiaddr,
+    multiaddr::{Multiaddr, multiaddr},
     peer_manager::{
         NodeIdentity,
         PEER_DATABASE_BUSY_TIMEOUT,
         Peer,
         PeerFeatures,
         PeerFlags,
+        PeerManagerConfig,
         PeerManagerError,
         database::{MIGRATIONS, PeerDatabaseSql},
     },
+    peer_validator::validate_address_shape,
     pipeline,
     protocol::{
         NodeNetworkInfo,
@@ -105,6 +108,10 @@ pub enum CommsInitializationError {
     HiddenServiceBuilderError(#[from] tor::HiddenServiceBuilderError),
     #[error("Invalid liveness CIDRs error: `{0}`")]
     InvalidLivenessCidrs(String),
+    #[error("Invalid listener_per_ip_exempt_cidrs: `{0}`")]
+    InvalidPerIpExemptCidrs(String),
+    #[error("Invalid p2p listener configuration: {0}")]
+    InvalidListenerConfig(String),
     #[error("Could not add seed peers to comms layer: `{0}`")]
     FailedToAddSeedPeer(#[from] PeerManagerError),
     #[error("Cannot acquire exclusive file lock, another instance of the application is already running")]
@@ -131,6 +138,8 @@ impl CommsInitializationError {
             CommsInitializationError::HiddenServiceControllerError(FailedToLoadCookieFile(_)) => {
                 ExitError::new(ExitCode::TorAuthUnreadableCookie, self)
             },
+            CommsInitializationError::InvalidListenerConfig(_) |
+            CommsInitializationError::InvalidPerIpExemptCidrs(_) => ExitError::new(ExitCode::ConfigError, self),
 
             _ => ExitError::new(ExitCode::NetworkError, self),
         }
@@ -156,6 +165,7 @@ where
         &database_url,
         MIGRATIONS,
         Some(5),
+        DbProfile::Cache,
         PEER_DATABASE_BUSY_TIMEOUT,
     )?;
     let peer_database = PeerDatabaseSql::new(db_connection, &node_identity.to_peer())?;
@@ -296,38 +306,78 @@ fn initialize_hidden_service(
     Ok(hidden_svc_ctl)
 }
 
+/// Rejects inbound listener limits that would refuse every inbound connection.
+fn validate_listener_limits(config: &P2pConfig) -> Result<(), CommsInitializationError> {
+    if config.listener_handshake_timeout.is_zero() {
+        return Err(CommsInitializationError::InvalidListenerConfig(
+            "listener_handshake_timeout must be greater than zero".to_string(),
+        ));
+    }
+    if config.max_inbound_connections == 0 {
+        return Err(CommsInitializationError::InvalidListenerConfig(
+            "max_inbound_connections must be greater than zero".to_string(),
+        ));
+    }
+    if config.listener_max_handshakes_per_ip == 0 {
+        return Err(CommsInitializationError::InvalidListenerConfig(
+            "listener_max_handshakes_per_ip must be greater than zero".to_string(),
+        ));
+    }
+    if config.max_inbound_connections_per_ip == 0 {
+        return Err(CommsInitializationError::InvalidListenerConfig(
+            "max_inbound_connections_per_ip must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn configure_comms_and_dht(
     builder: CommsBuilder,
     config: &P2pConfig,
     connector: InboundDomainConnector,
     seed_peer_provider: Arc<dyn SeedPeerProvider>,
 ) -> Result<(UnspawnedCommsNode, Dht), CommsInitializationError> {
+    validate_listener_limits(config)?;
     let database_url = DbConnectionUrl::File(
         PathBuf::from(&config.datastore_path)
             .join(&config.peer_database_name)
             .with_extension("db"),
     );
-    // The peer database is written on every dial result, so it must not be able to park a caller for
-    // the shared 60s default - see `PEER_DATABASE_BUSY_TIMEOUT`.
-    let db_connection = DbConnection::connect_and_migrate_with_busy_timeout(
-        &database_url,
-        MIGRATIONS,
-        Some(16),
-        PEER_DATABASE_BUSY_TIMEOUT,
-    )?;
     let this_node = builder
         .node_identity()
         .as_deref()
         .ok_or(CommsBuilderError::NodeIdentityNotSet)?
         .to_peer();
-    let peer_database = PeerDatabaseSql::new(db_connection, &this_node)?;
+    // Opening the peer database migrates it and may rewrite stored addresses once after an upgrade, so it runs on the
+    // blocking pool rather than on this task's worker thread.
+    let peer_database = tokio::task::spawn_blocking(move || -> Result<PeerDatabaseSql, CommsInitializationError> {
+        // The peer database is written on every dial result, so it must not be able to park a caller for
+        // the shared 60s default - see `PEER_DATABASE_BUSY_TIMEOUT`.
+        let db_connection = DbConnection::connect_and_migrate_with_busy_timeout(
+            &database_url,
+            MIGRATIONS,
+            Some(16),
+            DbProfile::Cache,
+            PEER_DATABASE_BUSY_TIMEOUT,
+        )?;
+        Ok(PeerDatabaseSql::new(db_connection, &this_node)?)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
 
     let listener_liveness_allowlist_cidrs = parse_cidrs(&config.listener_liveness_allowlist_cidrs)
         .map_err(CommsInitializationError::InvalidLivenessCidrs)?;
+    let listener_per_ip_exempt_cidrs =
+        parse_cidrs(&config.listener_per_ip_exempt_cidrs).map_err(CommsInitializationError::InvalidPerIpExemptCidrs)?;
 
     let builder = builder
         .with_listener_liveness_max_sessions(config.listener_liveness_max_sessions)
         .with_listener_liveness_allowlist_cidrs(listener_liveness_allowlist_cidrs)
+        .with_listener_handshake_timeout(config.listener_handshake_timeout)
+        .with_listener_max_handshakes_per_ip(config.listener_max_handshakes_per_ip)
+        .with_max_inbound_connections(config.max_inbound_connections)
+        .with_max_inbound_connections_per_ip(config.max_inbound_connections_per_ip)
+        .with_listener_per_ip_exempt_cidrs(listener_per_ip_exempt_cidrs)
         .with_dial_backoff(ConstantBackoff::new(Duration::from_millis(500)))
         .with_transport_protocols(config.transport.transport_type.get_supported_protocols())
         .with_peer_storage(peer_database)
@@ -594,6 +644,23 @@ impl SeedPeerProvider for ConfigSeedPeerProvider {
 /// dialer back into a co-equal steady-state controller fighting the pool - proactively dialing peers the pool
 /// then immediately disconnects as over-capacity, every refresh cycle, forever. Clamping here is what makes the
 /// relationship deliberate rather than incidental.
+/// Warns, loudly, about each of this node's public addresses that other nodes will drop from its identity claim (for
+/// example a DNS name that is not an ordinary host name). The node still starts. Returns how many there were.
+fn warn_about_unusable_public_addresses(addresses: &[Multiaddr]) -> usize {
+    let mut unusable = 0usize;
+    for address in addresses {
+        if let Err(err) = validate_address_shape(address) {
+            unusable = unusable.saturating_add(1);
+            warn!(
+                target: LOG_TARGET,
+                "Public address '{address}' is not usable: {err}. Other nodes will drop it from this node's \
+                 identity, so peers will not be able to reach this node on it. Fix p2p.public_addresses."
+            );
+        }
+    }
+    unusable
+}
+
 fn reconcile_proactive_dialing_floor(configured_floor: usize, dht_pool_size: usize) -> usize {
     if configured_floor < dht_pool_size {
         return configured_floor;
@@ -636,6 +703,11 @@ impl ServiceInitializer for P2pInitializer {
             .with_reaper_min_connection_thresholds(
                 self.config.dht.num_neighbouring_nodes + self.config.dht.num_random_nodes,
             )
+            .with_reaper_inbound_soft_limit(config.reaper_inbound_soft_limit)
+            .with_peer_manager_config(PeerManagerConfig {
+                max_peer_rows: config.max_peer_rows,
+                max_candidates_per_netgroup: config.max_candidates_per_netgroup,
+            })
             .with_proactive_dialing_enabled(config.proactive_dialing_enabled)
             .with_proactive_dialing_floor(reconcile_proactive_dialing_floor(
                 config.proactive_dialing_floor,
@@ -660,6 +732,7 @@ impl ServiceInitializer for P2pInitializer {
 
         let peer_manager = comms.peer_manager();
         let node_identity = comms.node_identity();
+        warn_about_unusable_public_addresses(&node_identity.public_addresses());
 
         let peers = match Self::try_resolve_dns_seeds(&self.seed_config).await {
             Ok(peers) => peers,
@@ -690,6 +763,34 @@ mod test {
 
     use super::*;
     use crate::P2pConfig;
+
+    #[test]
+    fn zero_listener_limits_are_rejected_at_config_load() {
+        assert!(validate_listener_limits(&P2pConfig::default()).is_ok());
+
+        let configs = [
+            P2pConfig {
+                listener_handshake_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            P2pConfig {
+                max_inbound_connections: 0,
+                ..Default::default()
+            },
+            P2pConfig {
+                listener_max_handshakes_per_ip: 0,
+                ..Default::default()
+            },
+            P2pConfig {
+                max_inbound_connections_per_ip: 0,
+                ..Default::default()
+            },
+        ];
+        for config in configs {
+            let err = validate_listener_limits(&config).unwrap_err();
+            assert!(matches!(err, CommsInitializationError::InvalidListenerConfig(_)));
+        }
+    }
 
     #[test]
     fn self_liveness_network_wire_byte_is_consistent() {
@@ -759,5 +860,16 @@ mod test {
     #[test]
     fn zero_pool_size_clamps_to_zero_without_underflowing() {
         assert_eq!(reconcile_proactive_dialing_floor(8, 0), 0);
+    }
+
+    #[test]
+    fn unusable_public_addresses_are_reported() {
+        let addresses = vec![
+            "/ip4/23.23.23.23/tcp/18189".parse().unwrap(),
+            "/dns4/node.example.com/tcp/18189".parse().unwrap(),
+            "/dns4/my_node.example.com/tcp/18189".parse().unwrap(),
+            "/dns4/127.1/tcp/18189".parse().unwrap(),
+        ];
+        assert_eq!(warn_about_unusable_public_addresses(&addresses), 2);
     }
 }

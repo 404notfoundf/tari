@@ -30,7 +30,7 @@ use tari_comms::{
     RefKind,
     connectivity::{ConnectivityError, ConnectivityRequester},
     peer_manager::{NodeId, Peer, PeerId},
-    protocol::rpc::{ClientStreaming, RpcStatus},
+    protocol::rpc::{ClientStreaming, RpcError},
     types::CommsPublicKey,
 };
 use tari_utilities::hex::Hex;
@@ -308,7 +308,7 @@ impl Discovering {
         &mut self,
         stream: &mut ClientStreaming<GetPeersResponse>,
         sync_peer: &NodeId,
-    ) -> Result<Option<Result<GetPeersResponse, RpcStatus>>, NetworkDiscoveryError> {
+    ) -> Result<Option<Result<GetPeersResponse, RpcError>>, NetworkDiscoveryError> {
         let rpc_streaming_timeout = self.config().network_discovery.bootstrap_rpc_streaming_timeout;
 
         tokio::time::timeout(rpc_streaming_timeout, stream.next())
@@ -349,7 +349,7 @@ impl Discovering {
                     target: LOG_TARGET,
                     "Discovering: Sync peer `{sync_peer}` sent an error response: {err:?}"
                 );
-                NetworkDiscoveryError::from(err)
+                NetworkDiscoveryError::from_stream_error(err)
             })?;
             let peer = peer
                 .ok_or_else(|| NetworkDiscoveryError::EmptyPeerMessageReceived)
@@ -577,6 +577,22 @@ mod test {
     }
 
     #[test]
+    fn a_bad_get_peers_stream_item_is_a_high_offence_but_a_status_stays_low() {
+        use tari_comms::protocol::rpc::RpcStatus;
+
+        let over_budget = NetworkDiscoveryError::from_stream_error(RpcError::DecodeBudgetExceeded { items: 2, max: 1 });
+        assert!(matches!(offence_severity(&over_budget), Some(OffenceSeverity::High)));
+
+        let undecodable =
+            NetworkDiscoveryError::from_stream_error(RpcError::DecodeError(prost::DecodeError::new("bad item")));
+        assert!(matches!(offence_severity(&undecodable), Some(OffenceSeverity::High)));
+
+        let status = NetworkDiscoveryError::from_stream_error(RpcError::RequestFailed(RpcStatus::bad_request("no")));
+        assert!(matches!(status, NetworkDiscoveryError::RpcStatus(_)));
+        assert!(matches!(offence_severity(&status), Some(OffenceSeverity::Low)));
+    }
+
+    #[test]
     fn a_relayed_claim_that_fails_validation_does_not_end_the_round() {
         // A peer behind NAT, or one we simply cannot use, is skipped for free.
         assert_eq!(
@@ -611,6 +627,54 @@ mod test {
             )),
             Some(true)
         );
+    }
+
+    /// Older nodes accept and relay any DNS name. A sync peer relaying many claims with names we do not use
+    /// (wildcard sybils, say) is not hostile, and must not be banned for it.
+    #[test]
+    fn relayed_claims_with_unusual_dns_names_do_not_count_against_the_sync_peer() {
+        use tari_comms::{
+            multiaddr::Multiaddr,
+            peer_manager::{NodeIdentity, PeerFeatures, PeerIdentityClaim},
+        };
+
+        use crate::{DhtConfig, peer_validator::PeerValidator, rpc::UnvalidatedPeerInfo};
+
+        let config = DhtConfig::default_local_test();
+        let validator = PeerValidator::new(&config);
+        let mut hostile_claims = 0usize;
+        for i in 0..10u8 {
+            let unusual: Multiaddr = format!("/dns4/a_{i}.example.com/tcp/1").parse().unwrap();
+            // Half come with a usable address too, half with only the unusual name
+            let mut addresses = vec![unusual];
+            if i % 2 == 0 {
+                addresses.push(format!("/ip4/23.23.23.{i}/tcp/18189").parse().unwrap());
+            }
+            let node_identity = NodeIdentity::random_multiple_addresses(
+                &mut rand::rng(),
+                addresses.clone(),
+                PeerFeatures::COMMUNICATION_NODE,
+            );
+            let relayed = UnvalidatedPeerInfo {
+                public_key: node_identity.public_key().clone(),
+                claims: vec![PeerIdentityClaim {
+                    addresses,
+                    features: PeerFeatures::COMMUNICATION_NODE,
+                    signature: node_identity.identity_signature_read().clone().unwrap(),
+                }],
+            };
+            match validator.validate_peer(relayed, None) {
+                Ok(peer) => assert_eq!(peer.addresses.len(), 1),
+                Err(err) => {
+                    let err = NetworkDiscoveryError::from(err);
+                    if classify_relay_failure(&err) == Some(true) {
+                        hostile_claims = hostile_claims.saturating_add(1);
+                    }
+                },
+            }
+        }
+        assert_eq!(hostile_claims, 0);
+        assert!(hostile_claims <= MAX_HOSTILE_RELAYED_CLAIMS);
     }
 
     #[test]

@@ -416,6 +416,13 @@ impl BlockchainBackend for TempDatabase {
         self.db.as_ref().unwrap().fetch_kernel_by_excess_sig(excess_sig)
     }
 
+    fn fetch_kernel_by_excess(
+        &self,
+        excess: &CompressedCommitment,
+    ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError> {
+        self.db.as_ref().unwrap().fetch_kernel_by_excess(excess)
+    }
+
     fn fetch_kernel_by_burn_commitment(
         &self,
         burn_commitment: &CompressedCommitment,
@@ -969,6 +976,12 @@ impl TestBlockchain {
 
     pub fn create(rules: BaseNodeConsensusManager) -> Self {
         Self::new(create_custom_blockchain(rules.clone()), rules)
+    }
+
+    /// Sets the range proof type of the coinbases this blockchain creates.
+    pub fn with_coinbase_range_proof_type(mut self, range_proof_type: RangeProofType) -> Self {
+        self.range_proof_type = range_proof_type;
+        self
     }
 
     pub fn append_chain(

@@ -45,7 +45,7 @@ use crate::{
     connectivity::{ConnectivityConfig, ConnectivityRequester},
     multiaddr::Multiaddr,
     net_address::MultiaddrRange,
-    peer_manager::{NodeIdentity, PeerManager},
+    peer_manager::{NodeIdentity, PeerManager, PeerManagerConfig},
     peer_validator::PeerValidatorConfig,
     protocol::{NodeNetworkInfo, ProtocolExtensions},
     tor,
@@ -116,6 +116,7 @@ pub struct CommsBuilder {
     shutdown_signal: Option<ShutdownSignal>,
     maintain_n_closest_connections_only: Option<usize>,
     transport_protocols: Vec<TransportProtocol>,
+    peer_manager_config: PeerManagerConfig,
 }
 
 impl Default for CommsBuilder {
@@ -130,6 +131,7 @@ impl Default for CommsBuilder {
             shutdown_signal: None,
             maintain_n_closest_connections_only: None,
             transport_protocols: TransportProtocol::get_all(),
+            peer_manager_config: PeerManagerConfig::default(),
         }
     }
 }
@@ -263,6 +265,41 @@ impl CommsBuilder {
         self
     }
 
+    /// The longest the unauthenticated stages of an inbound connection (wire byte, noise and identity exchange) may
+    /// take in total. Must be non-zero; `build` rejects zero.
+    pub fn with_listener_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_manager_config.inbound_handshake_timeout = timeout;
+        self
+    }
+
+    /// The maximum number of inbound handshakes in flight at once from a single source (IPv4 address or IPv6 /64).
+    /// Loopback, `listener_per_ip_exempt_cidrs` and non-IP sources are exempt. Must be non-zero.
+    pub fn with_listener_max_handshakes_per_ip(mut self, max_handshakes_per_ip: usize) -> Self {
+        self.connection_manager_config.max_inbound_handshakes_per_ip = max_handshakes_per_ip;
+        self
+    }
+
+    /// The maximum number of inbound connections, established and in-handshake combined. Inbound sockets over this
+    /// limit are closed before any handshake. Must be non-zero.
+    pub fn with_max_inbound_connections(mut self, max_inbound_connections: usize) -> Self {
+        self.connection_manager_config.max_inbound_connections = max_inbound_connections;
+        self
+    }
+
+    /// The maximum number of inbound connections, established and in-handshake combined, from a single source (IPv4
+    /// address or IPv6 /64). Same exemptions as the per-source handshake limit. Must be non-zero.
+    pub fn with_max_inbound_connections_per_ip(mut self, max_inbound_connections_per_ip: usize) -> Self {
+        self.connection_manager_config.max_inbound_connections_per_ip = max_inbound_connections_per_ip;
+        self
+    }
+
+    /// Sources exempt from the per-source inbound limits, in addition to loopback. Add a remote Tor forwarder or proxy
+    /// here, since every connection it forwards appears to come from its address.
+    pub fn with_listener_per_ip_exempt_cidrs(mut self, cidrs: Vec<cidr::AnyIpCidr>) -> Self {
+        self.connection_manager_config.listener_per_ip_exempt_cidrs = cidrs;
+        self
+    }
+
     /// The number of dial attempts to make before giving up.
     pub fn with_max_dial_attempts(mut self, max_dial_attempts: usize) -> Self {
         self.connection_manager_config.max_dial_attempts = max_dial_attempts;
@@ -309,9 +346,23 @@ impl CommsBuilder {
         self
     }
 
-    /// The closest number of peer connections to maintain; connections above the threshold will be removed
+    /// The number of outbound connections above which idle outbound connections are reaped. See
+    /// [`ConnectivityConfig::reaper_min_connection_threshold`].
     pub fn with_reaper_min_connection_thresholds(mut self, connections: usize) -> Self {
         self.connectivity_config.reaper_min_connection_threshold = connections;
+        self
+    }
+
+    /// Once more than this many inbound connections are open, idle inbound connections are closed, oldest first,
+    /// until the count is back at this limit. See [`ConnectivityConfig::reaper_inbound_soft_limit`].
+    pub fn with_reaper_inbound_soft_limit(mut self, limit: usize) -> Self {
+        self.connectivity_config.reaper_inbound_soft_limit = limit;
+        self
+    }
+
+    /// Set the peer manager configuration (peer database row cap and dial candidate spreading)
+    pub fn with_peer_manager_config(mut self, config: PeerManagerConfig) -> Self {
+        self.peer_manager_config = config;
         self
     }
 
@@ -341,8 +392,9 @@ impl CommsBuilder {
     fn make_peer_manager(&mut self) -> Result<Arc<PeerManager>, CommsBuilderError> {
         match self.peer_storage.take() {
             Some(storage) => {
-                let peer_manager = PeerManager::new(storage, self.transport_protocols.clone())
-                    .map_err(CommsBuilderError::PeerManagerError)?;
+                let peer_manager =
+                    PeerManager::new_with_config(storage, self.transport_protocols.clone(), self.peer_manager_config)
+                        .map_err(CommsBuilderError::PeerManagerError)?;
                 Ok(Arc::new(peer_manager))
             },
             None => Err(CommsBuilderError::PeerStorageNotProvided),
@@ -351,6 +403,7 @@ impl CommsBuilder {
 
     /// Build comms services and handles. Services will not be started.
     pub fn build(mut self) -> Result<UnspawnedCommsNode, CommsBuilderError> {
+        self.connection_manager_config.validate()?;
         let node_identity = self.node_identity.take().ok_or(CommsBuilderError::NodeIdentityNotSet)?;
         let shutdown_signal = self
             .shutdown_signal

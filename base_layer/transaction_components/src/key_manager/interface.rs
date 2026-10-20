@@ -45,10 +45,12 @@ use crate::{
         EncryptedData,
         KernelFeatures,
         MemoField,
+        OutputFeatures,
         RangeProofType,
         TransactionInputVersion,
         TransactionKernelVersion,
         TransactionOutputVersion,
+        covenants::Covenant,
     },
 };
 
@@ -56,6 +58,26 @@ use crate::{
 pub enum TxoStage {
     Input,
     Output,
+}
+
+/// How an output's encrypted data was opened, and therefore who wrote its memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryProvenance {
+    /// Opened with this wallet's private view key directly. Only a holder of the private view key can produce
+    /// this (our own change and self-built outputs), so the memo was written by this wallet (or another holder of
+    /// its view key).
+    OwnViewKey,
+    /// Opened with the Diffie-Hellman key of our view key and the output's sender offset key (one-sided, stealth,
+    /// multisig deposits, coinbases paid to us). Anyone who knows our address can produce this, so everything in
+    /// the memo is a claim by the output's creator. Only the value (which was verified against the commitment)
+    /// and the mask are established.
+    DiffieHellman,
+}
+
+impl RecoveryProvenance {
+    pub fn memo_is_self_authored(self) -> bool {
+        matches!(self, Self::OwnViewKey)
+    }
 }
 
 pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
@@ -181,13 +203,17 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
         payment_id: MemoField,
     ) -> Result<EncryptedData, KeyManagerError>;
 
+    /// Recover the commitment mask key, value and memo of an output. The returned [`RecoveryProvenance`] says which
+    /// key opened the encrypted data: only `OwnViewKey` data was written by this wallet; on a `DiffieHellman`
+    /// recovery the memo is a claim by the output's creator and only the value and mask are established.
     fn try_output_key_recovery(
         &self,
         commitment: &CompressedCommitment,
         encrypted_data: &EncryptedData,
         sender_offset_public_key: &CompressedPublicKey,
-    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField)>, KeyManagerError>;
+    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField, RecoveryProvenance)>, KeyManagerError>;
 
+    /// A memo read here is self-authored only when no custom key is passed.
     fn is_this_output_ours(
         &self,
         commitment: &CompressedCommitment,
@@ -211,7 +237,14 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
         sender_offset_count: usize,
     ) -> Result<(PrivateKey, Vec<TariKeyAndId>), KeyManagerError>;
 
-    // Creates a metadata signature for the output, without requiring manual user verification if on a ledger device
+    /// Creates a metadata signature for the output, with no recipient address.
+    ///
+    /// On a ledger wallet the key manager signs a device held sender offset key only through the device's reviewed
+    /// one sided metadata signature, which needs the output's recipient address - so here, with none, a device held
+    /// sender offset key is refused with [`KeyManagerError::LedgerSenderOffsetNeedsRecipient`]. Sign such an output
+    /// with [`TransactionKeyManagerInterface::get_metadata_signature_user_verified`] instead, passing the wallet's
+    /// own address for change. A software held sender offset key (the coinbase builder's) still signs here, in
+    /// software, on either wallet type.
     fn get_metadata_signature(
         &self,
         commitment_mask_key_id: &TariKeyId,
@@ -222,15 +255,49 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
         range_proof_type: RangeProofType,
     ) -> Result<ComAndPubSignature, KeyManagerError>;
 
-    // Creates a metadata signature for the output, requiring manual user verification if on a ledger device
+    /// Creates a metadata signature for the output to `receiver_address`, with the output's raw common fields.
+    ///
+    /// On a ledger wallet this is the only way a `OneSidedSenderOffset` key signs a metadata signature - the device
+    /// refuses it a raw signature. The device is sent the raw fields, not their hash: it reads them, hashes them itself
+    /// and builds the script from `receiver_address` itself, so a host that lies about any of them gets a signature
+    /// that verifies on no output carrying the fields it publishes. See
+    /// `minotari_ledger_wallet_common::metadata_output`.
+    ///
+    /// The device signs without a review only an output that is change in every respect it can see: to this wallet's
+    /// own address (its view key and spend key both the device's own, for the account the host names), with default
+    /// features (a standard output, maturity 0, no sidechain feature), an empty covenant and no minimum value promise.
+    /// Change and the wallet's own to-self outputs - coin split and join, payments to self - are signed silently.
+    /// Everything else is reviewed, and the review shows what differs: the output type (a validator node registration
+    /// or exit, say), a maturity, a sidechain feature, a minimum value promise. The device refuses a covenant, a burn
+    /// and a coinbase outright.
+    ///
+    /// The device signs over the standard stealth script for `receiver_address`, which it builds itself, so an output
+    /// whose `script` is anything else is refused with [`KeyManagerError::LedgerSenderOffsetNeedsRecipient`]: outputs
+    /// with no recipient address or a custom script - plain burns and HTLC (atomic swap) sends - are not supported on
+    /// a ledger wallet.
+    ///
+    /// A host held sender offset key is refused on a ledger wallet with
+    /// [`KeyManagerError::LedgerHostHeldSenderOffset`]: signed in software it would put an output on chain the device
+    /// never saw. Burns, plain and L2-bound, are not supported on a ledger wallet. The coinbase's host held key signs
+    /// through [`TransactionKeyManagerInterface::get_metadata_signature`] and is unaffected.
+    ///
+    /// What remains open, each tracked separately: the script offset the device hands the host, which together with an
+    /// output under a host held sender offset key can still move funds without a prompt; the encrypted data, which the
+    /// device hashes but does not verify (a lie there only affects the receiver's recovery of the output); the fee,
+    /// which the device never sees; and `PreMine` sender offset keys, which a host can mint on demand on any wallet
+    /// through [`TransactionKeyManagerInterface::get_script_offset`] with a `PreMine` script key and which still sign
+    /// raw challenges with no review - that belongs with the separate pre-mine issue.
+    #[allow(clippy::too_many_arguments)]
     fn get_metadata_signature_user_verified(
         &self,
         commitment_mask_key_id: &TariKeyId,
         value: MicroMinotari,
         sender_offset_key_id: &TariKeyId,
         txo_version: TransactionOutputVersion,
-        metadata_signature_message_common: &[u8; 32],
-        range_proof_type: RangeProofType,
+        features: &OutputFeatures,
+        covenant: &Covenant,
+        encrypted_data: &EncryptedData,
+        minimum_value_promise: MicroMinotari,
         script: &TariScript,
         receiver_address: &TariAddress,
     ) -> Result<ComAndPubSignature, KeyManagerError>;
@@ -253,6 +320,20 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
         sender_offset_pub_key: Option<&CompressedPublicKey>,
     ) -> Result<CompressedCheckSigSchnorrSignature, KeyManagerError>;
 
+    /// Signs `challenge` with `private_key_id` under `nonce`. A `Zero`, `SpendKey`, `ViewKey`, `CodeTemplateAuthor`,
+    /// `Derived`, `DHCommitmentMask` or `DHEncryptedData` nonce, or one equal to the signing key, is refused with
+    /// [`KeyManagerError::InvalidNonceKeyId`]. A `Zero` signing key, or one that resolves to zero, is refused with
+    /// [`KeyManagerError::InvalidSigningKeyId`], because the signature would be the nonce itself. That only removes
+    /// the trivial case: a signing key the caller knows (minted with `create_encrypted_key`) still reveals the value
+    /// behind an `Encrypted` nonce. A challenge that reduces to zero is refused with
+    /// [`KeyManagerError::ZeroChallenge`].
+    ///
+    /// This does not refuse every nonce the caller could know. An `Encrypted` nonce is still caller controllable -
+    /// `create_encrypted_key` wraps any scalar - so it must be fresh and used for one signature only: a known nonce,
+    /// or two signatures under one, gives up the signing key. The sender offset ids `get_script_offset` returns are
+    /// `Encrypted` too, and the caller also gets the script offset `o = Σscript - r`, so signing a script key under one
+    /// of them gives up that key. Closing all of this means moving software signatures onto reserved handles and
+    /// deleting the catch-all arm.
     fn sign_with_nonce_and_challenge(
         &self,
         private_key_id: &TariKeyId,
@@ -282,6 +363,11 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
     /// form of such a nonce is returned exactly once, by that reservation - it cannot be recovered from the handle
     /// afterwards, because on a ledger wallet only the device could recompute it and it will not. Carrying the
     /// sender offset key the same way also spares the caller a second device round trip for a key it already has.
+    ///
+    /// Not supported on a ledger wallet with a `OneSidedSenderOffset` key, which never signs a raw challenge: refused
+    /// with [`KeyManagerError::LedgerSenderOffsetRawSignature`]. A pre-mine sender offset key still signs here, so the
+    /// pre-mine ceremony's aggregated step 3 is unaffected; pre-mine signing belongs with the separate pre-mine
+    /// issue.
     fn get_sender_partial_metadata_signature(
         &self,
         ephemeral_private_nonce: &TariKeyAndId,
@@ -296,6 +382,14 @@ pub trait TransactionKeyManagerInterface: Clone + Send + Sync + 'static {
     /// sidechain (`None` for the default L2 chain that has no deployment key); it is bound into the
     /// signature challenge so the proof cannot be replayed to claim the burn on a different
     /// sidechain/application that shares this claim mechanism (see tari-ootle#445).
+    ///
+    /// The proof is signed with the burned output's commitment mask `k`, and the verifier fixes that: the Ootle
+    /// wallet (`validate_burn_claim_ownership_proof` in tari-ootle's `wallet/crypto`) checks it against
+    /// `C - v·H = k·G`, the commitment minus its revealed value, not against a key carried with the proof. Signing
+    /// with a spend-derived key instead would make every claim fail. The mask is not a spend-grade secret - the
+    /// burner knows it - so this proof does not decide who may claim. The Ootle engine (`claim_burn`) does: it
+    /// requires the claim transaction to be signed by the `claim_public_key` named in the L1 burn output's features,
+    /// and the claimed funds are locked to that key.
     fn generate_burn_claim_signature(
         &self,
         commitment_mask_key_id: &TariKeyId,

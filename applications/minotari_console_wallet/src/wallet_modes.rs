@@ -93,7 +93,12 @@ pub(crate) fn command_mode(
     println!("{CUCUMBER_TEST_MARKER_A}");
 
     info!(target: LOG_TARGET, "Starting wallet command mode");
-    let exit_override = handle.block_on(command_runner(config, vec![command.clone()], wallet.clone()))?;
+    let exit_override = handle.block_on(command_runner(
+        config,
+        vec![command.clone()],
+        wallet.clone(),
+        cli.non_interactive_mode,
+    ))?;
 
     // Do not remove this println!
     const CUCUMBER_TEST_MARKER_B: &str = "Minotari Console Wallet running... (Command mode completed)";
@@ -185,7 +190,12 @@ pub(crate) fn script_mode(
         println!("{CUCUMBER_TEST_MARKER_A}");
 
         println!("Starting the command runner!");
-        let exit_override = handle.block_on(command_runner(config, commands, wallet.clone()))?;
+        let exit_override = handle.block_on(command_runner(
+            config,
+            commands,
+            wallet.clone(),
+            cli.non_interactive_mode,
+        ))?;
         if exit_override {
             force_exit = true;
             force_interactive = false;
@@ -471,6 +481,38 @@ mod test {
     use std::path::Path;
 
     use crate::{cli::CliCommands, wallet_modes::parse_command_file};
+
+    /// Exporting the commitment mask and script private key of any wallet output gives away the wallet's spend key,
+    /// so neither export command may accept a request for private keys, in the flag form or the old positional form.
+    #[test]
+    fn utxo_exports_reject_a_request_for_private_keys() {
+        for command in ["export-utxos", "export-spent-utxos"] {
+            assert!(parse_command_file(format!("{command} --with-private-keys")).is_err());
+            assert!(parse_command_file(format!("{command} --output-file utxos.csv --with-private-keys")).is_err());
+            assert!(parse_command_file(format!("{command} true")).is_err());
+        }
+    }
+
+    #[test]
+    fn utxo_exports_still_parse_without_private_keys() {
+        let commands =
+            parse_command_file("export-utxos --output-file a.csv\nexport-spent-utxos\nexport-utxos".to_string())
+                .unwrap();
+        let mut commands = commands.into_iter();
+        match commands.next() {
+            Some(CliCommands::ExportUtxos(args)) => assert_eq!(args.output_file, Some("a.csv".into())),
+            other => panic!("unexpected command {other:?}"),
+        }
+        match commands.next() {
+            Some(CliCommands::ExportSpentUtxos(args)) => assert_eq!(args.output_file, None),
+            other => panic!("unexpected command {other:?}"),
+        }
+        match commands.next() {
+            Some(CliCommands::ExportUtxos(args)) => assert_eq!(args.output_file, None),
+            other => panic!("unexpected command {other:?}"),
+        }
+        assert!(commands.next().is_none());
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]

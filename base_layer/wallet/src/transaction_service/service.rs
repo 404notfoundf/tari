@@ -77,7 +77,7 @@ use tari_transaction_components::{
     crypto_factories::CryptoFactories,
     fee::{Fee, addressed_output_memo, recipient_output_features_and_scripts_size},
     helpers::borsh::SerializedSize,
-    key_manager::{SecretTransactionKeyManagerInterface, SerializedKeyString, TariKeyId},
+    key_manager::{RecoveryProvenance, SecretTransactionKeyManagerInterface, SerializedKeyString, TariKeyId},
     multisig::{script::get_multi_sig_script_components, session::MultisigSession, types::GetMultisigUtxoDataOutput},
     offline_signing::{
         models::{PaymentRecipient, SignedOneSidedTransactionResult},
@@ -89,6 +89,7 @@ use tari_transaction_components::{
             sign_locked_transaction,
             sign_locked_withdraw_multisig_transaction,
         },
+        one_sided_signer::{multisig_pending_output, withdraw_pending_output},
     },
     transaction_builder::{
         PendingOutput,
@@ -452,10 +453,25 @@ where
                             },
                         )
                         .unwrap_or(payment_id);
+                    // The signer declares the recipient as a stealth spec, which weighs and names itself in the
+                    // change memo exactly like this declaration does.
+                    let height = self.resources.db.get_last_scanned_height()?.unwrap_or(0);
+                    let recipient_output = PendingOutput::measured(
+                        self.resources
+                            .consensus_manager
+                            .consensus_constants(height)
+                            .transaction_weight_params(),
+                        amount,
+                        &output_features,
+                        &script,
+                        &covenant,
+                        &payment_id,
+                    )?
+                    .for_recipient(destination.clone());
                     let tx_builder = self
                         .resources
                         .output_manager_service
-                        .prepare_transaction_to_send(
+                        .prepare_offline_transaction_to_send(
                             temp_tx_id,
                             amount,
                             selection_criteria,
@@ -464,6 +480,7 @@ where
                             script,
                             covenant,
                             payment_id.clone(),
+                            vec![recipient_output],
                         )
                         .await?;
                     let fee = tx_builder.get_fee_estimate_without_change()?;
@@ -516,10 +533,20 @@ where
                         user_data.clone(),
                     )
                     .map_err(|e| TransactionServiceError::Other(format!("Failed to create MemoField: {}", e)))?;
+                    let height = self.resources.db.get_last_scanned_height()?.unwrap_or(0);
+                    let recipient_output = multisig_pending_output(
+                        self.resources.consensus_manager.consensus_constants(height),
+                        &request.recipient_address,
+                        request.amount,
+                        &output_features,
+                        &temp_payment_id,
+                        request.party_number,
+                        request.public_keys.len(),
+                    )?;
                     let tx_builder = self
                         .resources
                         .output_manager_service
-                        .prepare_transaction_to_send(
+                        .prepare_offline_transaction_to_send(
                             temp_tx_id,
                             request.amount,
                             UtxoSelectionCriteria::default(),
@@ -528,6 +555,7 @@ where
                             script,
                             covenant,
                             temp_payment_id,
+                            vec![recipient_output],
                         )
                         .await?;
                     let fee = tx_builder.get_fee_estimate_without_change()?;
@@ -629,10 +657,11 @@ where
                     let script = push_pubkey_script(&Default::default());
 
                     let output_features = OutputFeatures::default();
-                    // The whole input goes to a single recipient output with no change output, and that output
-                    // carries the memo built below in its encrypted data. The memo cannot be built yet because it
-                    // carries the fee we are about to calculate, so measure a copy built with a zero fee - see
-                    // `addressed_output_memo`. Leaving the memo out here cannot be balanced by the builder at all.
+                    // The input goes to a single recipient output plus the smallest possible change output, and the
+                    // recipient output carries the memo built below in its encrypted data. The memo cannot be built
+                    // yet because it carries the fee we are about to calculate, so measure a copy built with a zero
+                    // fee - see `addressed_output_memo`. Leaving the memo out here cannot be balanced by the builder
+                    // at all.
                     let measured_memo = addressed_output_memo(
                         MemoField::default(),
                         request.recipient_address.clone(),
@@ -647,22 +676,42 @@ where
                         &measured_memo,
                     )?;
 
-                    let fee: MicroMinotari =
+                    let fee_without_change: MicroMinotari =
                         fee_calculator.calculate(fee_per_gram, 1, 1, 1, features_and_scripts_byte_size);
-
-                    if fee > amount {
-                        return Err(TransactionServiceError::Other(format!(
-                            "insufficient funds: fee: {}, amount: {}",
-                            fee, amount
-                        )));
-                    }
-                    let total_amount = amount
-                        .checked_sub(fee)
-                        .ok_or(TransactionServiceError::Other("Amount too small to cover fee".into()))?;
 
                     tx_builder.with_input(input_wallet_output)?;
                     tx_builder.with_fee_per_gram(fee_per_gram);
                     tx_builder.with_lock_height(0);
+
+                    // The offline signer refuses to sign a transaction without a change output (see
+                    // `SignedTransaction`), so the recipient gets the input less the fee and the cost of a change
+                    // output, and one microminotari of change comes back to this wallet. The change output's fee is
+                    // measured the way the signer measures it, with the memo and the recipient declared; the memo's
+                    // fee field is fixed width, so the zero-fee copy measures the same.
+                    tx_builder.with_memo(measured_memo.clone());
+                    let measured_recipient = PaymentRecipient {
+                        amount: MicroMinotari::zero(),
+                        output_features: output_features.clone(),
+                        address: request.recipient_address.clone(),
+                        payment_id: measured_memo.clone(),
+                    };
+                    let change_fee = tx_builder.get_change_output_fee(&[withdraw_pending_output(
+                        consensus_constants,
+                        &measured_recipient,
+                        &measured_memo,
+                    )?])?;
+                    let fee = fee_without_change
+                        .checked_add(change_fee)
+                        .ok_or(TransactionServiceError::Other("Fee overflow".into()))?;
+                    let total_amount = amount
+                        .checked_sub(fee)
+                        .and_then(|v| v.checked_sub(MicroMinotari::from(1)))
+                        .ok_or_else(|| {
+                            TransactionServiceError::Other(format!(
+                                "insufficient funds: fee: {}, amount: {}",
+                                fee, amount
+                            ))
+                        })?;
 
                     let payment_id = addressed_output_memo(
                         MemoField::default(),
@@ -670,6 +719,19 @@ where
                         fee,
                         TxType::PaymentToOther,
                     )?;
+                    // Ask the builder, declared as the signer will declare it, whether the signer would sign this -
+                    // it leaves change and its fee does not exceed the amount - so a drift from the signer's decision
+                    // fails here rather than after the operator has approved it.
+                    let declared_recipient = PaymentRecipient {
+                        amount: total_amount,
+                        payment_id: payment_id.clone(),
+                        ..measured_recipient
+                    };
+                    tx_builder.check_offline_payload(&[withdraw_pending_output(
+                        consensus_constants,
+                        &declared_recipient,
+                        &payment_id,
+                    )?])?;
                     let tx_id = TxId::new_random();
                     let response = prepare_withdraw_multisig_transaction(
                         &self.resources.transaction_key_manager_service,
@@ -729,8 +791,7 @@ where
                 async {
                     let key_manager = self.resources.transaction_key_manager_service.clone();
                     let mut request = request;
-
-                    for pair_output in &mut request.info.inputs.iter_mut() {
+                    request.set_input_script_key_ids(|pair_output| -> Result<TariKeyId, TransactionServiceError> {
                         let spend_key = key_manager.get_spend_key();
 
                         let commitment_mask_key_id = pair_output.commitment_mask_key_id().clone();
@@ -768,8 +829,8 @@ where
                         }
 
                         // 5) Attach k' so signer uses the correct key
-                        pair_output.set_script_key_id(script_key);
-                    }
+                        Ok(script_key)
+                    })?;
 
                     let tip_height = self.resources.db.get_last_scanned_height()?.unwrap_or(0);
                     let res = sign_locked_withdraw_multisig_transaction(
@@ -1288,6 +1349,7 @@ where
                 payment_id,
                 optional_tx_id,
                 lock_height,
+                provenance,
             } => {
                 async {
                     let res = self
@@ -1301,6 +1363,7 @@ where
                             payment_id,
                             optional_tx_id,
                             lock_height,
+                            provenance,
                         )
                         .await?;
                     Ok(TransactionServiceResponse::UtxoImported(res))
@@ -2139,6 +2202,14 @@ where
             JoinHandle<Result<TxId, TransactionServiceProtocolError<TxId>>>,
         >,
     ) -> Result<Box<(TxId, CompressedPublicKey, TransactionOutput)>, TransactionServiceError> {
+        // A ledger device signs an output's metadata only over the standard stealth script to the receiver, which it
+        // builds itself, so it cannot sign the HTLC output's script. Refused here, before any input is selected,
+        // rather than deep inside the build. Claiming or refunding an HTLC is not affected by this refusal.
+        if matches!(*self.resources.wallet_type, LegacyWalletType::Ledger(_)) {
+            return Err(TransactionServiceError::NotSupported(
+                "HTLC (atomic swap) sends are not supported on Ledger wallets".to_string(),
+            ));
+        }
         if selection_criteria.range_limit.is_some() {
             return Err(TransactionServiceError::RangeLimitError {
                 reason: "Range limit coin-join cannot be set for send_sha_atomic_swap_transaction".to_string(),
@@ -2969,6 +3040,15 @@ where
             JoinHandle<Result<TxId, TransactionServiceProtocolError<TxId>>>,
         >,
     ) -> Result<(TxId, Option<PartialBurnClaimProof>), TransactionServiceError> {
+        // A ledger device signs an output's metadata only for a device held sender offset key over the standard
+        // stealth script, which it builds itself. A plain burn's script is not that, and an L2-bound burn's sender
+        // offset key is host held, so the device could never show the user where the funds go. Refused here, before
+        // any input is selected, rather than deep inside the build.
+        if matches!(*self.resources.wallet_type, LegacyWalletType::Ledger(_)) {
+            return Err(TransactionServiceError::NotSupported(
+                "Burns are not supported on Ledger wallets".to_string(),
+            ));
+        }
         if selection_criteria.range_limit.is_some() {
             return Err(TransactionServiceError::RangeLimitError {
                 reason: "Range limit coin-join cannot be set for burn_tari".to_string(),
@@ -3961,24 +4041,38 @@ where
         payment_id: MemoField,
         optional_tx_id: Option<TxId>,
         lock_height: u64,
+        provenance: RecoveryProvenance,
     ) -> Result<TxId, TransactionServiceError> {
-        // Faux transactions for scanned change outputs must correspond to the original transaction
+        // Faux transactions for scanned change outputs must correspond to the original transaction. Only a memo this
+        // wallet wrote may describe the transaction.
+        let self_authored_info = if provenance.memo_is_self_authored() {
+            payment_id.get_transaction_info_details()
+        } else {
+            None
+        };
         let (direction, amount, destination_address) =
-            if let Some((recipient_address, amount, tx_type, _)) = payment_id.get_transaction_info_details() {
+            if let Some((recipient_address, memo_amount, tx_type, _)) = self_authored_info {
+                let direction = match tx_type {
+                    TxType::PaymentToOther |
+                    TxType::Burn |
+                    TxType::CodeTemplateRegistration |
+                    TxType::ValidatorNodeRegistration |
+                    TxType::CoinSplit |
+                    TxType::PaymentToSelf => TransactionDirection::Outbound,
+                    TxType::CoinJoin |
+                    TxType::ClaimAtomicSwap |
+                    TxType::HtlcAtomicSwapRefund |
+                    TxType::ImportedUtxoNoneRewindable |
+                    TxType::Coinbase => TransactionDirection::Inbound,
+                };
+                // What we received is the verified output value; the memo amount describes outbound transactions only
+                let amount = if direction == TransactionDirection::Inbound {
+                    value
+                } else {
+                    memo_amount
+                };
                 (
-                    match tx_type {
-                        TxType::PaymentToOther |
-                        TxType::Burn |
-                        TxType::CodeTemplateRegistration |
-                        TxType::ValidatorNodeRegistration |
-                        TxType::CoinSplit |
-                        TxType::PaymentToSelf => TransactionDirection::Outbound,
-                        TxType::CoinJoin |
-                        TxType::ClaimAtomicSwap |
-                        TxType::HtlcAtomicSwapRefund |
-                        TxType::ImportedUtxoNoneRewindable |
-                        TxType::Coinbase => TransactionDirection::Inbound,
-                    },
+                    direction,
                     amount,
                     if tx_type == TxType::Burn {
                         TariAddress::default()
@@ -4005,6 +4099,10 @@ where
                 &scanned_output.hash(),
             ),
         };
+        // A coinbase is identified by the output itself, whichever scan found it
+        let source_address_claimed = !provenance.memo_is_self_authored() &&
+            source_address != TariAddress::default() &&
+            !scanned_output.features.is_coinbase();
         self.db.add_utxo_import_transaction_with_status(
             tx_id,
             amount,
@@ -4017,6 +4115,8 @@ where
             payment_id,
             direction,
             lock_height,
+            provenance,
+            source_address_claimed,
         )?;
         let transaction_event = match import_status {
             LegacyImportStatus::Broadcast => TransactionEvent::TransactionBroadcast(tx_id),

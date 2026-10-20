@@ -47,22 +47,26 @@ use tari_transaction_components::{
     crypto_factories::CryptoFactories,
     key_manager::{
         KeyManager,
+        RecoveryProvenance,
         SecretTransactionKeyManagerInterface,
         TariKeyAndId,
         TariKeyId,
         TransactionKeyManagerInterface,
         TxoStage,
         error::KeyManagerError,
+        redact_key_id_string,
         wallet_types::{HASHER_LABEL_DERIVE_KEY, KeyDigest, SPEND_KEY_BRANCH, VIEW_KEY_BRANCH, WalletType},
     },
     transaction_components::{
         EncryptedData,
         KernelFeatures,
         MemoField,
+        OutputFeatures,
         RangeProofType,
         TransactionInputVersion,
         TransactionKernelVersion,
         TransactionOutputVersion,
+        covenants::Covenant,
     },
 };
 use tari_utilities::ByteArrayError;
@@ -136,7 +140,9 @@ where TBackend: TransactionKeyManagerBackend + 'static
     ) -> Result<TariKeyId, KeyManagerError> {
         let legacy_key = LegacyTariKeyId::from_str(key_id.as_str())
             .inspect_err(|e| error!(target: LOG_TARGET, "Could not parse legacy key id string: {}", e))
-            .map_err(|_| KeyManagerError::InvalidKeyId(format!("Could not convert '{}'", key_id)))?;
+            .map_err(|_| {
+                KeyManagerError::InvalidKeyId(format!("Could not convert '{}'", redact_key_id_string(key_id.as_str())))
+            })?;
         self.convert_legacy_tari_key_id_to_current(&legacy_key)
             .inspect_err(|e| error!(target: LOG_TARGET, "Could not convert legacy key id: {}", e))
     }
@@ -156,7 +162,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
             },
             LegacyTariKeyId::Derived { key } => {
                 let key_id = self.convert_legacy_serialized_key_id_to_current(key).map_err(|_| {
-                    KeyManagerError::InvalidKeyId(format!("Could not convert '{}' to TariKeyId::Derived", key))
+                    KeyManagerError::InvalidKeyId(format!(
+                        "Could not convert '{}' to TariKeyId::Derived",
+                        redact_key_id_string(key.as_str())
+                    ))
                 })?;
                 Ok(TariKeyId::Derived {
                     key: key_id.to_string().into(),
@@ -177,7 +186,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
                     .map_err(|_| {
                         KeyManagerError::InvalidKeyId(format!(
                             "Could not convert '{}' to TariKeyId::DHCommitmentMask",
-                            private_key
+                            redact_key_id_string(private_key.as_str())
                         ))
                     })?;
                 Ok(TariKeyId::DHCommitmentMask {
@@ -194,7 +203,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
                     .map_err(|_| {
                         KeyManagerError::InvalidKeyId(format!(
                             "Could not convert '{}' to TariKeyId::DHEncryptedData",
-                            private_key
+                            redact_key_id_string(private_key.as_str())
                         ))
                     })?;
                 Ok(TariKeyId::DHEncryptedData {
@@ -204,7 +213,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
             },
             LegacyTariKeyId::Encrypted { encrypted, key } => {
                 let key_id = self.convert_legacy_serialized_key_id_to_current(key).map_err(|_| {
-                    KeyManagerError::InvalidKeyId(format!("Could not convert '{}' to TariKeyId::Encrypted", key))
+                    KeyManagerError::InvalidKeyId(format!(
+                        "Could not convert '{}' to TariKeyId::Encrypted",
+                        redact_key_id_string(key.as_str())
+                    ))
                 })?;
                 Ok(TariKeyId::Encrypted {
                     encrypted: encrypted.clone(),
@@ -524,8 +536,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
         value: MicroMinotari,
         sender_offset_key_id: &TariKeyId,
         txo_version: TransactionOutputVersion,
-        metadata_signature_message_common: &[u8; 32],
-        range_proof_type: RangeProofType,
+        features: &OutputFeatures,
+        covenant: &Covenant,
+        encrypted_data: &EncryptedData,
+        minimum_value_promise: MicroMinotari,
         script: &TariScript,
         receiver_address: &TariAddress,
     ) -> Result<ComAndPubSignature, KeyManagerError> {
@@ -534,8 +548,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
             value,
             sender_offset_key_id,
             txo_version,
-            metadata_signature_message_common,
-            range_proof_type,
+            features,
+            covenant,
+            encrypted_data,
+            minimum_value_promise,
             script,
             receiver_address,
         )
@@ -644,6 +660,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
             .encrypt_data_for_recovery(commitment_mask_key_id, custom_recovery_key_id, value, payment_id)
     }
 
+    /// A memo read here is self-authored only when no custom key is passed.
     pub fn extract_payment_id_from_encrypted_data(
         &self,
         encrypted_data: &EncryptedData,
@@ -664,7 +681,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
         commitment: &CompressedCommitment,
         encrypted_data: &EncryptedData,
         sender_offset_public_key: &CompressedPublicKey,
-    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField)>, KeyManagerError> {
+    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField, RecoveryProvenance)>, KeyManagerError> {
         self.key_manager
             .try_output_key_recovery(commitment, encrypted_data, sender_offset_public_key)
     }

@@ -42,14 +42,18 @@ use tari_script::CompressedCheckSigSchnorrSignature;
 use tari_service_framework::reply_channel::SenderService;
 use tari_transaction_components::{
     MicroMinotari,
+    key_manager::RecoveryProvenance,
     multisig::types::{CreateMultisigUtxo, GetMultisigUtxoDataOutput, WithdrawMultisigUtxo},
-    offline_signing::models::{
-        PrepareDepositMultisigTransactionResult,
-        PrepareOneSidedTransactionForSigningResult,
-        PrepareWithdrawMultisigTransactionResult,
-        SignedOneSidedDepositMultisigTransactionResult,
-        SignedOneSidedTransactionResult,
-        SignedOneSidedWithdrawMultisigTransactionResult,
+    offline_signing::{
+        ConfirmedPayload,
+        models::{
+            PrepareDepositMultisigTransactionResult,
+            PrepareOneSidedTransactionForSigningResult,
+            PrepareWithdrawMultisigTransactionResult,
+            SignedOneSidedDepositMultisigTransactionResult,
+            SignedOneSidedTransactionResult,
+            SignedOneSidedWithdrawMultisigTransactionResult,
+        },
     },
     rpc::models::FeePerGramStat,
     transaction_components::{MemoField, OutputFeatures, Transaction, TransactionOutput},
@@ -172,14 +176,14 @@ pub enum TransactionServiceRequest {
         payment_id: MemoField,
     },
     SignOneSidedTransaction {
-        request: PrepareOneSidedTransactionForSigningResult,
+        request: ConfirmedPayload<PrepareOneSidedTransactionForSigningResult>,
     },
 
     SignOneSidedDepositMultisigTransaction {
-        request: PrepareDepositMultisigTransactionResult,
+        request: ConfirmedPayload<PrepareDepositMultisigTransactionResult>,
     },
     SignOneSidedWithdrawMultisigTransaction {
-        request: PrepareWithdrawMultisigTransactionResult,
+        request: ConfirmedPayload<PrepareWithdrawMultisigTransactionResult>,
     },
     BroadcastSignedOneSidedTransaction {
         request: SignedOneSidedTransactionResult,
@@ -235,6 +239,7 @@ pub enum TransactionServiceRequest {
         payment_id: MemoField,
         optional_tx_id: Option<TxId>,
         lock_height: u64,
+        provenance: RecoveryProvenance,
     },
     SubmitTransactionToSelf(TxId, Transaction, MicroMinotari, MicroMinotari, MemoField),
     RestartBroadcastProtocols,
@@ -495,11 +500,13 @@ impl fmt::Display for TransactionServiceRequest {
                 current_height,
                 mined_timestamp,
                 payment_id,
+                provenance,
                 ..
             } => write!(
                 f,
                 "ImportUtxoWithStatus (amount: {amount}, from: {source_address}, payment_id: {payment_id}, import \
-                 status: {import_status:?}, height: {current_height:?}, mined at: {mined_timestamp:?}"
+                 status: {import_status:?}, height: {current_height:?}, mined at: {mined_timestamp:?}, provenance: \
+                 {provenance:?}"
             ),
             Self::SubmitTransactionToSelf(tx_id, _, _, _, _) => write!(f, "SubmitTransaction ({tx_id})"),
             Self::RestartBroadcastProtocols => write!(f, "RestartBroadcastProtocols"),
@@ -942,7 +949,7 @@ impl TransactionServiceHandle {
 
     pub async fn sign_one_sided_transaction(
         &mut self,
-        request: PrepareOneSidedTransactionForSigningResult,
+        request: ConfirmedPayload<PrepareOneSidedTransactionForSigningResult>,
     ) -> Result<SignedOneSidedTransactionResult, TransactionServiceError> {
         match self
             .handle
@@ -959,7 +966,7 @@ impl TransactionServiceHandle {
 
     pub async fn sign_one_sided_deposit_multisig_transaction(
         &mut self,
-        request: PrepareDepositMultisigTransactionResult,
+        request: ConfirmedPayload<PrepareDepositMultisigTransactionResult>,
     ) -> Result<SignedOneSidedDepositMultisigTransactionResult, TransactionServiceError> {
         match self
             .handle
@@ -977,7 +984,7 @@ impl TransactionServiceHandle {
 
     pub async fn sign_one_sided_withdraw_multisig_transaction(
         &mut self,
-        request: PrepareWithdrawMultisigTransactionResult,
+        request: ConfirmedPayload<PrepareWithdrawMultisigTransactionResult>,
     ) -> Result<SignedOneSidedWithdrawMultisigTransactionResult, TransactionServiceError> {
         match self
             .handle
@@ -1524,6 +1531,7 @@ impl TransactionServiceHandle {
         payment_id: MemoField,
         optional_tx_id: Option<TxId>,
         lock_height: u64,
+        provenance: RecoveryProvenance,
     ) -> Result<TxId, TransactionServiceError> {
         match self
             .handle
@@ -1537,6 +1545,7 @@ impl TransactionServiceHandle {
                 payment_id,
                 optional_tx_id,
                 lock_height,
+                provenance,
             })
             .await
             .inspect_err(|e| warn!(target: LOG_TARGET, "TransactionServiceRequest::ImportUtxoWithStatus({e})"))??

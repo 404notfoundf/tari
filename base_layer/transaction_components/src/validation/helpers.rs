@@ -20,9 +20,10 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use tari_script::TariScript;
+use tari_script::{Opcode, TariScript};
 
 use crate::{
+    aggregated_body::AggregateBody,
     consensus::consensus_constants::ConsensusConstants,
     helpers::borsh::SerializedSize,
     transaction_components::{
@@ -55,6 +56,18 @@ pub fn is_all_unique_and_sorted<'a, I: IntoIterator<Item = &'a T>, T: PartialOrd
     }
 
     true
+}
+
+/// Transactions may not carry a coinbase kernel; only a block's own coinbase may.
+pub fn check_no_coinbase_kernels(body: &AggregateBody) -> Result<(), AggregatedBodyValidationError> {
+    for kernel in body.kernels() {
+        if kernel.is_coinbase() {
+            return Err(AggregatedBodyValidationError::KernelFeaturesNotPermitted {
+                features: kernel.features,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Checks the byte size of TariScript is less than or equal to the given size, otherwise returns an error.
@@ -137,6 +150,23 @@ pub fn check_sidechain_data_rules(output: &TransactionOutput) -> Result<(), Aggr
     Ok(())
 }
 
+/// A burn claimable on a side chain (one carrying `ConfidentialOutput` data) must carry the canonical script, `Nop`
+/// or the empty script. Neither chain ever runs a burn's script: the base layer never spends a burn output, and the
+/// side-chain claim is authorised by the claim key alone. Any other script would only suggest spending conditions
+/// that are never enforced, so the burn is refused before its funds are destroyed.
+pub fn check_burn_claim_script(output: &TransactionOutput) -> Result<(), AggregatedBodyValidationError> {
+    let is_claimable_burn = output.features.output_type == OutputType::Burn &&
+        matches!(
+            output.features.sidechain_feature.as_ref().map(|f| f.data()),
+            Some(SideChainFeatureData::ConfidentialOutput(_))
+        );
+    if is_claimable_burn && !matches!(output.script().as_slice(), [] | [Opcode::Nop]) {
+        return Err(AggregatedBodyValidationError::BurnScriptNotPermitted);
+    }
+
+    Ok(())
+}
+
 pub fn check_covenant_length(covenant: &Covenant, max_token_len: u32) -> Result<(), AggregatedBodyValidationError> {
     if covenant.num_tokens() > max_token_len as usize {
         return Err(AggregatedBodyValidationError::CovenantTooLarge {
@@ -165,6 +195,18 @@ pub fn check_permitted_range_proof_types(
     {
         return Err(AggregatedBodyValidationError::RangeProofTypeNotPermitted {
             range_proof_type: output.features.range_proof_type,
+        });
+    }
+
+    Ok(())
+}
+
+/// A RevealedValue output must carry no range proof and a BulletProofPlus output must carry one.
+pub fn check_range_proof_presence(output: &TransactionOutput) -> Result<(), AggregatedBodyValidationError> {
+    if output.check_range_proof_presence().is_err() {
+        return Err(AggregatedBodyValidationError::RangeProofPresenceMismatch {
+            range_proof_type: output.features.range_proof_type,
+            proof_present: output.proof.is_some(),
         });
     }
 
@@ -249,7 +291,33 @@ mod test {
     use tari_test_utils::unpack_enum;
 
     use super::*;
-    use crate::{crypto_factories::CryptoFactories, test_helpers, test_helpers::TestParams};
+    use crate::{
+        crypto_factories::CryptoFactories,
+        test_helpers,
+        test_helpers::TestParams,
+        transaction_components::KernelFeatures,
+    };
+    #[test]
+    fn check_no_coinbase_kernels_rejects_coinbase_and_combined_flags() {
+        let body_with = |features: KernelFeatures| {
+            AggregateBody::new_unsorted(vec![], vec![], vec![test_helpers::create_test_kernel(
+                0.into(),
+                0,
+                features,
+            )])
+        };
+
+        for features in [KernelFeatures::COINBASE_KERNEL, KernelFeatures::all()] {
+            let err = check_no_coinbase_kernels(&body_with(features)).unwrap_err();
+            assert!(matches!(
+                err,
+                AggregatedBodyValidationError::KernelFeaturesNotPermitted { features: f } if f == features
+            ));
+        }
+        check_no_coinbase_kernels(&body_with(KernelFeatures::empty())).unwrap();
+        check_no_coinbase_kernels(&body_with(KernelFeatures::BURN_KERNEL)).unwrap();
+    }
+
     mod is_all_unique_and_sorted {
         use super::*;
 
@@ -496,6 +564,64 @@ mod test {
                     output_type: OutputType::Standard
                 }
             ));
+        }
+    }
+
+    mod check_burn_claim_script {
+        use borsh::to_vec;
+        use tari_common_types::types::CompressedPublicKey;
+        use tari_script::script;
+
+        use super::*;
+        use crate::transaction_components::OutputFeatures;
+
+        fn burn(features: OutputFeatures, script: TariScript) -> TransactionOutput {
+            TransactionOutput {
+                features,
+                script,
+                ..Default::default()
+            }
+        }
+
+        fn claimable_burn(script: TariScript) -> TransactionOutput {
+            burn(
+                OutputFeatures::create_burn_confidential_output(CompressedPublicKey::default(), None),
+                script,
+            )
+        }
+
+        #[test]
+        fn it_accepts_the_canonical_scripts() {
+            let nop = script!(Nop).unwrap();
+            let empty = TariScript::new(vec![]).unwrap();
+            assert_eq!(to_vec(&nop).unwrap(), [0x01, 0x73]);
+            assert_eq!(to_vec(&empty).unwrap(), [0x00]);
+            check_burn_claim_script(&claimable_burn(nop)).unwrap();
+            check_burn_claim_script(&claimable_burn(empty)).unwrap();
+        }
+
+        #[test]
+        fn it_rejects_any_other_script_on_a_claimable_burn() {
+            for script in [
+                script!(PushPubKey(Box::default())).unwrap(),
+                script!(Nop Nop).unwrap(),
+                script!(Drop).unwrap(),
+            ] {
+                let err = check_burn_claim_script(&claimable_burn(script.clone())).unwrap_err();
+                assert!(
+                    matches!(err, AggregatedBodyValidationError::BurnScriptNotPermitted),
+                    "{script}: {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn it_ignores_burns_without_a_claim_and_other_output_types() {
+            let script = script!(PushPubKey(Box::default())).unwrap();
+            check_burn_claim_script(&burn(OutputFeatures::create_burn_output(), script.clone())).unwrap();
+            let mut features = OutputFeatures::create_burn_confidential_output(CompressedPublicKey::default(), None);
+            features.output_type = OutputType::Standard;
+            check_burn_claim_script(&burn(features, script)).unwrap();
         }
     }
 }

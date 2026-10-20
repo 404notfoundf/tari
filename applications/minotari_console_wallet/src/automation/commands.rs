@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     fs::{self, File},
-    io::{self, BufRead, BufReader, LineWriter, Write},
+    io::{self, BufRead, BufReader, IsTerminal, LineWriter, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
@@ -80,14 +80,22 @@ use tari_p2p::{PeerSeedsConfig, auto_update::AutoUpdateConfig};
 use tari_script::{CompressedCheckSigSchnorrSignature, push_pubkey_script};
 use tari_shutdown::Shutdown;
 use tari_transaction_components::{
+    helpers::terminal_safe::escape_bytes_for_terminal,
     key_manager::{TariKeyId, TransactionKeyManagerInterface, error::KeyManagerError, wallet_types::WalletType},
     multisig::script::is_multisig_utxo,
-    offline_signing::models::{
-        PrepareDepositMultisigTransactionResult,
-        PrepareOneSidedTransactionForSigningResult,
-        PrepareWithdrawMultisigTransactionResult,
-        SignedOneSidedTransactionResult,
-        TransactionResult,
+    offline_signing::{
+        ConfirmationMode,
+        ConfirmedPayload,
+        OfflinePayload,
+        PayloadSummary,
+        models::{
+            PrepareDepositMultisigTransactionResult,
+            PrepareOneSidedTransactionForSigningResult,
+            PrepareWithdrawMultisigTransactionResult,
+            SignedOneSidedTransactionResult,
+            TransactionResult,
+        },
+        present_payload_summary,
     },
     rpc::models::TxLocation,
     tari_amount::{MicroMinotari, Minotari},
@@ -100,7 +108,6 @@ use tari_transaction_components::{
         TransactionKernel,
         TransactionOutput,
         TransactionOutputVersion,
-        UnblindedOutput,
         WalletOutput,
         covenants::Covenant,
         memo_field::{MemoField, TxType},
@@ -129,6 +136,7 @@ use crate::{
         Step3OutputsForParties,
         Step3OutputsForSelf,
         Step4OutputsForLeader,
+        check_self_file_key_ids,
         utils::{
             create_pre_mine_output_dir,
             get_file_name,
@@ -653,6 +661,91 @@ pub async fn monitor_transactions(
     results
 }
 
+/// Largest offline-signing payload file that is read.
+const MAX_PAYLOAD_FILE_SIZE: u64 = 10_000_000; // 10MB limit
+
+/// Opens a payload file without waiting on a FIFO: on unix the open does not block, and the caller then refuses
+/// anything that is not a regular file.
+#[cfg(unix)]
+fn open_payload_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_payload_file(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Reads an offline-signing payload file. Only regular files are read, and never more than the size limit, so a
+/// device or pipe in place of the file cannot stall the command or exhaust memory. All checks run on the opened
+/// handle.
+fn read_payload_file(path: &Path) -> Result<String, CommandError> {
+    let read_error = |err| CommandError::FileReadError {
+        file_path: path.to_path_buf(),
+        err,
+    };
+    #[cfg(not(unix))]
+    if !fs::metadata(path).map_err(read_error)?.is_file() {
+        return Err(CommandError::InvalidArgument(
+            "Input file is not a regular file".to_string(),
+        ));
+    }
+    let file = open_payload_file(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    if !metadata.is_file() {
+        return Err(CommandError::InvalidArgument(
+            "Input file is not a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > MAX_PAYLOAD_FILE_SIZE {
+        return Err(CommandError::InvalidArgument("Input file too large".to_string()));
+    }
+    let mut data = String::new();
+    file.take(MAX_PAYLOAD_FILE_SIZE.saturating_add(1))
+        .read_to_string(&mut data)
+        .map_err(read_error)?;
+    if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_PAYLOAD_FILE_SIZE {
+        return Err(CommandError::InvalidArgument("Input file too large".to_string()));
+    }
+    Ok(data)
+}
+
+/// Writes the summary of an offline payload and returns it confirmed, or an error if it was not confirmed.
+fn review_offline_payload<P: OfflinePayload>(
+    summary: PayloadSummary<P>,
+    mode: ConfirmationMode,
+    out: &mut dyn Write,
+    input: &mut dyn BufRead,
+) -> Result<ConfirmedPayload<P>, CommandError> {
+    let confirmation =
+        present_payload_summary(&summary, mode, out, input).map_err(|e| CommandError::General(e.to_string()))?;
+    summary
+        .confirm(confirmation)
+        .map_err(|e| CommandError::General(e.to_string()))
+}
+
+/// Prompt on a terminal unless running non-interactively; otherwise print the summary and sign.
+fn offline_confirmation_mode(non_interactive_mode: bool) -> ConfirmationMode {
+    if !non_interactive_mode && io::stdin().is_terminal() {
+        ConfirmationMode::Interactive
+    } else {
+        ConfirmationMode::NonInteractive
+    }
+}
+
+/// Where the summary goes: stderr when prompting with stdout redirected, so the operator still sees what they approve.
+fn offline_summary_output(mode: ConfirmationMode) -> Box<dyn Write> {
+    if mode == ConfirmationMode::Interactive && !io::stdout().is_terminal() {
+        Box::new(io::stderr().lock())
+    } else {
+        Box::new(io::stdout().lock())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 // Schnorr signature / Ristretto scalar arithmetic, not integer arithmetic: cannot overflow.
 #[allow(clippy::arithmetic_side_effects)]
@@ -660,6 +753,7 @@ pub async fn command_runner(
     config: &WalletConfig,
     commands: Vec<CliCommands>,
     wallet: WalletSqlite,
+    non_interactive_mode: bool,
 ) -> Result<bool, CommandError> {
     let wait_stage = config.command_send_wait_stage;
 
@@ -959,10 +1053,23 @@ pub async fn command_runner(
                     // device's nonce store is in RAM and holds eight. So they stay host indexed on the `Random`
                     // branch, and signing with them goes through `GetRawSchnorrSignatureLegacyNonce`.
                     //
-                    // These signatures therefore remain open to the two-signatures-one-nonce attack, which for
-                    // pre-mine outputs reaches the script key as well as the key that signed. The full cost, the
-                    // scope, and the TODO that closes it live in `minotari_ledger_wallet_common::legacy_nonce`;
-                    // read that before touching either of these lines.
+                    // These signatures therefore remain open to nonce reuse, which for pre-mine outputs reaches the
+                    // script key and the sender offset key - both on the `PreMine` branch, the only one the legacy
+                    // instruction will sign. It needs no repeated pair: one nonce index reused across any two
+                    // `PreMine` keys leaks both, because the script offset relates them. The device shows each
+                    // signature for approval, nonce index included, but the two reviews can look like a legitimate
+                    // step 3; that is not a control to rely on. `alpha` stays out of reach, but the reachable
+                    // `PreMine` keys include each output's single-key fail-safe backup key: whoever recovers it can
+                    // spend that output alone after `fail_safe_height` - the multisig protects only the pre-fail-safe
+                    // path. Reuse does not need a compromised host: a malicious leader who asks for step 4 to be
+                    // re-run against a second step 3 file, or anyone who can write the session directory (which can
+                    // copy a nonce an earlier session already used into a new session's file), gets it with an honest
+                    // host, and the reviews look normal. For them extraction is the whole capability; a compromised
+                    // host can already spend pre-mine outputs without a prompt, so it gains only permanence. Nothing
+                    // records which nonces were signed with; the tracked follow-up is a global allowlist of issued
+                    // nonce indexes in the wallet database, consumed before signing.
+                    // The full cost, the scope, and the TODO that closes it live in
+                    // `minotari_ledger_wallet_common::legacy_nonce`; read that before touching either of these lines.
                     let script_nonce_key = key_manager_service.get_random_key(None, Some(LedgerKeyBranch::Random))?;
                     let sender_offset_nonce =
                         key_manager_service.get_random_key(None, Some(LedgerKeyBranch::Random))?;
@@ -973,7 +1080,9 @@ pub async fn command_runner(
                     };
                     // The sender offset key has to be generated by the key manager - on a ledger wallet the device
                     // picks the index and never hands the key over - and it comes back with the script offset for
-                    // this output, which step 4 hands to the leader.
+                    // this output, which step 4 hands to the leader. Because the only script key here is a pre-mine
+                    // key, the device puts the sender offset key on the `PreMine` branch, which is what lets step 4
+                    // sign the metadata signature with it through the legacy instruction.
                     let (script_offset, mut sender_offset_keys) =
                         key_manager_service.get_script_offset(std::slice::from_ref(&pre_mine_script_key_id), 1)?;
                     let sender_offset_key = match sender_offset_keys.pop() {
@@ -1437,6 +1546,15 @@ pub async fn command_runner(
                     );
                     break;
                 }
+                // The self file is host-writable, and what it names is signed with below through the legacy nonce
+                // instruction. Hold it to the shape step 2 writes: distinct nonces and sender offset keys across the
+                // whole file, each script key at its output index. That is per file: it does not stop a nonce an
+                // earlier session already used being copied in, a leader-induced re-run of this step, or a compromised
+                // host; see `minotari_ledger_wallet_common::legacy_nonce`.
+                if let Err(e) = check_self_file_key_ids(&party_info_indexed.outputs_for_self) {
+                    eprintln!("\nError: Inconsistent step 2 self file! {e}\n");
+                    break;
+                }
 
                 let pre_mine_from_file =
                     match read_genesis_file_outputs(session_info.use_pre_mine_input_file, args.pre_mine_file_path) {
@@ -1480,8 +1598,11 @@ pub async fn command_runner(
                     );
 
                     // KNOWN, DELIBERATELY DEFERRED GAP: `script_nonce_key_id` is a host indexed nonce reserved
-                    // back in step 2, so this routes to `GetRawSchnorrSignatureLegacyNonce` and stays open to the
-                    // two-signatures-one-nonce attack. See `minotari_ledger_wallet_common::legacy_nonce` for the
+                    // back in step 2, so this routes to `GetRawSchnorrSignatureLegacyNonce` and stays open to
+                    // nonce reuse. Nothing marks the nonce spent once this step has run, and the challenge is built
+                    // entirely from the leader's step 3 fields, so a leader who sends a second step 3 file and asks
+                    // for this step to be re-run gets a second signature under the same nonce - with the same review
+                    // on the device as a legitimate retry. See `minotari_ledger_wallet_common::legacy_nonce` for the
                     // full cost and the TODO that closes it, and the reservation site in step 2 for why.
                     let script_signature = match key_manager_service.sign_with_nonce_and_challenge(
                         &party_info.pre_mine_script_key_id,
@@ -1562,16 +1683,19 @@ pub async fn command_runner(
                         MicroMinotari::zero(),
                     );
 
-                    // KNOWN, DELIBERATELY DEFERRED GAP, AND THE WORST OF THE THREE: `sender_offset_key_id` is on
-                    // the `OneSidedSenderOffset` branch - `get_script_offset` issues it - and
-                    // `sender_offset_nonce_key_id` is a host indexed nonce reserved back in step 2, so this routes
-                    // to `GetRawSchnorrSignatureLegacyNonce`.
+                    // KNOWN, DELIBERATELY DEFERRED GAP: `sender_offset_key_id` is the `PreMine` branch key
+                    // `get_script_offset` issued in step 2, and `sender_offset_nonce_key_id` is a host indexed nonce
+                    // reserved back in step 2, so this routes to `GetRawSchnorrSignatureLegacyNonce`.
                     //
-                    // That branch is on the legacy whitelist deliberately, so that pre-mine spend keeps working,
-                    // and the price is that a compromised host can recover this output's sender offset private key
-                    // and then subtract it back out of the script offset to recover the script private key too.
-                    // `minotari_ledger_wallet_common::legacy_nonce` sets out the derivation, the scope - pre-mine
-                    // only, normal spends use device issued handles - and the TODO that closes it.
+                    // A compromised host - or a leader who gets this step re-run against a second step 3 file, or
+                    // anyone who can write the session directory, including by copying in a nonce an earlier session
+                    // already signed with - can recover this output's sender offset private
+                    // key that way, and then subtract it back out of the script offset to recover the script private
+                    // key too. It cannot reach `alpha`: a step 2 session file from before sender offsets moved to
+                    // `PreMine` names a `OneSidedSenderOffset` key, which the legacy whitelist now refuses - redo
+                    // step 2 for such a session. `minotari_ledger_wallet_common::legacy_nonce` sets out the
+                    // derivation, the scope - pre-mine only, normal spends use device issued handles - and the TODO
+                    // that closes it.
                     let metadata_signature = match key_manager_service.sign_with_nonce_and_challenge(
                         &party_info.sender_offset_key_id,
                         &party_info.sender_offset_nonce_key_id,
@@ -1929,39 +2053,22 @@ pub async fn command_runner(
             },
             ExportUtxos(args) => match output_service.get_unspent_outputs().await {
                 Ok(utxos) => {
-                    let mut unblinded_utxos: Vec<(UnblindedOutput, CompressedCommitment)> =
-                        Vec::with_capacity(utxos.len());
-                    for output in utxos {
-                        let unblinded =
-                            UnblindedOutput::from_wallet_output(output.wallet_output, &wallet.key_manager_service)?;
-                        unblinded_utxos.push((unblinded, output.commitment));
-                    }
-                    let count = unblinded_utxos.len();
-                    let sum: MicroMinotari = unblinded_utxos.iter().map(|utxo| utxo.0.value).sum();
+                    let utxos: Vec<WalletOutput> = utxos.into_iter().map(|v| v.wallet_output).collect();
+                    let count = utxos.len();
+                    let sum: MicroMinotari = utxos.iter().map(|utxo| utxo.value()).sum();
                     if let Some(file) = args.output_file {
-                        if let Err(e) = write_utxos_to_csv_file(unblinded_utxos, file, args.with_private_keys) {
+                        if let Err(e) = write_utxos_to_csv_file(&utxos, file) {
                             eprintln!("ExportUtxos error! {e}");
                         }
                     } else {
-                        for (i, utxo) in unblinded_utxos.iter().enumerate() {
+                        for (i, utxo) in utxos.iter().enumerate() {
                             println!(
-                                "{}. Value: {}, Spending Key: {:?}, Script Key: {:?}, Features: {}, Commitment: {}, \
-                                 isMultisig: {}",
+                                "{}. Value: {}, Features: {}, Commitment: {}, isMultisig: {}",
                                 i.saturating_add(1),
-                                utxo.0.value,
-                                if args.with_private_keys {
-                                    utxo.0.commitment_mask_key.to_hex()
-                                } else {
-                                    "*hidden*".to_string()
-                                },
-                                if args.with_private_keys {
-                                    utxo.0.script_private_key.to_hex()
-                                } else {
-                                    "*hidden*".to_string()
-                                },
-                                utxo.0.features,
-                                utxo.1.to_hex(),
-                                is_multisig_utxo(&utxo.0.script)
+                                utxo.value(),
+                                utxo.features(),
+                                utxo.commitment().to_hex(),
+                                is_multisig_utxo(utxo.script())
                             );
                         }
                     }
@@ -2000,36 +2107,21 @@ pub async fn command_runner(
             },
             ExportSpentUtxos(args) => match output_service.get_spent_outputs().await {
                 Ok(utxos) => {
-                    let mut unblinded_utxos: Vec<(UnblindedOutput, CompressedCommitment)> =
-                        Vec::with_capacity(utxos.len());
-                    for output in utxos {
-                        let unblinded =
-                            UnblindedOutput::from_wallet_output(output.wallet_output, &wallet.key_manager_service)?;
-                        unblinded_utxos.push((unblinded, output.commitment));
-                    }
-                    let count = unblinded_utxos.len();
-                    let sum: MicroMinotari = unblinded_utxos.iter().map(|utxo| utxo.0.value).sum();
+                    let utxos: Vec<WalletOutput> = utxos.into_iter().map(|v| v.wallet_output).collect();
+                    let count = utxos.len();
+                    let sum: MicroMinotari = utxos.iter().map(|utxo| utxo.value()).sum();
                     if let Some(file) = args.output_file {
-                        if let Err(e) = write_utxos_to_csv_file(unblinded_utxos, file, args.with_private_keys) {
+                        if let Err(e) = write_utxos_to_csv_file(&utxos, file) {
                             eprintln!("ExportSpentUtxos error! {e}");
                         }
                     } else {
-                        for (i, utxo) in unblinded_utxos.iter().enumerate() {
+                        for (i, utxo) in utxos.iter().enumerate() {
                             println!(
-                                "{}. Value: {}, Spending Key: {:?}, Script Key: {:?}, Features: {}",
+                                "{}. Value: {}, Features: {}, Commitment: {}",
                                 i.saturating_add(1),
-                                utxo.0.value,
-                                if args.with_private_keys {
-                                    utxo.0.commitment_mask_key.to_hex()
-                                } else {
-                                    "*hidden*".to_string()
-                                },
-                                if args.with_private_keys {
-                                    utxo.0.script_private_key.to_hex()
-                                } else {
-                                    "*hidden*".to_string()
-                                },
-                                utxo.0.features
+                                utxo.value(),
+                                utxo.features(),
+                                utxo.commitment().to_hex()
                             );
                         }
                     }
@@ -2557,7 +2649,7 @@ pub async fn command_runner(
                             println!("Timestamp: {timestamp}");
                         }
                         if let Some(payment_id) = &payment_details.payment_id {
-                            println!("Payment ID: {}", String::from_utf8_lossy(payment_id));
+                            println!("Payment ID: {}", escape_bytes_for_terminal(payment_id));
                         }
                     },
                     Ok(None) => {
@@ -2775,24 +2867,28 @@ pub async fn command_runner(
             },
 
             SignOneSidedTransaction(args) => {
-                let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file.clone(),
-                    err,
-                })?;
-                let max_size = 10_000_000; // 10MB limit
-                if metadata.len() > max_size {
-                    return Err(CommandError::InvalidArgument("Input file too large".to_string()));
-                }
-
-                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file,
-                    err,
-                })?;
+                let data = read_payload_file(&args.input_file)?;
                 let request = PrepareOneSidedTransactionForSigningResult::from_json(&data)?;
+                let tx_id = request.tx_id;
+                let mode = offline_confirmation_mode(non_interactive_mode);
+                let review = review_offline_payload(
+                    PayloadSummary::from_one_sided(request),
+                    mode,
+                    &mut offline_summary_output(mode),
+                    &mut io::stdin().lock(),
+                );
+                let confirmed = match review {
+                    Ok(confirmed) => confirmed,
+                    Err(e) => {
+                        eprintln!("SignOneSidedTransaction not signed: {e}");
+                        continue;
+                    },
+                };
+                info!(target: LOG_TARGET, "Offline payload {tx_id} confirmed ({mode:?})");
 
                 let mut wallet_transaction_service = transaction_service.clone();
                 let result = wallet_transaction_service
-                    .sign_one_sided_transaction(request)
+                    .sign_one_sided_transaction(confirmed)
                     .await
                     .map_err(CommandError::TransactionServiceError);
                 match result {
@@ -2810,24 +2906,28 @@ pub async fn command_runner(
             },
 
             SignOneSidedDepositMultisigTransaction(args) => {
-                let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file.clone(),
-                    err,
-                })?;
-                let max_size = 10_000_000; // 10MB limit
-                if metadata.len() > max_size {
-                    return Err(CommandError::InvalidArgument("Input file too large".to_string()));
-                }
-
-                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file,
-                    err,
-                })?;
+                let data = read_payload_file(&args.input_file)?;
                 let request = PrepareDepositMultisigTransactionResult::from_json(&data)?;
+                let tx_id = request.tx_id;
+                let mode = offline_confirmation_mode(non_interactive_mode);
+                let review = review_offline_payload(
+                    PayloadSummary::from_multisig(request),
+                    mode,
+                    &mut offline_summary_output(mode),
+                    &mut io::stdin().lock(),
+                );
+                let confirmed = match review {
+                    Ok(confirmed) => confirmed,
+                    Err(e) => {
+                        eprintln!("SignOneSidedDepositMultisigTransaction not signed: {e}");
+                        continue;
+                    },
+                };
+                info!(target: LOG_TARGET, "Offline payload {tx_id} confirmed ({mode:?})");
 
                 let mut wallet_transaction_service = transaction_service.clone();
                 let result = wallet_transaction_service
-                    .sign_one_sided_deposit_multisig_transaction(request)
+                    .sign_one_sided_deposit_multisig_transaction(confirmed)
                     .await
                     .map_err(CommandError::TransactionServiceError);
                 match result {
@@ -2845,24 +2945,28 @@ pub async fn command_runner(
             },
 
             SignOneSidedWithdrawMultisigTransaction(args) => {
-                let metadata = fs::metadata(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file.clone(),
-                    err,
-                })?;
-                let max_size = 10_000_000; // 10MB limit
-                if metadata.len() > max_size {
-                    return Err(CommandError::InvalidArgument("Input file too large".to_string()));
-                }
-
-                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file,
-                    err,
-                })?;
+                let data = read_payload_file(&args.input_file)?;
                 let request = PrepareWithdrawMultisigTransactionResult::from_json(&data)?;
+                let tx_id = request.tx_id;
+                let mode = offline_confirmation_mode(non_interactive_mode);
+                let review = review_offline_payload(
+                    PayloadSummary::from_withdraw_multisig(request),
+                    mode,
+                    &mut offline_summary_output(mode),
+                    &mut io::stdin().lock(),
+                );
+                let confirmed = match review {
+                    Ok(confirmed) => confirmed,
+                    Err(e) => {
+                        eprintln!("SignOneSidedWithdrawMultisigTransaction not signed: {e}");
+                        continue;
+                    },
+                };
+                info!(target: LOG_TARGET, "Offline payload {tx_id} confirmed ({mode:?})");
 
                 let mut wallet_transaction_service = transaction_service.clone();
                 let result = wallet_transaction_service
-                    .sign_one_sided_withdraw_multisig_transaction(request)
+                    .sign_one_sided_withdraw_multisig_transaction(confirmed)
                     .await
                     .map_err(CommandError::TransactionServiceError);
                 match result {
@@ -2879,10 +2983,7 @@ pub async fn command_runner(
                 }
             },
             BroadcastSignedOneSidedTransaction(args) => {
-                let data = fs::read_to_string(&args.input_file).map_err(|err| CommandError::FileReadError {
-                    file_path: args.input_file,
-                    err,
-                })?;
+                let data = read_payload_file(&args.input_file)?;
                 let request = SignedOneSidedTransactionResult::from_json(&data)?;
 
                 let mut wallet_transaction_service = transaction_service.clone();
@@ -3765,56 +3866,63 @@ fn get_all_embedded_pre_mine_outputs() -> Result<Vec<TransactionOutput>, Command
     Ok(utxos)
 }
 
-fn write_utxos_to_csv_file(
-    utxos: Vec<(UnblindedOutput, CompressedCommitment)>,
-    file_path: PathBuf,
-    with_private_keys: bool,
-) -> Result<(), CommandError> {
-    let file = File::create(file_path).map_err(|e| CommandError::CSVFile(e.to_string()))?;
-    let mut csv_file = LineWriter::new(file);
-    writeln!(
-        csv_file,
-        r##""index","version","value","spending_key","commitment","output_type","maturity","coinbase_extra","script","covenant","input_data","script_private_key","sender_offset_public_key","ephemeral_commitment","ephemeral_nonce","signature_u_x","signature_u_a","signature_u_y","script_lock_height","encrypted_data","minimum_value_promise","range_proof""##
-    )
+/// The header row written by [write_utxos_to_csv_file]. There are deliberately no commitment mask or script private
+/// key columns: a wallet output's script key is `H("script key", mask) + alpha`, so those two values from any single
+/// row would give away the wallet's spend key.
+const UTXO_CSV_HEADER: &str = r##""index","version","value","commitment","output_type","maturity","coinbase_extra","script","covenant","input_data","sender_offset_public_key","ephemeral_commitment","ephemeral_nonce","signature_u_x","signature_u_a","signature_u_y","script_lock_height","encrypted_data","minimum_value_promise","range_proof""##;
+
+fn write_utxos_to_csv_file(utxos: &[WalletOutput], file_path: PathBuf) -> Result<(), CommandError> {
+    // Owner-only on unix: the export lists every output the wallet holds.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(file_path)
         .map_err(|e| CommandError::CSVFile(e.to_string()))?;
-    for (i, (utxo, commitment)) in utxos.iter().enumerate() {
+    let mut csv_file = LineWriter::new(file);
+    writeln!(csv_file, "{UTXO_CSV_HEADER}").map_err(|e| CommandError::CSVFile(e.to_string()))?;
+    for (i, utxo) in utxos.iter().enumerate() {
+        let features = utxo.features();
         writeln!(
             csv_file,
-            r##""{}","V{}","{}","{}","{}","{:?}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}""##,
+            r##""{}","V{}","{}","{}","{:?}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}","{}""##,
             i.saturating_add(1),
-            utxo.version.as_u8(),
-            utxo.value.0,
-            if with_private_keys { utxo.commitment_mask_key.to_hex() } else { "*hidden*".to_string() },
-            commitment.to_hex(),
-            utxo.features.output_type,
-            utxo.features.maturity,
-            String::from_utf8(utxo.features.coinbase_extra.to_vec())
-                .unwrap_or_else(|_| utxo.features.coinbase_extra.to_hex()),
-            utxo.script.to_hex(),
-            utxo.covenant.to_bytes().to_hex(),
-            utxo.input_data.to_hex(),
-            if with_private_keys { utxo.script_private_key.to_hex() } else { "*hidden*".to_string() },
-            utxo.sender_offset_public_key.to_hex(),
-            utxo.metadata_signature.ephemeral_commitment().to_hex(),
-            utxo.metadata_signature.ephemeral_pubkey().to_hex(),
-            utxo.metadata_signature.u_x().to_hex(),
-            utxo.metadata_signature.u_a().to_hex(),
-            utxo.metadata_signature.u_y().to_hex(),
-            utxo.script_lock_height,
-            utxo.encrypted_data.to_byte_vec().to_hex(),
-            utxo.minimum_value_promise.as_u64(),
-            if let Some(proof) = utxo.range_proof.clone() {
+            utxo.version().as_u8(),
+            utxo.value().0,
+            utxo.commitment().to_hex(),
+            features.output_type,
+            features.maturity,
+            // Always hex: the coinbase extra is chosen by whoever mined the block, so raw text could break out of
+            // the quoted field or be read as a spreadsheet formula.
+            features.coinbase_extra.to_hex(),
+            utxo.script().to_hex(),
+            utxo.covenant().to_bytes().to_hex(),
+            utxo.input_data().to_hex(),
+            utxo.sender_offset_public_key().to_hex(),
+            utxo.metadata_signature().ephemeral_commitment().to_hex(),
+            utxo.metadata_signature().ephemeral_pubkey().to_hex(),
+            utxo.metadata_signature().u_x().to_hex(),
+            utxo.metadata_signature().u_a().to_hex(),
+            utxo.metadata_signature().u_y().to_hex(),
+            utxo.script_lock_height(),
+            utxo.encrypted_data().to_byte_vec().to_hex(),
+            utxo.minimum_value_promise().as_u64(),
+            if let Some(proof) = utxo.range_proof() {
                 proof.to_hex()
             } else {
                 "".to_string()
             },
         )
-            .map_err(|e| CommandError::CSVFile(e.to_string()))?;
+        .map_err(|e| CommandError::CSVFile(e.to_string()))?;
         debug!(
             target: LOG_TARGET,
-            "UTXO {} exported: {:?}",
+            "UTXO {} exported: {}",
             i.saturating_add(1),
-            utxo
+            utxo.commitment().to_hex()
         );
     }
     Ok(())
@@ -3922,7 +4030,200 @@ fn write_audit_to_csv_file(
 
 #[cfg(test)]
 mod test {
+    use tari_transaction_components::{
+        key_manager::{KeyManager, SecretTransactionKeyManagerInterface},
+        test_helpers::{TestParams, UtxoTestParams},
+        transaction_components::CoinBaseExtra,
+    };
+
     use super::*;
+
+    fn payload_with_memo(memo: &[u8]) -> PrepareOneSidedTransactionForSigningResult {
+        use tari_transaction_components::offline_signing::models::{
+            OneSidedTransactionInfo,
+            PayloadIntegritySignature,
+            PaymentRecipient,
+            get_latest_version,
+        };
+
+        let memo = MemoField::new_open(memo.to_vec(), TxType::PaymentToOther).unwrap();
+        PrepareOneSidedTransactionForSigningResult {
+            version: get_latest_version(),
+            tx_id: TxId::from(1u64),
+            info: OneSidedTransactionInfo {
+                payment_id: memo.clone(),
+                recipients: vec![PaymentRecipient {
+                    amount: MicroMinotari(1000),
+                    output_features: OutputFeatures::default(),
+                    address: TariAddress::default(),
+                    payment_id: memo,
+                }],
+                inputs: vec![],
+                outputs: vec![],
+                fee: MicroMinotari(0),
+                fee_per_gram: MicroMinotari(5),
+                sender_address: TariAddress::default(),
+            },
+            payload_signature: PayloadIntegritySignature {
+                signature: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn offline_payload_review_renders_control_characters_escaped() {
+        let summary = PayloadSummary::from_one_sided(payload_with_memo(b"\x1b[2J\r\nRecap"));
+        let mut out = Vec::new();
+        let result = review_offline_payload(summary, ConfirmationMode::NonInteractive, &mut out, &mut io::empty());
+        assert!(result.is_ok());
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains("\\u{1b}"), "{written}");
+        assert!(!written.contains('\u{1b}'), "{written}");
+        let recap = written.find("---- Recap ----").expect("recap");
+        assert!(written.find("\\u{1b}").unwrap() < recap, "{written}");
+        // The "has been logged" sentence depends on whether a logger is installed, which it is not in unit tests
+        let last_line = written.trim_end().lines().last().unwrap();
+        assert!(
+            last_line.starts_with("Signing without a prompt (non-interactive mode or no terminal)."),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn payload_file_read_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_payload_file(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_file_read_refuses_a_fifo_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.fifo");
+        let status = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+        assert!(status.success());
+
+        // Nothing ever writes to the FIFO, so a blocking open would never return
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            let result = read_payload_file(&fifo).map_err(|e| e.to_string());
+            tx.send(result).unwrap();
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reading a FIFO must not block")
+            .unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn payload_file_read_refuses_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.json");
+        fs::write(&path, vec![b' '; 10_000_001]).unwrap();
+        let err = read_payload_file(&path).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_payload_file(&path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn offline_payload_review_declined_is_not_signed() {
+        let summary = PayloadSummary::from_one_sided(payload_with_memo(b"memo"));
+        let result = review_offline_payload(
+            summary,
+            ConfirmationMode::Interactive,
+            &mut Vec::new(),
+            &mut "n\n".as_bytes(),
+        );
+        match result {
+            Err(CommandError::General(e)) => assert!(e.contains("not confirmed"), "{e}"),
+            other => panic!("expected a General error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utxo_csv_export_hex_encodes_coinbase_extra_and_is_owner_only() {
+        let key_manager = KeyManager::new_random().unwrap();
+        let hostile = b"\",=1+1\n".to_vec();
+        let features = OutputFeatures {
+            coinbase_extra: CoinBaseExtra::try_from(hostile.clone()).unwrap(),
+            ..Default::default()
+        };
+        let output = TestParams::new(&key_manager)
+            .create_output(
+                UtxoTestParams {
+                    value: MicroMinotari(1234),
+                    features,
+                    ..Default::default()
+                },
+                &key_manager,
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utxos.csv");
+        write_utxos_to_csv_file(std::slice::from_ref(&output), path.clone()).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        assert!(lines.next().is_none());
+
+        let fields: Vec<&str> = row.trim_matches('"').split("\",\"").collect();
+        let header_fields: Vec<&str> = header.trim_matches('"').split("\",\"").collect();
+        let column = header_fields.iter().position(|h| *h == "coinbase_extra").unwrap();
+        assert_eq!(fields.get(column), Some(&hostile.to_hex().as_str()));
+        assert_eq!(fields.len(), header_fields.len());
+        assert!(!row.contains("=1+1"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn utxo_csv_export_contains_no_private_keys() {
+        let key_manager = KeyManager::new_random().unwrap();
+        let output = TestParams::new(&key_manager)
+            .create_output(
+                UtxoTestParams {
+                    value: MicroMinotari(1234),
+                    ..Default::default()
+                },
+                &key_manager,
+            )
+            .unwrap();
+        let mask = key_manager.get_private_key(output.commitment_mask_key_id()).unwrap();
+        let script_private_key = key_manager.get_private_key(output.script_key_id()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utxos.csv");
+        write_utxos_to_csv_file(std::slice::from_ref(&output), path.clone()).unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        assert!(lines.next().is_none());
+
+        assert_eq!(header, UTXO_CSV_HEADER);
+        assert!(!header.contains("spending_key"));
+        assert!(!header.contains("mask"));
+        assert!(!header.contains("private"));
+
+        assert_eq!(row.split("\",\"").count(), header.split("\",\"").count());
+        assert!(row.contains(&output.commitment().to_hex()));
+        assert!(row.starts_with("\"1\",\"V0\",\"1234\","));
+        // Either scalar, together with the other, gives away the wallet's spend key; neither may appear at all.
+        assert!(!row.contains(&mask.to_hex()));
+        assert!(!row.contains(&script_private_key.to_hex()));
+        assert!(!row.contains("*hidden*"));
+    }
 
     #[test]
     fn random_alphanumeric_is_the_requested_length_and_not_repeated() {

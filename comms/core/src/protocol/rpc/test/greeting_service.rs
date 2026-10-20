@@ -42,7 +42,16 @@ use crate::{
     async_trait,
     protocol::{
         ProtocolId,
-        rpc::{NamedProtocolService, Request, Response, RpcError, RpcServerError, RpcStatus, Streaming},
+        rpc::{
+            DEFAULT_MAX_DECODE_ITEMS,
+            NamedProtocolService,
+            Request,
+            Response,
+            RpcError,
+            RpcServerError,
+            RpcStatus,
+            Streaming,
+        },
     },
     utils,
 };
@@ -72,6 +81,8 @@ pub trait GreetingRpc: Send + Sync + 'static {
 pub struct GreetingService {
     greetings: Vec<String>,
     call_count: Arc<AtomicUsize>,
+    /// The number of items `slow_stream` has handed to the RPC server
+    slow_stream_items_sent: Arc<AtomicUsize>,
 }
 
 impl GreetingService {
@@ -82,11 +93,16 @@ impl GreetingService {
         Self {
             greetings: greetings.iter().map(ToString::to_string).collect(),
             call_count: Default::default(),
+            slow_stream_items_sent: Default::default(),
         }
     }
 
     pub fn call_count(&self) -> usize {
         self.call_count.load(Ordering::SeqCst)
+    }
+
+    pub fn slow_stream_items_sent(&self) -> usize {
+        self.slow_stream_items_sent.load(Ordering::SeqCst)
     }
 
     fn inc_call_count(&self) {
@@ -171,6 +187,7 @@ impl GreetingRpc for GreetingService {
 
         let (tx, rx) = mpsc::channel(1);
         let item = std::iter::repeat_n(0u8, item_size as usize).collect::<Vec<_>>();
+        let items_sent = self.slow_stream_items_sent.clone();
         tokio::spawn(async move {
             for i in 0..num_items {
                 time::sleep(Duration::from_millis(delay_ms)).await;
@@ -184,6 +201,7 @@ impl GreetingRpc for GreetingService {
                     log::info!("stream was interrupted");
                     break;
                 }
+                items_sent.fetch_add(1, Ordering::SeqCst);
             }
         });
 
@@ -193,19 +211,66 @@ impl GreetingRpc for GreetingService {
 
 pub struct SlowGreetingService {
     delay: Arc<RwLock<Duration>>,
+    num_cancelled: Arc<AtomicUsize>,
+    num_in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
 }
 
 impl SlowGreetingService {
     pub fn new(delay: Arc<RwLock<Duration>>) -> Self {
-        Self { delay }
+        Self {
+            delay,
+            num_cancelled: Arc::new(AtomicUsize::new(0)),
+            num_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The most `say_hello` calls whose work was running at once
+    pub fn max_in_flight(&self) -> Arc<AtomicUsize> {
+        self.max_in_flight.clone()
+    }
+
+    /// The number of `say_hello` calls dropped (cancelled) before they finished
+    pub fn num_cancelled(&self) -> Arc<AtomicUsize> {
+        self.num_cancelled.clone()
+    }
+}
+
+/// Counts a call as cancelled if it is dropped before `finished` is called
+struct CancelGuard {
+    num_cancelled: Arc<AtomicUsize>,
+    finished: bool,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.num_cancelled.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
 #[async_trait]
 impl GreetingRpc for SlowGreetingService {
     async fn say_hello(&self, _: Request<SayHelloRequest>) -> Result<Response<SayHelloResponse>, RpcStatus> {
+        let mut guard = CancelGuard {
+            num_cancelled: self.num_cancelled.clone(),
+            finished: false,
+        };
         let delay = *self.delay.read().await;
-        time::sleep(delay).await;
+        // Like a blocking database call, the work runs on a task of its own, which keeps running if this call is
+        // dropped
+        let num_in_flight = self.num_in_flight.clone();
+        let max_in_flight = self.max_in_flight.clone();
+        let work = task::spawn(async move {
+            let now_in_flight = num_in_flight.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+            max_in_flight.fetch_max(now_in_flight, Ordering::SeqCst);
+            time::sleep(delay).await;
+            num_in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+        let _result = work.await;
+        guard.finished = true;
         Ok(Response::new(SayHelloResponse {
             greeting: "took a while to load".to_string(),
         }))
@@ -239,7 +304,7 @@ impl GreetingRpc for SlowGreetingService {
         unimplemented!()
     }
 }
-#[derive(prost::Message)]
+#[derive(prost::Message, tari_comms_rpc_macros::DecodeBudget)]
 pub struct SlowStreamRequest {
     #[prost(uint32, tag = "1")]
     pub num_items: u32,
@@ -249,7 +314,7 @@ pub struct SlowStreamRequest {
     pub delay_ms: u64,
 }
 
-#[derive(prost::Message)]
+#[derive(prost::Message, tari_comms_rpc_macros::DecodeBudget)]
 pub struct SayHelloRequest {
     #[prost(string, tag = "1")]
     pub name: String,
@@ -257,7 +322,7 @@ pub struct SayHelloRequest {
     pub language: u32,
 }
 
-#[derive(prost::Message)]
+#[derive(prost::Message, tari_comms_rpc_macros::DecodeBudget)]
 pub struct SayHelloResponse {
     #[prost(string, tag = "1")]
     pub greeting: String,
@@ -422,38 +487,38 @@ impl GreetingClient {
     }
 
     pub async fn say_hello(&mut self, request: SayHelloRequest) -> Result<SayHelloResponse, RpcError> {
-        self.inner.request_response(request, 1).await
+        self.inner.request_response(request, 1, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn return_error(&mut self) -> Result<(), RpcError> {
-        self.inner.request_response((), 2).await
+        self.inner.request_response((), 2, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn get_greetings(&mut self, request: u32) -> Result<__rpc_deps::ClientStreaming<String>, RpcError> {
-        self.inner.server_streaming(request, 3).await
+        self.inner.server_streaming(request, 3, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn streaming_error(&mut self, request: String) -> Result<__rpc_deps::ClientStreaming<String>, RpcError> {
-        self.inner.server_streaming(request, 4).await
+        self.inner.server_streaming(request, 4, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn streaming_error2(&mut self) -> Result<__rpc_deps::ClientStreaming<String>, RpcError> {
-        self.inner.server_streaming((), 5).await
+        self.inner.server_streaming((), 5, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn get_public_key_hex(&mut self) -> Result<String, RpcError> {
-        self.inner.request_response((), 6).await
+        self.inner.request_response((), 6, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn reply_with_msg_of_size(&mut self, request: u64) -> Result<String, RpcError> {
-        self.inner.request_response(request, 7).await
+        self.inner.request_response(request, 7, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub async fn slow_stream(
         &mut self,
         request: SlowStreamRequest,
     ) -> Result<__rpc_deps::ClientStreaming<Vec<u8>>, RpcError> {
-        self.inner.server_streaming(request, 8).await
+        self.inner.server_streaming(request, 8, DEFAULT_MAX_DECODE_ITEMS).await
     }
 
     pub fn get_last_request_latency(&mut self) -> Option<Duration> {

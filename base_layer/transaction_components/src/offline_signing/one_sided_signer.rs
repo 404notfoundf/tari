@@ -20,9 +20,12 @@
 // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
 // OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 // DAMAGE.
+use std::str::FromStr;
+
 use rand::Rng;
 use tari_common::configuration::Network;
 use tari_common_types::{
+    tari_address::TariAddress,
     transaction::TxId,
     types::{CompressedPublicKey, CompressedSignature, PrivateKey},
 };
@@ -34,11 +37,17 @@ use crate::{
     TransactionBuilderError,
     consensus::ConsensusConstants,
     fee::recipient_output_features_and_scripts_size,
-    key_manager::{TariKeyAndId, TariKeyId, TransactionKeyManagerInterface},
+    key_manager::{
+        TariKeyAndId,
+        TariKeyId,
+        TransactionKeyManagerInterface,
+        manager::{require_mask_id, truncated_key_id},
+    },
     multisig::script::derive_multisig_ephemeral_pubkeys,
     offline_signing::models::{
         OneSidedMultisigTransactionInfo,
         OneSidedTransactionInfo,
+        PaymentRecipient,
         SignedTransaction,
         TransactionMetadata,
     },
@@ -59,8 +68,12 @@ use crate::{
 /// The script cannot be built until the sender offset key it derives its ephemeral keys from has been reserved, but
 /// the reservation needs the weight of every output it is charging for. A placeholder of the same shape - one
 /// `CheckMultiSigVerify` over `key_count` keys followed by one `PushPubKey` - serialises to the same size.
-fn multisig_pending_output(
+///
+/// The online wallet uses it too, so that its fee and change estimate for the deposit is the one the signer will
+/// commit to.
+pub fn multisig_pending_output(
     consensus_constants: &ConsensusConstants,
+    recipient: &TariAddress,
     amount: MicroMinotari,
     features: &OutputFeatures,
     memo: &MemoField,
@@ -85,7 +98,149 @@ fn multisig_pending_output(
             &Covenant::default(),
             memo,
         )?,
-    ))
+    )
+    .for_recipient(recipient.clone()))
+}
+
+/// The declaration of a multisig withdrawal's recipient output, the way the withdrawal signer makes it. The online
+/// wallet uses it too, so that its fee and change estimate for the withdrawal is the one the signer will commit to.
+pub fn withdraw_pending_output(
+    consensus_constants: &ConsensusConstants,
+    recipient: &PaymentRecipient,
+    memo: &MemoField,
+) -> Result<PendingOutput, TransactionBuilderError> {
+    Ok(PendingOutput::new(
+        recipient.amount,
+        recipient_output_features_and_scripts_size(
+            consensus_constants.transaction_weight_params(),
+            &recipient.output_features,
+            &push_pubkey_script(&Default::default()),
+            &Covenant::default(),
+            memo,
+        )?,
+    )
+    .for_recipient(recipient.address.clone()))
+}
+
+/// The longest key id string a payload may carry.
+const MAX_PAYLOAD_KEY_ID_LEN: usize = 1024;
+/// How many key ids a payload key id may wrap in total (`Encrypted.key`, `DH*.private_key` and `Derived.key` each wrap
+/// one): the outer id plus a nested id at most two levels deep. The deepest key id the wallet itself produces is a
+/// multisig input's script key, `derived.dh_commitment_mask.<pk>.encrypted.<hex>.view_key`: a script key `Derived`
+/// from a `DH*` mask over an `Encrypted` sender offset key.
+const MAX_PAYLOAD_KEY_ID_NESTING: usize = 3;
+
+/// The key ids a commitment mask is made from, over the keys the wallet makes them from: see
+/// [`require_mask_id`]. Anything else as a mask names a wallet root key (or a public tweak of one), or a secret
+/// encrypted under the spend key (an imported output's script key), and the signer would encrypt it into the
+/// output's recovery data.
+fn is_mask_key_id(key_id: &TariKeyId) -> bool {
+    require_mask_id(key_id).is_ok()
+}
+
+/// Whether `key_id` is within the payload size and nesting limits.
+fn is_within_payload_limits(key_id: &TariKeyId) -> bool {
+    if key_id.to_string().len() > MAX_PAYLOAD_KEY_ID_LEN {
+        return false;
+    }
+    let mut current = key_id.clone();
+    let mut nesting = 0usize;
+    loop {
+        let inner = match &current {
+            TariKeyId::Derived { key } | TariKeyId::Encrypted { key, .. } => key.as_str().to_string(),
+            TariKeyId::DHCommitmentMask { private_key, .. } | TariKeyId::DHEncryptedData { private_key, .. } => {
+                private_key.as_str().to_string()
+            },
+            _ => return true,
+        };
+        nesting = nesting.saturating_add(1);
+        if nesting > MAX_PAYLOAD_KEY_ID_NESTING {
+            return false;
+        }
+        current = match TariKeyId::from_str(&inner) {
+            Ok(key_id) => key_id,
+            Err(_) => return false,
+        };
+    }
+}
+
+fn is_allowed_mask_id(key_id: &TariKeyId) -> bool {
+    is_mask_key_id(key_id) && is_within_payload_limits(key_id)
+}
+
+/// A script key may be:
+/// - any mask key id (see [`require_mask_id`]);
+/// - `Derived` over a mask key id (an ordinary wallet script key);
+/// - `Derived` over the spend key: what the legacy key conversion turns `derived.managed.comms.0` into, so a migrated
+///   wallet can hold unspent outputs with it. It is the spend key plus a tweak, so it is no different as a script key
+///   from `Derived` over a mask. `Derived` over anything else (the view key, another `Derived`, an `Encrypted` under
+///   the spend key) is refused;
+/// - the spend key itself when the output's script is exactly `PushPubKey(<our public spend key>)`. That is how the
+///   wallet holds non-stealth outputs (for example non-stealth coinbases), and it is the same rule `WalletOutput` uses
+///   to pick the spend key as a script key;
+/// - `Encrypted` under the spend key: an imported output's script key (`UnblindedOutput::to_wallet_output`).
+///
+/// The script key only feeds the script signature (under a random nonce) and the script offset (blinded by fresh
+/// sender offset keys), exactly as when the output is spent online, so none of these gives the host anything. An
+/// `Encrypted` under the spend key cannot be minted by the host (the cipher is keyed by the spend key), only replayed
+/// from an imported output it saw; as a script key that replay does nothing new. As a *mask* it would be decrypted and
+/// published in the output's recovery data, which is why [`require_mask_id`] refuses it there, and why `Derived` over
+/// it is refused here.
+fn is_allowed_script_key_id(key_id: &TariKeyId, script: &TariScript, public_spend_key: &CompressedPublicKey) -> bool {
+    if !is_within_payload_limits(key_id) {
+        return false;
+    }
+    match key_id {
+        TariKeyId::SpendKey => matches!(script.as_slice(), [Opcode::PushPubKey(pk)] if **pk == *public_spend_key),
+        TariKeyId::Derived { key } => match TariKeyId::from_str(key.as_str()) {
+            Ok(TariKeyId::SpendKey) => true,
+            Ok(inner) => is_mask_key_id(&inner),
+            Err(_) => false,
+        },
+        TariKeyId::Encrypted { key, .. } if matches!(TariKeyId::from_str(key.as_str()), Ok(TariKeyId::SpendKey)) => {
+            true
+        },
+        _ => is_mask_key_id(key_id),
+    }
+}
+
+/// Checks the key ids of every wallet output an offline signing payload carries. It runs first in each signing entry
+/// point, before the signer's own builder or key manager calls touch any of them. Callers that pre-process payload
+/// masks before calling the signer (the wallet's withdraw-multisig service derives each input's script key from its
+/// host-supplied mask) are not covered by this check and rely on the key manager's [`require_mask_id`] gate on those
+/// calls instead.
+///
+/// The payload is only integrity-signed with the view key, so whoever holds the view key (the online host) can
+/// forge it, and the operator summary does not show key ids. A payload output whose commitment mask names the spend
+/// key would otherwise make the signer encrypt the spend key into the output's recovery data, so masks must be one
+/// of `Encrypted`, `DHCommitmentMask`, `DHEncryptedData` or `LedgerKey` over the keys [`require_mask_id`] allows (an
+/// `Encrypted` under the spend key, such as an imported output's script key, is refused). Script keys have a wider
+/// rule, see `is_allowed_script_key_id`. Refused key ids are echoed truncated (see [`truncated_key_id`]).
+fn check_payload_key_ids(
+    inputs: &[WalletOutput],
+    outputs: &[WalletOutput],
+    public_spend_key: &CompressedPublicKey,
+) -> Result<(), TransactionBuilderError> {
+    let lists = [("inputs", inputs), ("outputs", outputs)];
+    for (list_name, list) in lists {
+        for (i, output) in list.iter().enumerate() {
+            let mask = output.commitment_mask_key_id();
+            if !is_allowed_mask_id(mask) {
+                return Err(TransactionBuilderError::OfflinePayloadKeyIdNotAllowed {
+                    field: format!("{list_name}[{i}].commitment_mask_key_id"),
+                    key_id: truncated_key_id(mask),
+                });
+            }
+            let script_key = output.script_key_id();
+            if !is_allowed_script_key_id(script_key, output.script(), public_spend_key) {
+                return Err(TransactionBuilderError::OfflinePayloadKeyIdNotAllowed {
+                    field: format!("{list_name}[{i}].script_key_id"),
+                    key_id: truncated_key_id(script_key),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// This is the message containing the public data that the Receiver will send back to the Sender
@@ -99,18 +254,23 @@ pub struct RecipientSignedMessage {
     pub offset: PrivateKey,
 }
 
-pub fn build_and_sign_transaction<KM: TransactionKeyManagerInterface>(
+/// Fails with [`TransactionBuilderError::OfflineTransactionRequiresChange`] if the transaction would carry no change
+/// output; see [`SignedTransaction`] for why.
+pub(crate) fn build_and_sign_transaction<KM: TransactionKeyManagerInterface>(
     key_manager: &KM,
     consensus_constants: ConsensusConstants,
     network: Network,
     info: OneSidedTransactionInfo,
 ) -> Result<SignedTransaction, TransactionBuilderError> {
+    check_payload_key_ids(&info.inputs, &info.outputs, &key_manager.get_spend_key().pub_key)?;
     let mut tx_builder = TransactionBuilder::new(consensus_constants, key_manager.clone(), network)?;
     if info.fee_per_gram > MicroMinotari::zero() {
         tx_builder.with_fee_per_gram(info.fee_per_gram);
     } else {
         tx_builder.with_fee(info.fee);
     }
+    // Refuse, before any sender offset key is minted, a transaction without change: see `SignedTransaction`.
+    tx_builder.with_change_required();
 
     for uo in info.inputs {
         tx_builder.with_input(uo)?;
@@ -126,6 +286,8 @@ pub fn build_and_sign_transaction<KM: TransactionKeyManagerInterface>(
             recipient.payment_id.clone(),
         )?;
     }
+    // The change memo carries the payment id, and the reservation has to measure the memo `build` will write.
+    tx_builder.with_memo(info.payment_id.clone());
     // The payload's outputs arrive fully formed, so they cannot be specs; they are declared here instead, because
     // the single reservation has to charge for every output the transaction will carry.
     let pending = info
@@ -142,7 +304,6 @@ pub fn build_and_sign_transaction<KM: TransactionKeyManagerInterface>(
         uo.set_metadata_signature(Default::default());
         tx_builder.with_output(uo, sender_offset_key.key_id, None)?;
     }
-    tx_builder.with_memo(info.payment_id.clone());
     let finalized_tx = tx_builder.build()?;
     let FinalizedTransaction {
         transaction,
@@ -165,12 +326,19 @@ pub fn build_and_sign_transaction<KM: TransactionKeyManagerInterface>(
     })
 }
 
-pub fn sign_multisig_transaction<KM: TransactionKeyManagerInterface>(
+/// Fails with [`TransactionBuilderError::OfflineTransactionRequiresChange`] if the transaction would carry no change
+/// output; see [`SignedTransaction`] for why.
+pub(crate) fn sign_multisig_transaction<KM: TransactionKeyManagerInterface>(
     key_manager: &KM,
     consensus_constants: ConsensusConstants,
     network: Network,
     mut info: OneSidedMultisigTransactionInfo,
 ) -> Result<SignedTransaction, TransactionBuilderError> {
+    check_payload_key_ids(
+        &info.base.inputs,
+        &info.base.outputs,
+        &key_manager.get_spend_key().pub_key,
+    )?;
     let constants = consensus_constants.clone();
     let mut tx_builder = TransactionBuilder::new(consensus_constants, key_manager.clone(), network)?;
     if info.base.fee_per_gram > MicroMinotari::zero() {
@@ -178,6 +346,8 @@ pub fn sign_multisig_transaction<KM: TransactionKeyManagerInterface>(
     } else {
         tx_builder.with_fee(info.base.fee);
     }
+    // Refuse, before any sender offset key is minted, a transaction without change: see `SignedTransaction`.
+    tx_builder.with_change_required();
 
     for uo in std::mem::take(&mut info.base.inputs) {
         tx_builder.with_input(uo)?;
@@ -198,8 +368,12 @@ pub fn sign_multisig_transaction<KM: TransactionKeyManagerInterface>(
     // Every output this transaction will carry is declared up front, because the sender offset keys are reserved in
     // a single call: splitting the reservation would leave the later calls with no input script keys to fold in, and
     // their replies would be bare sender offset private keys.
+    // The change memo names the recipient and carries the payment id, so both are declared before the reservation
+    // measures it.
+    tx_builder.with_memo(info.base.payment_id.clone());
     let mut pending = vec![multisig_pending_output(
         &constants,
+        &recipient.address,
         recipient.amount,
         &recipient.output_features,
         &info.payment_id,
@@ -229,7 +403,6 @@ pub fn sign_multisig_transaction<KM: TransactionKeyManagerInterface>(
     }
     tx_builder.add_recipient(recipient.address.clone(), output, sender_offset.key_id, None)?;
 
-    tx_builder.with_memo(info.base.payment_id.clone());
     let finalized_tx = tx_builder.build()?;
     let FinalizedTransaction {
         transaction,
@@ -312,12 +485,15 @@ fn build_multisig_output<KM: TransactionKeyManagerInterface>(
     Ok(output)
 }
 
-pub fn sign_multisig_withdraw_transaction<KM: TransactionKeyManagerInterface>(
+/// Fails with [`TransactionBuilderError::OfflineTransactionRequiresChange`] if the transaction would carry no change
+/// output; see [`SignedTransaction`] for why.
+pub(crate) fn sign_multisig_withdraw_transaction<KM: TransactionKeyManagerInterface>(
     key_manager: &KM,
     consensus_constants: ConsensusConstants,
     network: Network,
     mut info: OneSidedTransactionInfo,
 ) -> Result<SignedTransaction, TransactionBuilderError> {
+    check_payload_key_ids(&info.inputs, &info.outputs, &key_manager.get_spend_key().pub_key)?;
     let constants = consensus_constants.clone();
     let mut tx_builder = TransactionBuilder::new(consensus_constants, key_manager.clone(), network)?;
     if info.fee_per_gram > MicroMinotari::zero() {
@@ -325,6 +501,8 @@ pub fn sign_multisig_withdraw_transaction<KM: TransactionKeyManagerInterface>(
     } else {
         tx_builder.with_fee(info.fee);
     }
+    // Refuse, before any sender offset key is minted, a transaction without change: see `SignedTransaction`.
+    tx_builder.with_change_required();
 
     for uo in std::mem::take(&mut info.inputs) {
         tx_builder.with_input(uo)?;
@@ -341,17 +519,10 @@ pub fn sign_multisig_withdraw_transaction<KM: TransactionKeyManagerInterface>(
         .ok_or(TransactionBuilderError::NoRecipients)?
         .clone();
 
-    // As above: one reservation for every output, declared before any key exists.
-    let mut pending = vec![PendingOutput::new(
-        recipient.amount,
-        recipient_output_features_and_scripts_size(
-            constants.transaction_weight_params(),
-            &recipient.output_features,
-            &push_pubkey_script(&Default::default()),
-            &Covenant::default(),
-            &info.payment_id,
-        )?,
-    )];
+    // As above: one reservation for every output, declared before any key exists, and the memo and the recipient
+    // declared before the reservation measures the change memo.
+    tx_builder.with_memo(info.payment_id.clone());
+    let mut pending = vec![withdraw_pending_output(&constants, &recipient, &info.payment_id)?];
     for uo in &info.outputs {
         pending.push(PendingOutput::from_output(uo)?);
     }
@@ -375,7 +546,6 @@ pub fn sign_multisig_withdraw_transaction<KM: TransactionKeyManagerInterface>(
     }
     tx_builder.add_recipient(recipient.address.clone(), output, sender_offset.key_id, None)?;
 
-    tx_builder.with_memo(info.payment_id.clone());
     let finalized_tx = tx_builder.build()?;
     let FinalizedTransaction {
         transaction,

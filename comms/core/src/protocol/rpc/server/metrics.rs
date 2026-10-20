@@ -33,7 +33,7 @@ pub fn num_sessions(protocol: &ProtocolId) -> IntGauge {
     static METER: Lazy<IntGaugeVec> = Lazy::new(|| {
         tari_metrics::register_int_gauge_vec(
             "comms::rpc::server::num_sessions",
-            "The number of active server sessions per protocol",
+            "The number of active server sessions per protocol. Handshakes in progress are not counted.",
             &["protocol"],
         )
         .unwrap()
@@ -42,11 +42,54 @@ pub fn num_sessions(protocol: &ProtocolId) -> IntGauge {
     METER.with_label_values(&[String::from_utf8_lossy(protocol).as_ref()])
 }
 
+/// Counts a session in [num_sessions] for as long as it is held
+pub struct ActiveSession(IntGauge);
+
+impl ActiveSession {
+    pub fn new(protocol: &ProtocolId) -> Self {
+        let gauge = num_sessions(protocol);
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
 pub fn handshake_error_counter(protocol: &ProtocolId) -> IntCounter {
     static METER: Lazy<IntCounterVec> = Lazy::new(|| {
         tari_metrics::register_int_counter_vec(
             "comms::rpc::server::handshake_error_count",
             "The number of handshake errors per protocol",
+            &["protocol"],
+        )
+        .unwrap()
+    });
+
+    METER.with_label_values(&[String::from_utf8_lossy(protocol).as_ref()])
+}
+
+pub fn handshake_capacity_rejection_counter(protocol: &ProtocolId) -> IntCounter {
+    static METER: Lazy<IntCounterVec> = Lazy::new(|| {
+        tari_metrics::register_int_counter_vec(
+            "comms::rpc::server::handshake_capacity_rejection_count",
+            "The number of substreams refused because too many handshakes were in progress, per protocol",
+            &["protocol"],
+        )
+        .unwrap()
+    });
+
+    METER.with_label_values(&[String::from_utf8_lossy(protocol).as_ref()])
+}
+
+pub fn handshake_timeout_counter(protocol: &ProtocolId) -> IntCounter {
+    static METER: Lazy<IntCounterVec> = Lazy::new(|| {
+        tari_metrics::register_int_counter_vec(
+            "comms::rpc::server::handshake_timeout_count",
+            "The number of handshakes that timed out waiting for the client, per protocol",
             &["protocol"],
         )
         .unwrap()

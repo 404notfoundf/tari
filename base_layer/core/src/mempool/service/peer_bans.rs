@@ -1,4 +1,4 @@
-// Copyright 2025. The Tari Project
+// Copyright 2026. The Tari Project
 //
 // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
 // following conditions are met:
@@ -19,29 +19,40 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-use serde::{Deserialize, Serialize};
 
-use crate::{transaction_builder::OutputPair, transaction_components::TransactionError};
+use std::time::Duration;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MarshalOutputPair {
-    pub output_pair: OutputPair,
-    pub encrypted_kernel_nonce: String,
-    pub encrypted_sender_offset_key: String,
-    pub encrypted_output_commitment_mask: String,
+use tari_transaction_components::BanPeriod;
+
+use crate::base_node::BlockchainSyncConfig;
+
+/// How long a peer is banned for each [BanPeriod].
+#[derive(Debug, Clone, Copy)]
+pub struct PeerBanPeriods {
+    pub long: Duration,
+    pub short: Duration,
 }
 
-impl MarshalOutputPair {
-    pub fn marshal(output_pair: OutputPair) -> Result<Self, TransactionError> {
-        let encrypted_kernel_nonce = output_pair.kernel_nonce.to_string();
-        let encrypted_sender_offset_key = output_pair.sender_offset_key_id.to_string();
-        let encrypted_output_commitment_mask = output_pair.output.commitment_mask_key_id().to_string();
+impl PeerBanPeriods {
+    pub fn duration(&self, period: BanPeriod) -> Duration {
+        match period {
+            BanPeriod::Short => self.short,
+            BanPeriod::Long => self.long,
+        }
+    }
+}
 
-        Ok(MarshalOutputPair {
-            output_pair,
-            encrypted_kernel_nonce,
-            encrypted_sender_offset_key,
-            encrypted_output_commitment_mask,
-        })
+impl From<&BlockchainSyncConfig> for PeerBanPeriods {
+    fn from(config: &BlockchainSyncConfig) -> Self {
+        Self {
+            long: config.ban_period,
+            short: config.short_ban_period,
+        }
+    }
+}
+
+impl Default for PeerBanPeriods {
+    fn default() -> Self {
+        Self::from(&BlockchainSyncConfig::default())
     }
 }

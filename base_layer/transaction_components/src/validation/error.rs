@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use crate::{
     MicroMinotari,
-    transaction_components::{OutputType, RangeProofType, TransactionError, covenants::CovenantError},
+    transaction_components::{KernelFeatures, OutputType, RangeProofType, TransactionError, covenants::CovenantError},
 };
 
 #[derive(Debug, Error)]
@@ -48,6 +48,8 @@ pub enum AggregatedBodyValidationError {
     UnsortedOrDuplicateOutput,
     #[error("Duplicate or unsorted kernel found in block body")]
     UnsortedOrDuplicateKernel,
+    #[error("Duplicate kernel excess found in body")]
+    DuplicateKernelExcess,
     #[error(
         "Script exceeded maximum script size, expected less than {max_script_size} but was
     {actual_script_size}"
@@ -72,14 +74,25 @@ pub enum AggregatedBodyValidationError {
     InvalidBurnError(String),
     #[error("Output type '{output_type}' is not permitted")]
     OutputTypeNotPermitted { output_type: OutputType },
+    #[error("Kernel features {features:?} are not permitted in a transaction")]
+    KernelFeaturesNotPermitted { features: KernelFeatures },
     #[error("Output type '{output_type}' does not permit this side-chain feature data")]
     SideChainFeatureNotPermitted { output_type: OutputType },
     #[error("Output type '{output_type}' requires side-chain feature data")]
     SideChainFeatureRequired { output_type: OutputType },
+    #[error("A burn claimable on a side chain must carry the Nop or the empty script")]
+    BurnScriptNotPermitted,
     #[error("Range proof type '{range_proof_type}' is not permitted")]
     RangeProofTypeNotPermitted { range_proof_type: RangeProofType },
     #[error("Output type '{output_type}' is not matched to any range proof type")]
     OutputTypeNotMatchedToRangeProofType { output_type: OutputType },
+    #[error(
+        "Range proof presence does not match range proof type '{range_proof_type}' (proof present: {proof_present})"
+    )]
+    RangeProofPresenceMismatch {
+        range_proof_type: RangeProofType,
+        proof_present: bool,
+    },
     #[error("Validator registration has invalid minimum amount {actual}, must be at least {min}")]
     ValidatorNodeRegistrationMinDepositAmount { min: MicroMinotari, actual: MicroMinotari },
     #[error("Validator registration has invalid maturity {actual}, must be at least {min}")]
@@ -92,6 +105,10 @@ pub enum AggregatedBodyValidationError {
     ValidatorNodeInvalidSidechainIdKnowledgeProof,
     #[error("Covenant too large. Max size: {max_size}, Actual size: {actual_size}")]
     CovenantTooLarge { max_size: usize, actual_size: usize },
+    #[error("Covenant evaluation exceeded the work limit of {limit}")]
+    CovenantWorkLimitExceeded { limit: u64 },
+    #[error("Covenants of {inputs} inputs need distinct outputs, but at most {matched} can be satisfied")]
+    CovenantOutputsClaimedTwice { inputs: usize, matched: usize },
     #[error("Invalid Serialized Public key: {0}")]
     InvalidSerializedPublicKey(String),
 }

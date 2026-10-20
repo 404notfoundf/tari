@@ -25,6 +25,7 @@ use tari_common::configuration::Network;
 use tari_common_types::{
     epoch::VnEpoch,
     types::{
+        BulletRangeProof,
         ComAndPubSignature,
         CompressedCommitment,
         CompressedPublicKey,
@@ -1574,6 +1575,19 @@ fn body_samples() -> Vec<Sample> {
         Mutation::OutputCovenant(valid_covenant.repeat(4096 / valid_covenant.len() + 1)),
         false,
     ));
+    // `identity()` (0x20) tokens, 63 of them, then a nested covenant (0x05, length 65) of 65 more: 129 tokens in total
+    let over_token_limit = [vec![0x20; 63], vec![0x05, 65], vec![0x20; 65]].concat();
+    samples.push(sample(
+        "a covenant over the total token limit",
+        Mutation::OutputCovenant(over_token_limit),
+        false,
+    ));
+    // A nested covenant (0x05) holding `identity()` (0x20), with its length 1 encoded in two bytes
+    samples.push(sample(
+        "a covenant with a non-minimal length",
+        Mutation::OutputCovenant(vec![0x05, 0x81, 0x00, 0x20]),
+        false,
+    ));
 
     // Versions
     samples.extend(version_samples("output version", &[0, 1], Mutation::OutputVersion));
@@ -1615,12 +1629,18 @@ fn body_samples() -> Vec<Sample> {
         ));
     }
 
-    // Range proof bytes: not validated when decoded (the proof is verified by consensus validation)
-    for (name, bytes) in [("empty", vec![]), ("1 byte", vec![1]), ("garbage", vec![0xff; 100])] {
+    // Range proof bytes: only the length is checked when decoded
+    for (name, bytes, accept) in [
+        ("empty", vec![], true),
+        ("1 byte", vec![1], true),
+        ("garbage", vec![0xff; 100], true),
+        ("at the cap", vec![0xff; 577], true),
+        ("one over the cap", vec![0xff; 578], false),
+    ] {
         samples.push(sample(
             format!("range proof: {name}"),
             Mutation::OutputRangeProof(bytes),
-            true,
+            accept,
         ));
     }
 
@@ -1890,6 +1910,7 @@ fn every_invariant_type_decodes_through_validated_decode() {
     assert_validated::<MemoField>();
     assert_validated::<Difficulty>();
     assert_validated::<TariKeyId>();
+    assert_validated::<BulletRangeProof>();
 }
 
 #[test]

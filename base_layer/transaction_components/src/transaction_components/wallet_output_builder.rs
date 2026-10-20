@@ -19,7 +19,8 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-use derivative::Derivative;
+use std::fmt;
+
 use tari_common_types::{
     tari_address::TariAddress,
     types::{ComAndPubSignature, CompressedPublicKey},
@@ -41,8 +42,7 @@ use crate::{
     },
 };
 
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(Clone)]
 pub struct WalletOutputBuilder {
     version: TransactionOutputVersion,
     value: MicroMinotari,
@@ -61,6 +61,30 @@ pub struct WalletOutputBuilder {
     custom_recovery_key_id: Option<TariKeyId>,
     minimum_value_promise: MicroMinotari,
     payment_id: MemoField,
+}
+
+impl fmt::Debug for WalletOutputBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletOutputBuilder")
+            .field("version", &self.version)
+            .field("value", &self.value)
+            .field("commitment_mask_key_id", &self.commitment_mask_key_id)
+            .field("features", &self.features)
+            .field("script", &self.script)
+            .field("script_lock_height", &self.script_lock_height)
+            .field("covenant", &self.covenant)
+            .field("input_data", &self.input_data)
+            .field("script_key_id", &self.script_key_id)
+            .field("sender_offset_public_key", &self.sender_offset_public_key)
+            .field("metadata_signature", &self.metadata_signature)
+            .field("metadata_signed_by_receiver", &self.metadata_signed_by_receiver)
+            .field("metadata_signed_by_sender", &self.metadata_signed_by_sender)
+            .field("encrypted_data", &self.encrypted_data)
+            .field("custom_recovery_key_id", &self.custom_recovery_key_id)
+            .field("minimum_value_promise", &self.minimum_value_promise)
+            .field("payment_id", &self.payment_id)
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -168,6 +192,11 @@ impl WalletOutputBuilder {
         &self.encrypted_data
     }
 
+    /// Sign the metadata signature with no recipient address.
+    ///
+    /// On a ledger wallet a device held sender offset key is refused here, because the device signs only an output
+    /// it can show for review: use [`Self::sign_metadata_signature_user_verified`] with the recipient's address, or
+    /// the wallet's own address for an output to itself.
     pub fn sign_metadata_signature<KM: TransactionKeyManagerInterface>(
         mut self,
         key_manager: &KM,
@@ -212,20 +241,15 @@ impl WalletOutputBuilder {
             .as_ref()
             .ok_or_else(|| TransactionError::BuilderError("Cannot sign metadata without a script".to_string()))?;
         let sender_offset_public_key = key_manager.get_public_key_at_key_id(sender_offset_key_id)?;
-        let metadata_message_common = TransactionOutput::metadata_signature_message_common_from_parts(
-            &self.version,
-            &self.features,
-            &self.covenant,
-            &self.encrypted_data,
-            &self.minimum_value_promise,
-        );
         let metadata_signature = key_manager.get_metadata_signature_user_verified(
             &self.commitment_mask_key_id,
             self.value,
             sender_offset_key_id,
             self.version,
-            &metadata_message_common,
-            self.features.range_proof_type,
+            &self.features,
+            &self.covenant,
+            &self.encrypted_data,
+            self.minimum_value_promise,
             script,
             receiver_address,
         )?;
@@ -238,6 +262,9 @@ impl WalletOutputBuilder {
 
     /// Sign a partial multi-party metadata signature as the sender and receiver - `sender_offset_public_key_shares` and
     /// `ephemeral_pubkey_shares` from other participants are combined to enable creation of the challenge.
+    ///
+    /// Not supported on a ledger wallet with a `OneSidedSenderOffset` key, which never signs a raw challenge. The
+    /// pre-mine leader's aggregated step 3, with a pre-mine sender offset key, is unaffected.
     // Ristretto point/scalar arithmetic, not integer arithmetic: these operators cannot overflow.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn sign_partial_as_sender_and_receiver<KM: TransactionKeyManagerInterface>(
@@ -400,7 +427,7 @@ mod test {
                     .verify_mask(output.commitment(), &commitment_mask_key.key_id, value.into())
                     .unwrap();
 
-                let (recovered_key_id, recovered_value, _) = key_manager
+                let (recovered_key_id, recovered_value, _, _) = key_manager
                     .try_output_key_recovery(
                         output.commitment(),
                         output.encrypted_data(),

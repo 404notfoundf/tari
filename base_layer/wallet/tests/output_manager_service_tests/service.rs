@@ -482,6 +482,57 @@ async fn prepare_transaction_fails_when_all_commitments_are_excluded() {
     assert!(matches!(result, Err(OutputManagerError::NotEnoughFunds)));
 }
 
+#[tokio::test]
+async fn must_include_commitment_listed_twice_selects_it_once() {
+    let (connection, _tempdir) = get_temp_sqlite_database_connection();
+    let backend = OutputManagerSqliteDatabase::new(connection.clone());
+    let mut oms = setup_output_manager_service(backend.clone(), true).await;
+
+    let outputs = [3000u64, 4000]
+        .into_iter()
+        .map(|value| {
+            make_input(
+                &mut rand::rng(),
+                MicroMinotari::from(value),
+                &OutputFeatures::default(),
+                oms.key_manager_handle.key_manager(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for output in &outputs {
+        oms.output_manager_handle
+            .add_output(output.clone(), None)
+            .await
+            .unwrap();
+    }
+    backend
+        .mark_outputs_as_unspent(outputs.iter().map(|output| (output.output_hash(), true)).collect())
+        .unwrap();
+
+    let commitment = outputs[0].commitment().clone();
+    let tx_builder = oms
+        .output_manager_handle
+        .prepare_transaction_to_send(
+            TxId::new_random(),
+            MicroMinotari::from(100),
+            UtxoSelectionCriteria::must_include(vec![commitment.clone(), commitment.clone()]),
+            OutputFeatures::default(),
+            MicroMinotari::from(1),
+            script!(Nop).unwrap(),
+            Covenant::default(),
+            MemoField::new_empty(),
+        )
+        .await
+        .unwrap();
+
+    let matching_inputs = tx_builder
+        .inputs()
+        .iter()
+        .filter(|input| input.output.commitment() == &commitment)
+        .count();
+    assert_eq!(matching_inputs, 1);
+}
+
 #[allow(clippy::identity_op)]
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -2588,9 +2639,10 @@ async fn spend_backup_pre_mine_utxo_fee_estimate_counts_the_output_memo() {
         .await;
 }
 
-/// Covers the `PrepareWithdrawMultisigTransaction` estimate in the transaction service, which spends a whole
-/// multisig input to a single recipient with no change output. Its output memo is the recipient address attached
-/// to an empty payment id, again padded to the 130 byte `AddressAndData` minimum.
+/// Covers the `PrepareWithdrawMultisigTransaction` estimate in the transaction service: the fee for a multisig input
+/// spent to a single recipient before a change output is added, which the handler then adds the change output's fee
+/// to. Its output memo is the recipient address attached to an empty payment id, again padded to the 130 byte
+/// `AddressAndData` minimum.
 ///
 /// The path needs collected multisig signatures over a real UTXO, so as above this exercises the production
 /// estimate and memo constructor it uses against a real transaction of the same shape.
@@ -2686,6 +2738,20 @@ async fn coin_split_even_builds_a_valid_transaction() {
     assert_eq!(tx.body.inputs().len(), 1);
     assert_eq!(tx.body.outputs().len(), split_count);
     assert_validates(&tx);
+}
+
+#[tokio::test]
+async fn coin_split_even_rejects_insufficient_funds_for_fee() {
+    let (mut oms, _tempdir, uo) = oms_with_spendable_input(MicroMinotari::from(100)).await;
+
+    let split_count = 5;
+    let err = oms
+        .output_manager_handle
+        .create_coin_split_even(vec![uo.commitment().clone()], split_count, MicroMinotari::from(1000))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, OutputManagerError::NotEnoughFunds));
 }
 
 /// An uneven split takes a fixed amount per output and leaves the rest as change, so this exercises the case where

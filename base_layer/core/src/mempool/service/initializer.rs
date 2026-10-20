@@ -24,6 +24,7 @@ use std::{convert::TryFrom, sync::Arc};
 
 use futures::Stream;
 use log::*;
+use tari_comms::connectivity::ConnectivityRequester;
 use tari_comms_dht::Dht;
 use tari_p2p::{
     comms_connector::{PeerMessage, SubscriptionFactory},
@@ -46,6 +47,7 @@ use crate::{
         mempool::Mempool,
         service::{
             MempoolHandle,
+            PeerBanPeriods,
             inbound_handlers::MempoolInboundHandlers,
             local_service::LocalMempoolService,
             outbound_interface::OutboundMempoolServiceInterface,
@@ -53,6 +55,7 @@ use crate::{
         },
     },
     proto,
+    proto::transaction::TransactionProtoConversionError,
 };
 const LOG_TARGET: &str = "c::bn::mempool_service::initializer";
 const SUBSCRIPTION_LABEL: &str = "Mempool";
@@ -61,14 +64,20 @@ const SUBSCRIPTION_LABEL: &str = "Mempool";
 pub struct MempoolServiceInitializer {
     mempool: Mempool,
     inbound_message_subscription_factory: Arc<SubscriptionFactory>,
+    ban_periods: PeerBanPeriods,
 }
 
 impl MempoolServiceInitializer {
     /// Create a new MempoolServiceInitializer from the inbound message subscriber.
-    pub fn new(mempool: Mempool, inbound_message_subscription_factory: Arc<SubscriptionFactory>) -> Self {
+    pub fn new(
+        mempool: Mempool,
+        inbound_message_subscription_factory: Arc<SubscriptionFactory>,
+        ban_periods: PeerBanPeriods,
+    ) -> Self {
         Self {
             mempool,
             inbound_message_subscription_factory,
+            ban_periods,
         }
     }
 
@@ -80,29 +89,49 @@ impl MempoolServiceInitializer {
     }
 }
 
-/// Decode an inbound transaction message. Returns `None` (after logging a warning) if the message cannot be decoded or
-/// the transaction is ill-formed. This is CPU-bound, and must be run on a blocking thread.
-pub(crate) fn extract_transaction(msg: &PeerMessage) -> Option<DomainMessage<Transaction>> {
-    match msg.decode_message::<proto::types::Transaction>() {
+/// Why an inbound transaction message was not decoded
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExtractTransactionError {
+    #[error("Could not decode inbound transaction message: {0}")]
+    Undecodable(String),
+    #[error("Inbound transaction message was ill-formed: {0}")]
+    IllFormed(String),
+    #[error("Transaction covenant exceeds token limit")]
+    CovenantTokenLimit,
+}
+
+/// Decode an inbound transaction message. Returns an error (after logging a warning) if the message cannot be decoded
+/// or the transaction is ill-formed. This is CPU-bound, and must be run on a blocking thread.
+pub(crate) fn extract_transaction(msg: &PeerMessage) -> Result<DomainMessage<Transaction>, ExtractTransactionError> {
+    match msg.decode_message_with_max_items::<proto::types::Transaction>(proto::MESSAGE_MAX_DECODE_ITEMS) {
         Err(e) => {
             warn!(
                 target: LOG_TARGET,
                 "Could not decode inbound transaction message. {e}"
             );
-            None
+            Err(ExtractTransactionError::Undecodable(e.to_string()))
         },
         Ok(tx) => {
             let tx = match Transaction::try_from(tx) {
+                Err(TransactionProtoConversionError::CovenantTokenLimit(e)) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Inbound transaction message from {} has a covenant over the token limit. {}",
+                        msg.source_peer.public_key,
+                        e
+                    );
+                    return Err(ExtractTransactionError::CovenantTokenLimit);
+                },
                 Err(e) => {
                     warn!(
                         target: LOG_TARGET,
                         "Inbound transaction message from {} was ill-formed. {}", msg.source_peer.public_key, e
                     );
-                    return None;
+                    return Err(ExtractTransactionError::IllFormed(e.to_string()));
                 },
                 Ok(b) => b,
             };
-            Some(DomainMessage {
+            Ok(DomainMessage {
                 source_peer: msg.source_peer.clone(),
                 dht_header: msg.dht_header.clone(),
                 authenticated_origin: msg.authenticated_origin.clone(),
@@ -128,6 +157,7 @@ impl ServiceInitializer for MempoolServiceInitializer {
         let outbound_mp_interface = OutboundMempoolServiceInterface::new(outbound_tx_sender);
         let local_mp_interface = LocalMempoolService::new(local_request_sender_service);
         let inbound_handlers = MempoolInboundHandlers::new(self.mempool.clone(), outbound_mp_interface.clone());
+        let ban_periods = self.ban_periods;
 
         // Register handle to OutboundMempoolServiceInterface before waiting for handles to be ready
         context.register_handle(outbound_mp_interface);
@@ -136,6 +166,8 @@ impl ServiceInitializer for MempoolServiceInitializer {
         context.spawn_until_shutdown(move |handles| {
             let outbound_message_service = handles.expect_handle::<Dht>().outbound_requester();
             let base_node = handles.expect_handle::<LocalNodeCommsInterface>();
+            let connectivity = handles.expect_handle::<ConnectivityRequester>();
+            let inbound_handlers = inbound_handlers.with_peer_bans(connectivity, ban_periods);
 
             let streams = MempoolStreams {
                 outbound_tx_stream,
@@ -149,5 +181,37 @@ impl ServiceInitializer for MempoolServiceInitializer {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tari_p2p::tari_message::TariMessageType;
+
+    use super::*;
+    use crate::test_helpers::create_peer_message;
+
+    /// `key, length` header of field `tag`
+    fn len_header(tag: u32, len: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut buf);
+        prost::encoding::encode_varint(len as u64, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn a_transaction_message_of_empty_inputs_is_rejected_before_decoding() {
+        // Nearly a whole 8 MiB messaging frame of empty `Transaction.body.inputs`: two bytes each on the wire, a whole
+        // struct each once decoded (~1 GB). Built from wire bytes, since building the structs would cost the same.
+        let inputs = len_header(1, 0).repeat(4_000_000);
+        let mut body = len_header(2, inputs.len());
+        body.extend_from_slice(&inputs);
+        let msg = create_peer_message(TariMessageType::NewTransaction, body);
+
+        let err = msg
+            .decode_message_with_max_items::<proto::types::Transaction>(proto::MESSAGE_MAX_DECODE_ITEMS)
+            .unwrap_err();
+        assert!(err.to_string().contains("decode budget"), "{err}");
+        assert!(extract_transaction(&msg).is_err());
     }
 }

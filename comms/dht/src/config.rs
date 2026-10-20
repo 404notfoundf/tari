@@ -48,7 +48,9 @@ const MIN_ON_CONNECT_RESYNC_TTL: Duration = Duration::from_secs(60);
 pub struct DhtConfig {
     /// The major protocol version to use. Default: DhtProtocolVersion::latest()
     pub protocol_version: DhtProtocolVersion,
-    /// The `DbConnectionUrl` for the Dht database. Default: In-memory database
+    /// The `DbConnectionUrl` for the Dht database. Default: `dht.sqlite` under the data directory (set by the p2p
+    /// config; `DhtConfig::default()` itself uses `:memory:`). `:memory:` is accepted only with a single connection
+    /// and is lost on restart.
     pub database_url: DbConnectionUrl,
     /// The number of peers to connect to as part of the managed peer pool.
     /// Default: 8
@@ -101,11 +103,12 @@ pub struct DhtConfig {
     #[serde(with = "serializers::seconds")]
     pub ban_duration_short: Duration,
     /// The maximum number of messages over `flood_ban_timespan` to allow before banning the peer (for
-    /// `ban_duration_short`) Default: 100_000 messages
+    /// `ban_duration_short`). The DHT keeps the times of up to this many messages plus one per peer.
+    /// Default: 1000 messages
     pub flood_ban_max_msg_count: usize,
     /// The timespan over which to calculate the max message rate.
-    /// `flood_ban_max_count / flood_ban_timespan (as seconds) = avg. messages per second over the timespan`
-    /// Default: 100 seconds
+    /// `flood_ban_max_msg_count / flood_ban_timespan (as seconds) = avg. messages per second over the timespan`
+    /// Default: 60 seconds
     #[serde(with = "serializers::seconds")]
     pub flood_ban_timespan: Duration,
     /// Once a peer has been marked as offline, wait at least this length of time before reconsidering them.

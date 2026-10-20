@@ -47,7 +47,7 @@ To iterate against a simulator you leave running:
 SPECULOS_APDU_ADDRESS=$(./scripts/ledger_speculos.sh address nanosplus default) \
 SPECULOS_API_ADDRESS=$(./scripts/ledger_speculos.sh api-address nanosplus default) \
 SPECULOS_MODEL=nanosplus SPECULOS_SEED_ID=default \
-  cargo test --locked --manifest-path applications/minotari_ledger_wallet/comms_testing/Cargo.toml -- \
+  cargo test --manifest-path applications/minotari_ledger_wallet/comms_testing/Cargo.toml -- \
     --ignored --test-threads=1 --skip a_wrong_length_payload_does_not_block_on_a_button_press
 ```
 
@@ -290,9 +290,11 @@ account silently moved.
 
 ## The review screen
 
-Exactly one instruction shows anything to a human: `GetOneSidedMetadataSignature` puts up a transaction review and
-does not answer until somebody approves or rejects it. `src/review.rs`, `src/approver.rs` and `src/speculos_api.rs`
-drive and assert that one screen, and `tests/speculos_review.rs` is the scenario file.
+Two instructions show anything to a human: `GetOneSidedMetadataSignature` puts up a transaction review, and
+`GetRawSchnorrSignatureLegacyNonce` puts up the pre-mine signature it is about to make (purpose, key and nonce).
+Neither answers until somebody approves or rejects it. `src/review.rs`, `src/approver.rs` and `src/speculos_api.rs`
+drive and assert those screens; `tests/speculos_review.rs` is the metadata signature scenario file, and the legacy
+nonce reviews are answered by the `legacy_nonce` scenarios.
 
 ### The assertion is the field text
 

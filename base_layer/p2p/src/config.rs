@@ -138,13 +138,52 @@ pub struct P2pConfig {
     pub allow_test_addresses: bool,
     /// The maximum number of liveness sessions allowed for the connection listener.
     /// Liveness sessions can be used by third party tooling to determine node liveness.
-    /// A value of 0 will disallow any liveness sessions.
+    /// A value of 0 will disallow any liveness sessions. The limit applies to the node as a whole (all listeners) and
+    /// is capped at half of the inbound handshake slots (50 by default), since each session holds a slot while open.
+    /// The node's own self-check does not need a session.
     pub listener_liveness_max_sessions: usize,
     /// If Some, enables periodic socket-level liveness checks
     #[serde(with = "serializers::optional_seconds_nonzero")]
     pub listener_self_liveness_check_interval: Option<Duration>,
     /// CIDR for addresses allowed to enter into liveness check mode on the listener.
     pub listener_liveness_allowlist_cidrs: StringList,
+    /// The longest the unauthenticated stages of an inbound connection may take in total: the wire byte, noise and
+    /// the identity exchange. Connections that take longer are closed. Peer database work and the multiplexer upgrade
+    /// are not counted. Must be greater than zero.
+    /// Default: 15 seconds
+    #[serde(with = "serializers::seconds")]
+    pub listener_handshake_timeout: Duration,
+    /// The maximum number of inbound handshakes in flight at once from a single source (an IPv4 address or an IPv6
+    /// /64). Further connections from that source are closed until one completes. Loopback sources, including Tor
+    /// inbound forwarded over loopback, are exempt. If a remote Tor forwarder or proxy delivers inbound connections,
+    /// add its address to `listener_per_ip_exempt_cidrs`. Because loopback is always exempt, a clearnet node behind a
+    /// proxy on the same host that forwards over loopback (nginx or haproxy stream, socat) gets no per-source
+    /// protection. Behind docker's userland-proxy (or any SNAT, NAT64 or Teredo translator) all peers appear to come
+    /// from one non-loopback address (for docker, the bridge gateway, e.g. 172.17.0.1) and share its limits; add that
+    /// address to `listener_per_ip_exempt_cidrs`. Prefer forwarding that preserves the source address. Must be greater
+    /// than zero.
+    /// Default: 4
+    pub listener_max_handshakes_per_ip: usize,
+    /// The maximum number of inbound connections, established and in-handshake combined. Inbound connections over
+    /// this limit are closed before any handshake. Outbound connections are not counted. The auxiliary TCP listener
+    /// has its own count and is neither counted against nor refused by this limit on the main listener (and vice
+    /// versa). Must be greater than zero.
+    /// Default: 500
+    pub max_inbound_connections: usize,
+    /// The maximum number of inbound connections, established and in-handshake combined, from a single source (an
+    /// IPv4 address or an IPv6 /64), counted per listener. Same exemptions as `listener_max_handshakes_per_ip`. Many
+    /// hosts can share one egress address (VPN, Tor exit, CGNAT, SNAT), and one of them can hold all of that
+    /// address's slots and lock the others out; `listener_per_ip_exempt_cidrs` is the escape hatch for proxies and
+    /// SNAT you control. Loopback sources are always exempt (see `listener_max_handshakes_per_ip`). Must be greater
+    /// than zero.
+    /// Default: 32
+    pub max_inbound_connections_per_ip: usize,
+    /// CIDRs exempt from the per-source inbound limits (`listener_max_handshakes_per_ip` and
+    /// `max_inbound_connections_per_ip`), in addition to loopback, which is always exempt. Every connection forwarded
+    /// by a remote Tor forwarder, proxy or SNAT appears to come from its address, so add that address here.
+    /// IPv4-mapped IPv6 CIDRs are treated as their IPv4 form.
+    /// Default: empty
+    pub listener_per_ip_exempt_cidrs: StringList,
     /// The address to bind on using the TCP transport _in addition to_ the primary transport. This is typically useful
     /// for direct comms between a wallet and base node. If this is set to None, no listener will be bound.
     /// Default: None
@@ -191,6 +230,21 @@ pub struct P2pConfig {
     /// `P2pInitializer` clamps it below the pool size and warns if this is set into conflict.
     /// Default: 8
     pub proactive_dialing_floor: usize,
+    /// Once more than this many inbound connections are open, the connection reaper closes idle inbound connections,
+    /// oldest first, until the count is back at this limit. Inbound connections are not counted towards the
+    /// outbound reaping threshold, so remote peers cannot evict the connections this node chose.
+    /// Default: 400
+    pub reaper_inbound_soft_limit: usize,
+    /// The most peers with addresses kept in the peer database. Above this, peers that have never been reached on any
+    /// address are removed, oldest first. Seed peers, peers with a configured address and banned peers are kept.
+    /// Peers without any address (mostly rows that only record a handshake ban) are capped separately at a fifth of
+    /// this, soonest-ending ban removed first.
+    /// Default: 50,000
+    pub max_peer_rows: usize,
+    /// The most addresses taken from any one network group (IPv4 /16, IPv6 /32, an onion or DNS name) when selecting
+    /// peers to dial, so that one operator cannot fill the list. 0 disables the cap.
+    /// Default: 4
+    pub max_candidates_per_netgroup: usize,
 }
 
 impl Default for P2pConfig {
@@ -212,6 +266,11 @@ impl Default for P2pConfig {
             listener_liveness_max_sessions: 0,
             listener_self_liveness_check_interval: None,
             listener_liveness_allowlist_cidrs: StringList::default(),
+            listener_handshake_timeout: Duration::from_secs(15),
+            listener_max_handshakes_per_ip: 4,
+            max_inbound_connections: 500,
+            max_inbound_connections_per_ip: 32,
+            listener_per_ip_exempt_cidrs: StringList::default(),
             auxiliary_tcp_listener_address: None,
             rpc_max_simultaneous_sessions: 100,
             rpc_max_sessions_per_peer: 10,
@@ -221,6 +280,9 @@ impl Default for P2pConfig {
             max_seed_peer_age: Duration::from_secs(15 * 60),
             proactive_dialing_enabled: true,
             proactive_dialing_floor: 8,
+            reaper_inbound_soft_limit: 400,
+            max_peer_rows: 50_000,
+            max_candidates_per_netgroup: 4,
         }
     }
 }

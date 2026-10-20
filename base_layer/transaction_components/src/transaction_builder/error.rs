@@ -6,7 +6,12 @@ use tari_script::ScriptError;
 use tari_utilities::ByteArrayError;
 use thiserror::Error;
 
-use crate::{MicroMinotari, key_manager::error::KeyManagerError, transaction_components::TransactionError};
+use crate::{
+    MicroMinotari,
+    key_manager::error::KeyManagerError,
+    offline_signing::PayloadNotConfirmed,
+    transaction_components::TransactionError,
+};
 
 #[derive(Debug, Error)]
 pub enum TransactionBuilderError {
@@ -85,8 +90,31 @@ pub enum TransactionBuilderError {
          exchange, so it is limited to {max} outputs including change"
     )]
     TooManyOutputsForDevice { requested: usize, max: usize },
+    #[error(
+        "The recipient address {address} is {size} bytes, but the ledger device can review a receiver address of at \
+         most {max} bytes (a payment ID of at most 112 bytes); nothing was sent to the device for review"
+    )]
+    RecipientAddressTooLongForDevice { address: String, size: usize, max: usize },
+    #[error(
+        "The recipient address {address} is a single address, but a ledger device can only sign for a dual address; \
+         nothing was sent to the device for review"
+    )]
+    RecipientAddressNotDualForDevice { address: String },
     #[error("Only a single burned output is allowed in a transaction")]
     MultipleBurnCommitments,
+    #[error(
+        "The offline signer only signs transactions that carry a change output, but this one would not: the \
+         {remainder} left over after the outputs and fee does not exceed the {change_fee} a change output would cost. \
+         Prepare the transaction again with a smaller amount."
+    )]
+    OfflineTransactionRequiresChange {
+        remainder: MicroMinotari,
+        change_fee: MicroMinotari,
+    },
+    #[error("Offline signing payload field `{field}` carries key id `{key_id}`, which is not allowed there")]
+    OfflinePayloadKeyIdNotAllowed { field: String, key_id: String },
+    #[error("{0}")]
+    PayloadNotConfirmed(#[from] PayloadNotConfirmed),
     #[error("Transaction builder error: {0}")]
     Other(String),
 }

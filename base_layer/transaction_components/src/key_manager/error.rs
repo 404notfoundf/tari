@@ -69,19 +69,47 @@ pub enum KeyManagerError {
     )]
     TooManySenderOffsetKeys { requested: usize, max: usize },
     #[error(
-        "The ephemeral nonce handle counter is exhausted. This is not a full store - a full store evicts its oldest \
-         entry - it is the one case that must refuse, because re-issuing a handle that an earlier nonce still answers \
-         to would allow that nonce to be signed with twice."
-    )]
-    EphemeralNonceHandlesExhausted,
-    #[error(
         "Ephemeral nonce handle `{handle}` was never issued, has already been signed with, or was evicted to make \
          room for a newer reservation. A nonce may only ever be used once: two signatures over different challenges \
          under one nonce give up the private key."
     )]
     UnknownEphemeralNonce { handle: u64 },
+    #[error(
+        "On a ledger wallet a device held sender offset key signs a metadata signature only through the device's \
+         reviewed one sided metadata signature, which needs the output's recipient address and the standard stealth \
+         script for it. Outputs signed with no recipient address (a multisig withdraw, custom outputs) or with any \
+         other script (plain burns, HTLC sends, a multisig deposit) are not supported on a ledger wallet."
+    )]
+    LedgerSenderOffsetNeedsRecipient,
+    #[error(
+        "On a ledger wallet a OneSidedSenderOffset key cannot sign a raw challenge, so aggregated (multi-party) \
+         sender partial metadata signatures with one are not supported on a ledger wallet. The pre-mine ceremony, \
+         whose sender offset keys are PreMine keys, is unaffected."
+    )]
+    LedgerSenderOffsetRawSignature,
+    #[error(
+        "On a ledger wallet an output signed for a recipient address must use a device held sender offset key, so \
+         that the device signs it. A host held sender offset key would put an output on chain the device never saw, \
+         so it is refused. Burns are not supported on a ledger wallet."
+    )]
+    LedgerHostHeldSenderOffset,
+    #[error(
+        "On a ledger wallet an output signed for a recipient address must use a BulletProofPlus range proof. The \
+         device signs with a random value nonce, which a RevealedValue output's balance check refuses, so the output \
+         would be rejected by consensus."
+    )]
+    LedgerRevealedValueUnsupported,
     #[error("The ephemeral nonce store lock is poisoned")]
     EphemeralNonceStorePoisoned,
+    #[error(
+        "Key id `{nonce}` cannot be used as a signing nonce: {reason}. A nonce the caller can compute or has used \
+         before gives up the private key that signed with it."
+    )]
+    InvalidNonceKeyId { nonce: String, reason: String },
+    #[error("Key id `{key}` cannot be used as a signing key: {reason}")]
+    InvalidSigningKeyId { key: String, reason: String },
+    #[error("The challenge reduces to zero, so the signature would be the nonce itself")]
+    ZeroChallenge,
     #[error("Byte array error: `{0}`")]
     ByteArrayError(String),
     #[error("Invalid range proof: `{0}`")]
@@ -90,6 +118,11 @@ pub enum KeyManagerError {
     EncryptedDataError(#[from] EncryptedDataError),
     #[error("The commitment does not open to the value and mask")]
     InvalidMask,
+    #[error(
+        "Key id `{key_id}` cannot be used as a commitment mask or recovery key: it resolves to a wallet root key (or \
+         a public tweak of one), so using it would publish that key"
+    )]
+    KeyIdNotAMask { key_id: String },
 }
 
 impl From<RangeProofError> for KeyManagerError {

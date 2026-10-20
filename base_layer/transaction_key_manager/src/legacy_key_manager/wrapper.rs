@@ -45,6 +45,7 @@ use tari_transaction_components::{
     crypto_factories::CryptoFactories,
     key_manager::{
         KeyManager,
+        RecoveryProvenance,
         SecretTransactionKeyManagerInterface,
         TariKeyAndId,
         TariKeyId,
@@ -57,10 +58,12 @@ use tari_transaction_components::{
         EncryptedData,
         KernelFeatures,
         MemoField,
+        OutputFeatures,
         RangeProofType,
         TransactionInputVersion,
         TransactionKernelVersion,
         TransactionOutputVersion,
+        covenants::Covenant,
     },
 };
 
@@ -362,7 +365,7 @@ where TBackend: TransactionKeyManagerBackend + 'static
         commitment: &CompressedCommitment,
         encrypted_data: &EncryptedData,
         sender_offset_public_key: &CompressedPublicKey,
-    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField)>, KeyManagerError> {
+    ) -> Result<Option<(TariKeyId, MicroMinotari, MemoField, RecoveryProvenance)>, KeyManagerError> {
         self.transaction_key_manager_inner
             .try_output_key_recovery(commitment, encrypted_data, sender_offset_public_key)
     }
@@ -411,8 +414,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
         value: MicroMinotari,
         sender_offset_key_id: &TariKeyId,
         txo_version: TransactionOutputVersion,
-        metadata_signature_message_common: &[u8; 32],
-        range_proof_type: RangeProofType,
+        features: &OutputFeatures,
+        covenant: &Covenant,
+        encrypted_data: &EncryptedData,
+        minimum_value_promise: MicroMinotari,
         script: &TariScript,
         receiver_address: &TariAddress,
     ) -> Result<ComAndPubSignature, KeyManagerError> {
@@ -421,8 +426,10 @@ where TBackend: TransactionKeyManagerBackend + 'static
             value,
             sender_offset_key_id,
             txo_version,
-            metadata_signature_message_common,
-            range_proof_type,
+            features,
+            covenant,
+            encrypted_data,
+            minimum_value_promise,
             script,
             receiver_address,
         )

@@ -62,9 +62,14 @@ pub use keys::{
     GetViewKeyRequest,
 };
 pub use metadata::{
-    GetOneSidedMetadataSignatureRequest,
-    OneSidedMetadataSignatureHead,
-    OneSidedMetadataSignatureTail,
+    MAX_APDU_DATA_SIZE,
+    MAX_METADATA_SIGNATURE_ADDRESS_SIZE,
+    MetadataSignatureChunk,
+    MetadataSignatureChunkBody,
+    MetadataSignatureHeadChunk,
+    MetadataSignatureRequest,
+    PREIMAGE_CHUNK_SIZE,
+    PreimageSizeOutOfRange,
     ReceiverAddressTooLong,
 };
 pub use nonce::{
@@ -336,10 +341,14 @@ mod test {
                 })
             },
             Instruction::GetOneSidedMetadataSignature => || {
-                registered(
-                    &GetOneSidedMetadataSignatureRequest::new(1, 2, 3, 4, 5, &KEY, &[0x22; 67], &KEY)
-                        .expect("a 67 byte address fits its length prefix"),
-                )
+                registered(&MetadataSignatureChunk {
+                    chunk_number: 0,
+                    more: true,
+                    body: MetadataSignatureChunkBody::Head(
+                        MetadataSignatureHeadChunk::new(1, 2, 3, 6, 5, &KEY, 120, &[0x22; 67])
+                            .expect("a 67 byte address fits its length prefix"),
+                    ),
+                })
             },
             Instruction::GetScriptSignatureManaged => || {
                 registered(&GetScriptSignatureManagedRequest {

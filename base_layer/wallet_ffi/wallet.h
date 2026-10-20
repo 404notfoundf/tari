@@ -33,6 +33,9 @@ enum TariUtxoSort {
  */
 struct Balance;
 
+/**
+ * Decoded through [`ValidatedDecode`], so every decoder rejects more than `MAX_RANGE_PROOF_BYTES` bytes.
+ */
 struct BulletRangeProof;
 
 struct ByteVector;
@@ -54,6 +57,8 @@ struct CompressedKey_RistrettoPublicKey;
 /**
  * A covenant allows a UTXO to specify some restrictions on how it is spent in a future transaction.
  * See https://rfc.tari.com/RFC-0250_Covenants.html for details.
+ *
+ * The covenant is kept as its canonical encoding and is only split into tokens when it is evaluated.
  */
 struct Covenant;
 
@@ -121,8 +126,6 @@ struct TariPendingOutboundTransactions;
 
 struct TariSeedWords;
 
-struct TariUnblindedOutputs;
-
 struct TariWallet;
 
 /**
@@ -143,8 +146,11 @@ struct TransactionSendStatus;
 
 /**
  * An unblinded output is one where the value and spending key (blinding factor) are known. This can be used to
- * build both inputs and outputs (every input comes from an output). This is only used for import and export where
- * serialization is important.
+ * build both inputs and outputs (every input comes from an output). This is only used to import outputs whose keys
+ * were created outside this wallet, where serialization is important.
+ *
+ * There is intentionally no way to build one from a wallet's own output: a wallet's script private key is
+ * `H("script key", mask) + alpha`, so exporting the mask and script key of any of its outputs reveals the spend key.
  */
 struct UnblindedOutput;
 
@@ -1256,79 +1262,6 @@ TariUnblindedOutput *create_tari_unblinded_output_from_json(const char *output_j
                                                             int *error_out);
 
 /**
- * -------------------------------------------------------------------------------------------- ///
- * ----------------------------------- TariUnblindedOutputs ------------------------------------///
- * Gets the length of TariUnblindedOutputs
- *
- * ## Arguments
- * `outputs` - The pointer to a TariUnblindedOutputs
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter. Returns a null pointer if any pointer argument is null.
- *
- * ## Returns
- * `c_uint` - Returns number of elements in, zero if any pointer is null.
- *
- * # Safety
- * None
- */
-unsigned int unblinded_outputs_get_length(struct TariUnblindedOutputs *outputs,
-                                          int *error_out);
-
-/**
- * Gets a TariUnblindedOutput from TariUnblindedOutputs at position
- *
- * ## Arguments
- * `outputs` - The pointer to a TariUnblindedOutputs
- * `position` - The integer position
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter. Returns a null pointer if any pointer argument is null.
- *
- * ## Returns
- * `*mut TariUnblindedOutput` - Returns a TariUnblindedOutput, note that it returns ptr::null_mut() if
- * TariUnblindedOutputs is null or position is invalid
- *
- * # Safety
- * The ```unblinded_outputs_destroy``` method must be called when finished with a TariUnblindedOutputs to prevent a
- * memory leak
- */
-TariUnblindedOutput *unblinded_outputs_get_at(struct TariUnblindedOutputs *outputs,
-                                              unsigned int position,
-                                              int *error_out);
-
-/**
- * Frees memory for a TariUnblindedOutputs
- *
- * ## Arguments
- * `outputs` - The pointer to a TariUnblindedOutputs
- *
- * ## Returns
- * `()` - Does not return a value, equivalent to void in C
- *
- * # Safety
- * None
- */
-void unblinded_outputs_destroy(struct TariUnblindedOutputs *outputs);
-
-/**
- * Get the TariUnblindedOutputs from a TariWallet
- *
- * ## Arguments
- * `wallet` - The TariWallet pointer
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter. Returns a null pointer if any pointer argument is null.
- *
- * ## Returns
- * `*mut TariUnblindedOutputs` - returns the unspent unblinded outputs, note that it returns ptr::null_mut() if
- * wallet is null
- *
- * # Safety
- * The ```unblinded_outputs_destroy``` method must be called when finished with a TariUnblindedOutput to prevent a
- * memory leak
- */
-struct TariUnblindedOutputs *wallet_get_unspent_outputs(struct TariWallet *wallet,
-                                                        int *error_out);
-
-/**
  * Import an external UTXO into the wallet as a non-rewindable (i.e. non-recoverable) output. This will add a spendable
  * UTXO (as EncumberedToBeReceived) and create a faux completed transaction to record the event.
  *
@@ -2064,6 +1997,8 @@ TariTransactionKernel *completed_transaction_get_transaction_kernel(TariComplete
 /**
  * Gets the source TariWalletAddress of a TariCompletedTransaction
  *
+ * For inbound transactions recovered from the chain, these are taken from the sender's memo and are not authenticated.
+ *
  * ## Arguments
  * `transaction` - The pointer to a TariCompletedTransaction
  * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
@@ -2285,6 +2220,8 @@ struct ByteVector *completed_transaction_get_payment_id_as_bytes(TariCompletedTr
 
 /**
  * Extract the transaction type from a TariCompletedTransaction
+ *
+ * For inbound transactions recovered from the chain, these are taken from the sender's memo and are not authenticated.
  *
  * ## Arguments
  * `transaction` - The completed transaction
