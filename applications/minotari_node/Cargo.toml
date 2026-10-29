@@ -75,8 +75,8 @@ tari_metrics = { workspace = true, optional = true, features = ["server"] }
 url = { version = "2.5.4", features = ["default", "serde"] }
 axum = { version = "0.8.4", features = ["default", "http2"] }
 http = "0.2.12"
-utoipa = "5.3.1"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa = "6.0.0"
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 tower-http = { version = "0.6", features = ["limit"] }
 # XMRig proxy dependencies
 bytes = "1.1"
@@ -88,7 +88,7 @@ monero = { version = "0.21.0", features = ["serde"] }
 
 [features]
 default = ["libtor", "mimalloc"]
-metrics = ["tari_metrics", "tari_comms/metrics"]
+metrics = ["tari_metrics", "tari_comms/metrics", "tari_comms_dht/metrics"]
 safe = []
 libtor = ["tari_libtor"]
 # Use mimalloc as the global allocator of the `minotari_node` binary instead of the system allocator (glibc malloc on

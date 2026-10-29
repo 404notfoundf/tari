@@ -517,6 +517,10 @@ where
             TransactionServiceRequest::PrepareDepositMultisigTransaction { request } => {
                 async {
                     self.verify_send(&request.recipient_address, TariAddressFeatures::create_one_sided_only())?;
+                    // Checked before any input is locked; the offline signer needs the recipient's view key.
+                    if request.recipient_address.public_view_key().is_none() {
+                        return Err(TransactionError::BuilderError("Missing public view key".to_string()).into());
+                    }
 
                     let temp_tx_id = TxId::new_random();
                     let script = push_pubkey_script(&Default::default());
@@ -3206,13 +3210,13 @@ where
                     amount,
                     burn_features_and_scripts_size,
                 )])?;
-                tx_builder.add_recipient(Default::default(), output, r.key_id.clone(), Some(recovery_key_id))?;
+                tx_builder.add_burn_recipient(output, r.key_id.clone(), Some(recovery_key_id))?;
             },
             // A plain burn has no L2 to decrypt the payload, so it falls back to the L1 view key and its sender
             // offset key comes from the builder's single reservation like any other output.
             None => {
                 tx_builder.with_recipient_spec(
-                    RecipientSpec::to_self(amount, output_features, payment_id.clone())
+                    RecipientSpec::burn(amount, output_features, payment_id.clone())
                         .with_script(script!(Nop)?)
                         .with_script_key(RecipientScriptKey::Zero),
                 )?;
@@ -3609,7 +3613,21 @@ where
 
     /// Cancel a pending transaction
     async fn cancel_pending_transaction(&mut self, tx_id: TxId) -> Result<(), TransactionServiceError> {
-        let transaction = self.db.get_any_transaction(tx_id)?;
+        let transaction = match self.db.get_any_transaction(tx_id) {
+            Ok(transaction) => transaction,
+            // A pending outbound row stored by an older version may no longer decode; it is still cancelled so that
+            // its inputs are released
+            Err(
+                e @ (TransactionStorageError::BincodeDeserialize(_) | TransactionStorageError::TransactionKeyError(_)),
+            ) if self.db.pending_outbound_transaction_exists(tx_id)? => {
+                warn!(
+                    target: LOG_TARGET,
+                    "Pending outbound transaction {tx_id} could not be decoded ({e}); cancelling it to release its inputs"
+                );
+                None
+            },
+            Err(e) => return Err(e.into()),
+        };
 
         if let Some(transaction) = transaction {
             if transaction.is_mined() {
@@ -4425,6 +4443,22 @@ where
         address: &TariAddress,
         sending_method: TariAddressFeatures,
     ) -> Result<(), TransactionServiceError> {
+        let mut keys = vec![("spend", address.public_spend_key())];
+        if let Some(view_key) = address.public_view_key() {
+            keys.push(("view", view_key));
+        }
+        for (name, key) in keys {
+            if *key == CompressedPublicKey::default() {
+                return Err(TransactionServiceError::InvalidAddress(format!(
+                    "Address {name} key is the identity point"
+                )));
+            }
+            if key.to_public_key().is_err() {
+                return Err(TransactionServiceError::InvalidAddress(format!(
+                    "Address {name} key is not a valid point"
+                )));
+            }
+        }
         if address.network() != self.resources.one_sided_tari_address.network() {
             return Err(TransactionServiceError::InvalidNetwork);
         }
