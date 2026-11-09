@@ -1,4 +1,8 @@
-# 上游 Release 报告：{{tag}}
+# 🤖 上游 Release 报告：{{tag}}
+
+> 此报告由你配置的模型辅助生成，用来判断要不要在本机执行 `/merge-upstream`。它不 merge，也不 push。
+
+---
 
 ## 1. 范围
 
@@ -41,58 +45,3 @@ Class C，双方都改过。其它源码冲突时问人：
 
 Class B 不在预设名单里。真正 merge 时，版本号、`Cargo.lock`、生成物才会自动采用官方。
 {{footer}}
-<!-- appendix -->
-## 附录
-
-这份附录是完整的，没有按 Issue 字数截断。关键词命中不是升级结论。
-
-### 提交说明关键词
-
-{{important}}
-
-### 可疑新增行
-
-```text
-{{suspicious}}
-```
-
-### 发行说明
-
-{{notes}}
-
-### changelog
-
-```markdown
-{{changelog}}
-```
-
-### 节点和钱包改动统计
-
-```text
-{{focus_stat}}
-```
-
-### 全仓库改动统计
-
-```text
-{{stat}}
-```
-
-### 预设重点文件：上游一侧
-
-```diff
-{{upstream_diff}}
-```
-
-### 预设重点文件：Fork 一侧
-
-```diff
-{{fork_diff}}
-```
-
-### 本地复核
-
-```bash
-git fetch https://github.com/{{upstream_repo}}.git tag {{tag}}
-git diff {{branch}}...{{tag}}
-```

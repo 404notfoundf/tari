@@ -203,7 +203,7 @@ def render_report_parts(values):
         template = handle.read()
     head, separator, appendix = template.partition("<!-- appendix -->")
     if not separator:
-        raise RuntimeError("upstream_release_report.md is missing the appendix marker.")
+        appendix = ""
 
     def fill(part):
         def replace(match):
@@ -216,7 +216,7 @@ def render_report_parts(values):
     return fill(head), fill(appendix)
 
 
-def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff, focus_stat, stat, changelog, commits, other_commit_count, suspicious):
+def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff, changelog, commits, other_commit_count, suspicious):
     tag = release["tag_name"]
     branch = os.environ["COMPARE_BRANCH"]
     notes = (release.get("body") or "").replace("\r\n", "\n").strip()
@@ -224,27 +224,6 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
         notes = "（这个 tag 没有 GitHub Release 正文，下面是 changelog 开头。）"
     url = release.get("html_url") or f"https://github.com/{os.environ['UPSTREAM_REPO']}/releases/tag/{tag}"
     status = f"`{branch}` 还没有包含 `{tag}`。详细对比只包括节点和钱包；其它目录有 {other_commit_count} 个提交未展开。"
-
-    rules = [
-        ("内存", ("leak", "memory", "oom", "alloc", "rss", "heap")),
-        ("安全", ("security", "auth", "dos", "vuln", "secret", "sanitiz", "ban")),
-        ("共识与同步", ("consensus", "validat", "orphan", "difficulty", "sync", "reorg")),
-        ("协议", ("protocol", "grpc", "negotiat")),
-        ("稳定性", ("panic", "crash", "deadlock", "race", "hang", "spin", "timeout")),
-    ]
-    grouped = {title: [] for title, _words in rules}
-    for line in commits.splitlines():
-        low = line.lower()
-        for title, words in rules:
-            if any(word in low for word in words):
-                grouped[title].append(line)
-                break
-    important_parts = []
-    for title, _words in rules:
-        hits = grouped[title]
-        if hits:
-            important_parts.append("### " + title + "\n\n" + "\n".join(f"- `{item}`" for item in hits))
-    important = "\n\n".join(important_parts) if important_parts else "（提交说明里没有命中内存、安全、共识、协议、稳定性这些关键词。这不代表没有这类改动。）"
 
     ai = summarize(notes, commits, focus_diff, diff, fork_diff, suspicious, both_names, only_upstream, tag)
     class_a_names = set(CLASS_A)
@@ -265,7 +244,7 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
     mention = " ".join(f"@{login}" for login in notify_logins())
     footer = "\n".join([
         "",
-        "完整报告在这次 Actions 运行的 Artifact `upstream-release-report` 里，包含未截断的附录。" + (f" 运行结束后下载：{run_url}" if run_url else ""),
+        "完整分析在这次 Actions 运行的 Artifact `upstream-release-report` 里。" + (f" 运行结束后下载：{run_url}" if run_url else ""),
         mention,
     ])
     values = {
@@ -279,18 +258,9 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
         "class_c_overlap": listed(class_c_overlap),
         "only_upstream": listed(only_upstream),
         "footer": "",
-        "important": important,
-        "suspicious": suspicious.strip() or "（没有命中外联、执行命令、反序列化绕过或依赖地址）",
-        "notes": notes,
-        "changelog": changelog.rstrip() or "（没有）",
-        "focus_stat": focus_stat.rstrip() or "（节点和钱包没有差异）",
-        "stat": stat.rstrip() or "（没有差异）",
-        "upstream_diff": diff.rstrip() or "（这些路径没有上游 diff）",
-        "fork_diff": fork_diff.rstrip() or "（没有双方都改过的预设文件）",
-        "upstream_repo": os.environ["UPSTREAM_REPO"],
     }
     head, appendix = render_report_parts(values)
-    full_report = head + "\n" + appendix
+    full_report = head if not appendix.strip() else head + "\n" + appendix
     issue_analysis = values["analysis"]
     if len(issue_analysis) > 12000:
         issue_analysis = issue_analysis[:12000] + "\n\n…（Issue 里的分析到这里为止。完整分析在 Artifact 的报告文件中。）"
@@ -454,8 +424,6 @@ def main():
     base = run(["git", "merge-base", branch, tag], check=False)
     fork_diff = git_text(["diff", base.stdout.strip(), branch, "--", *both_names]) if both_names and base.returncode == 0 else ""
     focus_diff = git_text(["diff", f"{branch}...{tag}", "--", *FOCUS])
-    focus_stat = git_text(["diff", "--stat", f"{branch}...{tag}", "--", *FOCUS])
-    stat = git_text(["diff", "--stat", f"{branch}...{tag}"])
     changelog = git_text(["show", f"{tag}:changelog-development.md"])
     focus_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}", "--", *FOCUS])))
     all_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}"])))
@@ -464,7 +432,7 @@ def main():
     suspicious = suspicious_text(focus_diff)
 
     issue_body, full_report, run_url = build_issue(
-        release, both_names, only_upstream, diff, fork_diff, focus_diff, focus_stat, stat, changelog, commits, other_commit_count, suspicious,
+        release, both_names, only_upstream, diff, fork_diff, focus_diff, changelog, commits, other_commit_count, suspicious,
     )
     repo = os.environ["GITHUB_REPOSITORY"]
     run(
