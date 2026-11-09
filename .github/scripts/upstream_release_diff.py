@@ -8,6 +8,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 CLASS_A = [
     "applications/minotari_app_grpc/proto/base_node.proto",
@@ -39,15 +40,19 @@ FOCUS = [
     "clients/rust/wallet_grpc_client",
     "clients/rust/base_node_wallet_client",
 ]
-SUSPICIOUS_RE = re.compile(
-    r"curl |wget |bash -c|powershell|cmd\.exe|nc -|socket\.connect|0\.0\.0\.0|"
-    r"base64::decode|from_utf8_unchecked|mem::transmute|Command::new|std::process|"
-    r"eval\(|/dev/tcp|git = ",
+SKIP_PATH_RE = re.compile(
+    r"(^|/)(tests?|benches|examples|docs)(/|$)|_tests?\.rs$|/tests\.rs$|\.md$|\.rst$",
     re.IGNORECASE,
 )
-URL_RE = re.compile(r"^\+.*https?://", re.IGNORECASE)
-URL_SKIP_RE = re.compile(
-    r"github.com|githubusercontent.com|docs.rs|rust-lang.org|ietf.org|unicode.org|crates.io|tari.com",
+KEEP_PATH_RE = re.compile(
+    r"consensus|hard_fork|sync|mempool|wallet|grpc|auth|coinbase|validat|chain_storage|"
+    r"difficulty|reorg|transaction|kernel|proof_of_work|randomx|mining|header|"
+    r"sqlite|export|utxo|key_manager|fee|identity|ban",
+    re.IGNORECASE,
+)
+IMPORTANT_LINE_RE = re.compile(
+    r"unsafe|transmute|mem::forget|Box::leak|alloc|with_capacity|password|secret|spend_key|"
+    r"private_key|auth|Command::new|std::process|Mutex|RwLock|hard_fork|RandomX|leak",
     re.IGNORECASE,
 )
 SYSTEM_PROMPT = """# 角色与目标
@@ -79,25 +84,23 @@ P3：低影响变化。不能只凭关键词定级。证据不足不要给 P0。
 分段审查时用简体中文。每条写成「[P等级][已确认/可能影响/待验证] 路径或短哈希 — 变化；影响；要核对什么」。
 没有发现就只写「这段没有」。最终汇总的段落结构以该次用户消息为准。"""
 SOURCE_INSTRUCTIONS = {
-    "发行说明": """只提取与节点、钱包、共识、同步、gRPC 相关的重要变化。merge-mining proxy 不是重点，不要单独展开。
+    "发行说明": """只提取节点、钱包、共识、同步、gRPC 相关的重要变化。merge-mining proxy 不是重点，不要单独展开。
+必须单独写出，不能并进笼统摘要：硬分叉及激活高度、必须在该高度前升级、共识或挖矿漏洞（例如 RandomX、区块头校验）、破坏性变更（数据库落盘格式、WAL、文件权限、钱包导出）、私钥或 spend key 泄露、内存占用或泄漏、崩溃、认证绕过。
 每项写：上游声称的变化、关联模块、可能影响、应查证的代码。全部标记[待验证]。
 不得因为 Notes 提到修复就宣称代码已修复。不要下恶意行为定论。""",
     "重点提交": """从提交描述识别共识、同步、稳定性、安全、钱包、API 和重要依赖变化。
+硬分叉、激活高度、破坏性变更、私钥或 spend key 泄露、内存、共识或挖矿漏洞必须写出。
 保留输入中的原始哈希，短哈希不得补全。只有标题时一律[待验证]，并指出需要哪一块 Diff。
 不要根据单个关键词推断漏洞。""",
-    "上游重点模块 Diff": """这是共同祖先到上游 Tag 的代码 Diff，只含上游修改，覆盖节点、钱包、base_layer/core、gRPC 和对应 client。
-选出行为上重要的修改，说明逻辑变化、触发条件和潜在后果。
-重点：共识/同步、交易/钱包、gRPC、资源生命周期和依赖。不要展开 merge-mining proxy。
-文件路径取本段 diff --git 或 +++ b/ 那一行。不推断 Fork 的修改。""",
+    "上游重点模块 Diff": """这是共同祖先到上游 Tag 的代码 Diff，只含上游修改。测试、文档和仅空白变化已去掉。
+选出行为上重要的修改。必须标出：硬分叉或共识规则、激活高度、挖矿或区块头校验、钱包资金与导出、gRPC 与认证、数据库落盘、内存增长或泄漏、死锁、崩溃。
+文件路径取本段 diff --git 或 +++ b/ 那一行。不推断 Fork 的修改，也不要把没出现的文件说成已审过。""",
     "重叠重点文件-上游 Diff": """这些预设重点文件 Fork 和上游都改过。本段只展示上游一侧。
 识别上游在公开 API、配置、协议、状态机、锁、错误处理上的变化，写出需要和 Fork 核对的位置。
 不要声称已经发现 Git 冲突。""",
     "重叠重点文件-Fork Diff": """这是共同祖先到 Fork develop 的代码 Diff，只包含双方都改过的预设重点文件。
 总结 Fork 这里要保留的行为，并引用本段里的文件路径。本段没有上游实现，不要单独判断兼容。
 指出应和上游的哪类改动对照。""",
-    "可疑新增行": """这些是规则命中的上游新增行，没有文件名，多数是误报。
-只保留需要复核的信号：不可信下载并执行、私钥或第三方 API 密钥、认证绕过、故意削弱校验、异常外联、把依赖换成非 crates.io 或非官方 git。
-孤立片段标[待验证]，引用该行，不要编文件路径，不要直接定性为恶意。""",
 }
 FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护者写结论。
 只引用分段里有依据的发现，不新增事实，合并重复项。按证据定级，不按关键词定级。
@@ -122,10 +125,11 @@ skill 的行为是：新建 feat/merge-<tag>，git merge 该 tag；结束时把 
 ## 2. 优先处理的风险
 最多 8 条，按 P0 到 P3。每条：
 [P等级][已确认/可能影响/待验证] 文件路径或短哈希 — 具体改动；触发条件与影响；要复核什么。
-没有证据就写「已检查材料未支持高优先级风险」。
+发行说明里的这些内容必须列入，不能省略：硬分叉、激活高度、必须在该高度前升级、共识或挖矿漏洞、破坏性变更（数据库落盘、钱包导出、私钥或 spend key 泄露）、内存占用或泄漏、认证绕过、崩溃。
+只有说明、diff 里看不到时标记[待验证]。没有证据就写「已检查材料未支持高优先级风险」。
 
 ## 3. 关键行为变化
-只列有发现的类别：共识/同步、钱包/交易、gRPC/客户端、并发/性能。
+只列有发现的类别：硬分叉/共识激活、共识/同步、钱包/交易、gRPC/客户端、数据库落盘、并发/内存。
 区分「Diff 证实」和「仅 Notes/Commit 声称」。不要写材料里没有的 develop 改动。
 
 ## 4. 安全审查
@@ -157,16 +161,91 @@ def names_between(left, right):
     return sorted(set(lines(text)))
 
 
-def suspicious_text(diff_text):
-    hits = []
-    for line in diff_text.splitlines():
-        if not line.startswith("+"):
+def split_diff_files(diff_text):
+    files = []
+    current = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                files.append("".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        files.append("".join(current))
+    return files
+
+
+def file_path(file_diff):
+    first = file_diff.splitlines()[0]
+    if " b/" in first:
+        return first.split(" b/", 1)[1].strip().strip('"')
+    return ""
+
+
+def has_behavior_change(file_diff):
+    for line in file_diff.splitlines():
+        if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
             continue
-        if SUSPICIOUS_RE.search(line):
-            hits.append(line)
-        elif URL_RE.search(line) and not URL_SKIP_RE.search(line):
-            hits.append(line)
-    return "\n".join(hits)
+        if line[1:].strip():
+            return True
+    return False
+
+
+def keep_file(path, file_diff):
+    if not path or SKIP_PATH_RE.search(path):
+        return False
+    if not has_behavior_change(file_diff):
+        return False
+    if path in PATHS or any(path.endswith(item) for item in PATHS):
+        return True
+    if KEEP_PATH_RE.search(path):
+        return True
+    return bool(IMPORTANT_LINE_RE.search(file_diff))
+
+
+def narrow_diff(diff_text, limit):
+    files = split_diff_files(diff_text)
+    if not files:
+        text = (diff_text or "")[:limit]
+        note = "" if not diff_text or len(diff_text) <= limit else f"diff 超过 {limit} 字符，后面的部分没有送入模型。"
+        return text, note
+    kept = []
+    skipped = 0
+    for file_diff in files:
+        path = file_path(file_diff)
+        if not keep_file(path, file_diff):
+            skipped += 1
+            continue
+        score = 0
+        if path in PATHS or any(path.endswith(item) for item in PATHS):
+            score += 3
+        if KEEP_PATH_RE.search(path):
+            score += 2
+        if IMPORTANT_LINE_RE.search(file_diff):
+            score += 2
+        kept.append((score, path, file_diff))
+    kept.sort(key=lambda item: (-item[0], item[1]))
+    parts = []
+    size = 0
+    dropped_tail = 0
+    for _, _, file_diff in kept:
+        if size >= limit or (parts and size + len(file_diff) > limit):
+            dropped_tail += 1
+            continue
+        if len(file_diff) > limit - size:
+            parts.append(file_diff[:limit - size])
+            size = limit
+            dropped_tail += 1
+            continue
+        parts.append(file_diff)
+        size += len(file_diff)
+    notes = []
+    if skipped:
+        notes.append(f"已跳过测试、文档或仅空白变化的文件 {skipped} 个。这不构成材料不足。")
+    if dropped_tail:
+        notes.append(f"收窄后仍有 {dropped_tail} 个文件没有送入模型。")
+    return "".join(parts), "\n".join(notes)
 
 
 def release_json():
@@ -216,16 +295,16 @@ def render_report_parts(values):
     return fill(head), fill(appendix)
 
 
-def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff, changelog, commits, other_commit_count, suspicious):
+def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff, commits, other_commit_count):
     tag = release["tag_name"]
     branch = os.environ["COMPARE_BRANCH"]
     notes = (release.get("body") or "").replace("\r\n", "\n").strip()
     if not notes:
-        notes = "（这个 tag 没有 GitHub Release 正文，下面是 changelog 开头。）"
+        notes = "（这个 tag 没有 GitHub Release 正文。）"
     url = release.get("html_url") or f"https://github.com/{os.environ['UPSTREAM_REPO']}/releases/tag/{tag}"
     status = f"`{branch}` 还没有包含 `{tag}`。详细对比只包括节点和钱包；其它目录有 {other_commit_count} 个提交未展开。"
 
-    ai = summarize(notes, commits, focus_diff, diff, fork_diff, suspicious, both_names, only_upstream, tag)
+    ai = summarize(notes, commits, focus_diff, diff, fork_diff, both_names, only_upstream, tag)
     class_a_names = set(CLASS_A)
     class_a_overlap = [name for name in both_names if name in class_a_names]
     class_c_overlap = [name for name in both_names if name not in class_a_names]
@@ -280,13 +359,13 @@ def chat_completions_url(api_url):
     return url + "/chat/completions"
 
 
-def summarize(notes, commits, focus_diff, diff, fork_diff, suspicious, both_names, only_upstream, tag):
+def summarize(notes, commits, focus_diff, diff, fork_diff, both_names, only_upstream, tag):
     raw_url = os.environ.get("AI_API_URL", "").strip()
     api_url = chat_completions_url(raw_url) if raw_url else ""
     api_key = os.environ.get("AI_API_KEY", "").strip()
     model = os.environ.get("AI_MODEL", "").strip()
     if not api_url or not api_key or not model:
-        return "（未配置 AI_API_URL、AI_API_KEY 或 AI_MODEL，关键词标记仍然有效）"
+        return "（未配置 AI_API_URL、AI_API_KEY 或 AI_MODEL，处理建议和重叠文件仍然有效）"
     try:
         def pieces(text, size):
             text = text or ""
@@ -294,9 +373,10 @@ def summarize(notes, commits, focus_diff, diff, fork_diff, suspicious, both_name
                 return []
             return [text[i:i + size] for i in range(0, len(text), size)]
 
-        def ask(user_text):
+        def ask(user_text, max_tokens):
             payload = json.dumps({
                 "model": model,
+                "max_tokens": max_tokens,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_text},
@@ -314,75 +394,88 @@ def summarize(notes, commits, focus_diff, diff, fork_diff, suspicious, both_name
                 body = json.loads(response.read().decode())
             return body["choices"][0]["message"]["content"].strip()
 
-        chunk_size = 24000
-        source_cap = 200000
-
-        def capped(label, text):
-            if len(text) <= source_cap:
-                return text, ""
-            return text[:source_cap], f"{label} 超过 {source_cap} 字符，模型没有读到后面的部分。"
-
-        notes_for_model, notes_note = capped("发行说明", notes)
-        commits_for_model, commits_note = capped("重点提交", commits)
-        focus_for_model, focus_note = capped("上游重点模块 Diff", focus_diff)
-        diff_for_model, diff_note = capped("重叠重点文件-上游 Diff", diff)
-        fork_for_model, fork_note = capped("重叠重点文件-Fork Diff", fork_diff)
-        suspicious_for_model, suspicious_note = capped("可疑新增行", suspicious)
+        focus_for_model, focus_note = narrow_diff(focus_diff, 96000)
+        overlap_for_model, overlap_note = narrow_diff(diff, 24000)
+        fork_for_model, fork_note = narrow_diff(fork_diff, 24000)
         sources = [
-            ("发行说明", notes_for_model),
-            ("重点提交", commits_for_model),
-            ("上游重点模块 Diff", focus_for_model),
-            ("重叠重点文件-上游 Diff", diff_for_model),
-            ("重叠重点文件-Fork Diff", fork_for_model),
-            ("可疑新增行", suspicious_for_model),
+            ("发行说明", notes, SOURCE_INSTRUCTIONS["发行说明"]),
+            ("重点提交", commits, SOURCE_INSTRUCTIONS["重点提交"]),
+            ("上游重点模块 Diff", focus_for_model, SOURCE_INSTRUCTIONS["上游重点模块 Diff"]),
+            ("重叠重点文件-上游 Diff", overlap_for_model, SOURCE_INSTRUCTIONS["重叠重点文件-上游 Diff"]),
+            ("重叠重点文件-Fork Diff", fork_for_model, SOURCE_INSTRUCTIONS["重叠重点文件-Fork Diff"]),
         ]
-        partials = []
-        for label, text in sources:
-            parts = pieces(text, chunk_size)
-            for index, part in enumerate(parts, 1):
-                partials.append(
-                    f"## {label} {index}/{len(parts)}\n"
-                    + ask("\n".join([
-                        SOURCE_INSTRUCTIONS[label],
-                        f"第 {index}/{len(parts)} 段，只审查本段。没有发现就只写「这段没有」。不超过 12 条。",
-                        "<untrusted_repository_material>",
-                        part,
-                        "</untrusted_repository_material>",
-                    ]))
-                )
-        cap_notes = [item for item in (notes_note, commits_note, focus_note, diff_note, fork_note, suspicious_note) if item]
-        synthesis = "\n\n".join(partials)
-        if len(synthesis) > 80000:
-            synthesis = synthesis[:80000] + "\n…（分段摘要过长，汇总时截断）"
-            cap_notes.append("分段摘要超过 80000 字符，汇总时被截断。")
-        truncation = ""
-        if cap_notes:
-            truncation = "以下材料被截断，模型没有读到后面的部分。第一节选「证据不足」，安全审查也写成证据不足。已确认的其它问题保留。\n" + "\n".join(cap_notes)
+        sources = [(label, text, instruction) for label, text, instruction in sources if text and text.strip()]
+        narrow_notes = "\n".join(item for item in (focus_note, overlap_note, fork_note) if item)
         fork_status = (
             "Fork 一侧 diff 已提供，只覆盖双方都改过的预设重点文件。"
             if fork_diff.strip()
             else "Fork 一侧 diff 未提供。不要讨论具体的定制行为兼容性。"
         )
-        return ask("\n".join([
-            FINAL_REVIEW_PROMPT,
-            "",
-            f"本机命令：/merge-upstream {tag}",
-            "Class A，冲突时必须逐段问人，禁止自动选边：",
-            "\n".join(CLASS_A),
-            "双方都改过的预设重点文件：",
-            "\n".join(both_names) or "无",
-            "只有官方改过的预设重点文件：",
-            "\n".join(only_upstream) or "无",
-            fork_status,
-            truncation,
-            "",
-            "<untrusted_repository_material>",
-            synthesis or "（没有可阅读的发行说明、提交、diff 或可疑行）",
-            "</untrusted_repository_material>",
-        ]))
+
+        def final_request(material, extra):
+            return ask("\n".join([
+                FINAL_REVIEW_PROMPT,
+                "",
+                f"本机命令：/merge-upstream {tag}",
+                "Class A，冲突时必须逐段问人，禁止自动选边：",
+                "\n".join(CLASS_A),
+                "双方都改过的预设重点文件：",
+                "\n".join(both_names) or "无",
+                "只有官方改过的预设重点文件：",
+                "\n".join(only_upstream) or "无",
+                fork_status,
+                extra,
+                "",
+                material or "（没有可阅读的发行说明、提交或 diff）",
+            ]), 2000)
+
+        total = sum(len(text) for _, text, _ in sources)
+        if total <= 48000:
+            material = "\n\n".join(
+                "\n".join([
+                    f"## {label}",
+                    instruction,
+                    "<untrusted_repository_material>",
+                    text,
+                    "</untrusted_repository_material>",
+                ])
+                for label, text, instruction in sources
+            )
+            extra = "材料可以一次读完。直接写五节，不要先写分段摘要。测试、文档和仅空白变化没有送入。"
+            if narrow_notes:
+                extra += "\n" + narrow_notes
+            return final_request(material, extra)
+
+        jobs = []
+        for label, text, instruction in sources:
+            parts = pieces(text, 24000)
+            for index, part in enumerate(parts, 1):
+                jobs.append((label, index, len(parts), instruction, part))
+
+        def run_job(job):
+            label, index, count, instruction, part = job
+            answer = ask("\n".join([
+                instruction,
+                f"第 {index}/{count} 段，只审查本段。没有发现就只写「这段没有」。不超过 12 条。",
+                "硬分叉、激活高度、破坏性变更、私钥或 spend key 泄露、内存、共识或挖矿漏洞即使只在本段出现也要写出。",
+                "<untrusted_repository_material>",
+                part,
+                "</untrusted_repository_material>",
+            ]), 800)
+            return f"## {label} {index}/{count}\n{answer}"
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            partials = list(pool.map(run_job, jobs))
+        synthesis = "\n\n".join(partials)
+        if len(synthesis) > 80000:
+            synthesis = synthesis[:80000] + "\n…（分段摘要过长，汇总时截断）"
+            narrow_notes += "\n分段摘要超过 80000 字符，汇总时被截断。第一节选「证据不足」，已确认的其它问题保留。"
+        elif "没有送入模型" in narrow_notes:
+            narrow_notes += "\n有文件没有送入模型。第一节选「证据不足」，已确认的硬分叉、泄露和安全问题保留。"
+        return final_request(synthesis, narrow_notes)
     except Exception as error:
         detail = str(error).replace(api_key, "***")
-        return f"（自定义 AI 调用失败，关键词标记仍然有效：{detail}）"
+        return f"（自定义 AI 调用失败，处理建议和重叠文件仍然有效：{detail}）"
 
 
 def notify_logins():
@@ -424,15 +517,13 @@ def main():
     base = run(["git", "merge-base", branch, tag], check=False)
     fork_diff = git_text(["diff", base.stdout.strip(), branch, "--", *both_names]) if both_names and base.returncode == 0 else ""
     focus_diff = git_text(["diff", f"{branch}...{tag}", "--", *FOCUS])
-    changelog = git_text(["show", f"{tag}:changelog-development.md"])
     focus_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}", "--", *FOCUS])))
     all_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}"])))
     commits = "\n".join(sorted(focus_commits))
     other_commit_count = len(all_commits - focus_commits)
-    suspicious = suspicious_text(focus_diff)
 
     issue_body, full_report, run_url = build_issue(
-        release, both_names, only_upstream, diff, fork_diff, focus_diff, changelog, commits, other_commit_count, suspicious,
+        release, both_names, only_upstream, diff, fork_diff, focus_diff, commits, other_commit_count,
     )
     repo = os.environ["GITHUB_REPOSITORY"]
     run(
