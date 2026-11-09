@@ -1,0 +1,59 @@
+# Fetches a tari-project/tari Release and opens an issue comparing it with this fork.
+# Scheduled runs only start when this file is on the repository default branch.
+# The job still diffs COMPARE_BRANCH, not whatever branch contains this file.
+# The script must exist on the checkout ref (develop).
+name: Upstream release diff
+
+'on':
+  schedule:
+    # Every 5 minutes, the shortest interval GitHub Actions allows. Runs may still start late.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to compare, for example v6.4.0. Empty uses the newest Release, including pre-releases.'
+        required: false
+        type: string
+
+concurrency:
+  group: upstream-release-diff
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compare:
+    name: Compare upstream release
+    runs-on: ubuntu-latest
+    env:
+      COMPARE_BRANCH: develop
+      UPSTREAM_REPO: tari-project/tari
+      INPUT_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Repository secret. A base URL ending in /v1 is enough; /chat/completions is added when missing.
+      # Example: https://token-plan-sgp.xiaomimimo.com/v1
+      AI_API_URL: ${{ secrets.AI_API_URL }}
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+      AI_MODEL: ${{ vars.AI_MODEL }}
+      # GitHub usernames, separated by commas. Empty mentions the repository owner.
+      NOTIFY_LOGINS: ${{ vars.NOTIFY_LOGINS }}
+    steps:
+      - name: Checkout the branch to compare
+        uses: actions/checkout@v7
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Open an issue for a new upstream release
+        run: python3 .github/scripts/upstream_release_diff.py
+
+      - name: Upload the full report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upstream-release-report
+          path: upstream-release-report.md
+          if-no-files-found: ignore
+          retention-days: 90
