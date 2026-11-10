@@ -116,9 +116,9 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 结论：可以开始
 原因：一句话，不超过 40 字。
 结论只能是「可以开始」「先核对再开始」「证据不足」之一。不要写「建议升级」。
-可以开始：已读材料里没有需要先停下来的 P0 或 P1。没送入的普通文件不表示这次合并没有冲突。
-先核对再开始：已读材料里有 P0 或 P1，原因里点出要先看的那一件。
-证据不足：关键 diff 被截断，或发行说明里的高风险声称在 diff 里对不上。
+可以开始：已读材料里没有需要先停下来的 P0 或 P1。没送入的普通文件，以及只出现在发行说明里的条目，不阻止这个结论。
+先核对再开始：已读材料里有 P0 或 P1。原因里点出要先看的那一件。发行说明里对不上 diff 的条目保持待验证，不要因此改选证据不足。
+证据不足：已读材料里看不到任何可核对的 P0 或 P1，并且优先文件没有送入或关键 diff 被截断。已经有可核对的 P0 或 P1 时，不要选证据不足。
 文件重叠不是 Git 冲突。这份结论不执行 merge 或 push。
 
 然后只输出下面四节。条目用 1. 2. 3.，一条一件事。
@@ -658,9 +658,9 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
         synthesis = "\n\n".join(partials)
         if len(synthesis) > 80000:
             synthesis = synthesis[:80000] + "\n…（分段摘要过长，汇总时截断）"
-            narrow_notes += "\n分段摘要超过 80000 字符，汇总时被截断。结论行写「证据不足」，已确认的其它问题保留。"
+            narrow_notes += "\n分段摘要超过 80000 字符，汇总时被截断。已读材料里已有 P0 或 P1 时结论选「先核对再开始」，原因里说明摘要被截断。已确认的问题保留。"
         elif "没有送入模型" in narrow_notes:
-            narrow_notes += "\n有文件没有送入模型。结论行写「证据不足」，已确认的硬分叉、泄露和安全问题保留。"
+            narrow_notes += "\n优先文件没有送完整。已读材料里已有 P0 或 P1 时结论选「先核对再开始」，原因里说明缺了优先文件。不要只因为发行说明对不上 diff 就选「证据不足」。"
         return final_request(synthesis, narrow_notes)
     except Exception as error:
         detail = str(error).replace(api_key, "***")
