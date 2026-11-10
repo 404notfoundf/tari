@@ -541,51 +541,44 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                         parts.append(str(part.get("text") or part.get("content") or ""))
             return "\n".join(part.strip() for part in parts if part and str(part).strip()).strip()
 
-        def ask(user_text, max_tokens):
-            def once(limit):
-                payload = json.dumps({
-                    "model": model,
-                    "max_tokens": limit,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_text},
-                    ],
-                }).encode()
-                request = urllib.request.Request(
-                    api_url,
-                    data=payload,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(request, timeout=300) as response:
-                    return json.loads(response.read().decode())
-
-            def diagnose(body):
-                choice = body.get("choices", [{}])[0]
-                message = choice.get("message", {}) if isinstance(choice, dict) else {}
-                usage = body.get("usage") or {}
-                details = usage.get("completion_tokens_details") or {}
+        def ask(user_text):
+            payload = json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+            }).encode()
+            request = urllib.request.Request(
+                api_url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=300) as response:
+                body = json.loads(response.read().decode())
+            choice = body.get("choices", [{}])[0]
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            text = message_text(message)
+            usage = body.get("usage") or {}
+            details = usage.get("completion_tokens_details") or {}
+            finish = choice.get("finish_reason") if isinstance(choice, dict) else ""
+            print(
+                f"AI response chars: {len(text)}, finish_reason={finish}, "
+                f"completion_tokens={usage.get('completion_tokens')}, "
+                f"reasoning_tokens={details.get('reasoning_tokens')}",
+                flush=True,
+            )
+            if not text:
                 reasoning = message.get("reasoning_content") if isinstance(message, dict) else ""
-                return (
-                    f"finish_reason={choice.get('finish_reason') if isinstance(choice, dict) else ''}"
+                raise RuntimeError(
+                    f"模型的 content 为空。finish_reason={finish}"
                     f"，completion_tokens={usage.get('completion_tokens')}"
                     f"，reasoning_tokens={details.get('reasoning_tokens')}"
                     f"，reasoning_content={'有' if isinstance(reasoning, str) and reasoning.strip() else '无'}"
                 )
-
-            body = once(max_tokens)
-            message = body.get("choices", [{}])[0].get("message", {})
-            text = message_text(message)
-            if not text:
-                print(f"AI content empty, retrying with a larger limit. {diagnose(body)}", flush=True)
-                body = once(max(max_tokens * 2, 8000))
-                message = body.get("choices", [{}])[0].get("message", {})
-                text = message_text(message)
-            if not text:
-                raise RuntimeError(f"模型的 content 为空。{diagnose(body)}")
-            print(f"AI response chars: {len(text)}", flush=True)
             return text
 
         focus_for_model, focus_note = narrow_diff(focus_diff, 96000)
@@ -623,7 +616,7 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 extra,
                 "",
                 material or "（没有可阅读的发行说明、提交或 diff）",
-            ]), 8000)
+            ]))
 
         total = sum(len(text) for _, text, _ in sources)
         if total <= 48000:
@@ -657,7 +650,7 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 "<untrusted_repository_material>",
                 part,
                 "</untrusted_repository_material>",
-            ]), 4000)
+            ]))
             return f"## {label} {index}/{count}\n{answer}"
 
         with ThreadPoolExecutor(max_workers=3) as pool:
