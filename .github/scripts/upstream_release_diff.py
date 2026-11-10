@@ -285,16 +285,21 @@ def nest_headings(text):
     return "\n".join(("### " + line[3:]) if line.startswith("## ") else line for line in text.splitlines())
 
 
+def normalize_line(line):
+    text = line.strip().lstrip("#").strip().strip("*").strip()
+    return re.sub(r"^\d+[.、]\s*", "", text)
+
+
 def split_conclusion(ai):
     verdicts = ("先核对再开始", "可以开始", "证据不足")
     decision = ""
     reason = ""
     body_start = 0
     for index, line in enumerate(ai.splitlines()):
-        text = line.strip().lstrip("#").strip()
-        if not decision and text.startswith("结论"):
+        text = normalize_line(line)
+        if not decision and (text.startswith("结论") or text.startswith("升级建议")):
             tail = re.split(r"[:：]", text, maxsplit=1)[-1].strip()
-            decision = next((item for item in verdicts if item in tail), "")
+            decision = next((item for item in verdicts if item in tail or item in text), "")
             body_start = index + 1
             continue
         if decision and text.startswith("原因"):
@@ -313,7 +318,7 @@ def split_section(text, title):
     lines = text.splitlines()
     start = None
     for index, line in enumerate(lines):
-        if line.strip().lstrip("#").strip() == title:
+        if normalize_line(line) == title:
             start = index
             break
     if start is None:
@@ -450,10 +455,15 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
         decision, reason, analysis = split_conclusion(ai)
         if not decision:
             decision = "证据不足"
-            reason = "模型没有把结论写在开头，下面是它返回的分析。"
+            reason = "模型没有把结论写在开头，原文保留在下面。"
             analysis = ai
-        highlights, analysis = split_section(analysis, "发行说明重点")
-        highlights = number_highlights(highlights) if highlights else "模型没有按 1. 2. 3. 列出发行说明重点。"
+        highlights, remainder = split_section(analysis, "发行说明重点")
+        if highlights:
+            highlights = number_highlights(highlights)
+            analysis = remainder or analysis
+        else:
+            highlights = "模型没有按 1. 2. 3. 列出发行说明重点，原文保留在下一节。"
+            analysis = ai if not analysis.strip() else analysis
     def listed(names):
         return "\n".join(f"- `{name}`" for name in names) if names else "（没有）"
 
@@ -516,26 +526,67 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 return []
             return [text[i:i + size] for i in range(0, len(text), size)]
 
+        def message_text(message):
+            if not isinstance(message, dict):
+                return ""
+            content = message.get("content")
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict):
+                        parts.append(str(part.get("text") or part.get("content") or ""))
+            return "\n".join(part.strip() for part in parts if part and str(part).strip()).strip()
+
         def ask(user_text, max_tokens):
-            payload = json.dumps({
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text},
-                ],
-            }).encode()
-            request = urllib.request.Request(
-                api_url,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            with urllib.request.urlopen(request, timeout=300) as response:
-                body = json.loads(response.read().decode())
-            return body["choices"][0]["message"]["content"].strip()
+            def once(limit):
+                payload = json.dumps({
+                    "model": model,
+                    "max_tokens": limit,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_text},
+                    ],
+                }).encode()
+                request = urllib.request.Request(
+                    api_url,
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    return json.loads(response.read().decode())
+
+            def diagnose(body):
+                choice = body.get("choices", [{}])[0]
+                message = choice.get("message", {}) if isinstance(choice, dict) else {}
+                usage = body.get("usage") or {}
+                details = usage.get("completion_tokens_details") or {}
+                reasoning = message.get("reasoning_content") if isinstance(message, dict) else ""
+                return (
+                    f"finish_reason={choice.get('finish_reason') if isinstance(choice, dict) else ''}"
+                    f"，completion_tokens={usage.get('completion_tokens')}"
+                    f"，reasoning_tokens={details.get('reasoning_tokens')}"
+                    f"，reasoning_content={'有' if isinstance(reasoning, str) and reasoning.strip() else '无'}"
+                )
+
+            body = once(max_tokens)
+            message = body.get("choices", [{}])[0].get("message", {})
+            text = message_text(message)
+            if not text:
+                print(f"AI content empty, retrying with a larger limit. {diagnose(body)}", flush=True)
+                body = once(max(max_tokens * 2, 8000))
+                message = body.get("choices", [{}])[0].get("message", {})
+                text = message_text(message)
+            if not text:
+                raise RuntimeError(f"模型的 content 为空。{diagnose(body)}")
+            print(f"AI response chars: {len(text)}", flush=True)
+            return text
 
         focus_for_model, focus_note = narrow_diff(focus_diff, 96000)
         outside_for_model, outside_note = narrow_diff(outside_diff, 48000)
@@ -572,7 +623,7 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 extra,
                 "",
                 material or "（没有可阅读的发行说明、提交或 diff）",
-            ]), 2000)
+            ]), 8000)
 
         total = sum(len(text) for _, text, _ in sources)
         if total <= 48000:
@@ -606,7 +657,7 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 "<untrusted_repository_material>",
                 part,
                 "</untrusted_repository_material>",
-            ]), 800)
+            ]), 4000)
             return f"## {label} {index}/{count}\n{answer}"
 
         with ThreadPoolExecutor(max_workers=3) as pool:
