@@ -90,20 +90,20 @@ SOURCE_INSTRUCTIONS = {
     "发行说明": """提取全仓库的重要变化，不限于节点和钱包。merge-mining proxy 的业务流程不要展开。
 必须单独写出，不能并进笼统摘要：硬分叉及激活高度、必须在该高度前升级、共识或挖矿漏洞（例如 RandomX、区块头校验）、破坏性变更（数据库落盘格式、WAL、文件权限、钱包导出）、私钥或 spend key 泄露、内存占用或泄漏、崩溃、认证绕过。
 每项写：上游声称的变化、关联模块、可能影响、应查证的代码。全部标记[待验证]。
-不得因为 Notes 提到修复就宣称代码已修复。不要下恶意行为定论。""",
+不得因为 Notes 提到修复就宣称代码已修复。不要下恶意行为定论。材料若有多个 ## 版本号，每条保留对应版本号，不要把不同版本并成一条。""",
     "重点提交": """从提交描述识别共识、同步、稳定性、安全、钱包、API 和重要依赖变化。
 硬分叉、激活高度、破坏性变更、私钥或 spend key 泄露、内存、共识或挖矿漏洞必须写出。
 保留输入中的原始哈希，短哈希不得补全。只有标题时一律[待验证]，并指出需要哪一块 Diff。
-不要根据单个关键词推断漏洞。""",
+不要根据单个关键词推断漏洞。材料若有多个 ## 版本号，只描述本段里的版本，不要把别的版本的改动写进来。""",
     "上游重点模块 Diff": """这是共同祖先到上游 Tag 的代码 Diff，只含上游修改。测试、文档和仅空白变化已去掉，其余有行为变化的文件都会送入。
 选出行为上重要的修改，不要因为路径或代码里没有 consensus、wallet、spend_key 这些词就忽略。必须标出：硬分叉或共识规则、激活高度、挖矿或区块头校验、钱包资金与导出、gRPC 与认证、数据库落盘、内存增长或泄漏、死锁、崩溃。
-文件路径取本段 diff --git 或 +++ b/ 那一行。不推断 Fork 的修改，也不要把没出现的文件说成已审过。""",
+文件路径取本段 diff --git 或 +++ b/ 那一行。不推断 Fork 的修改，也不要把没出现的文件说成已审过。材料若有多个 ## 版本号，只描述本段里的版本。""",
     "其它目录 Diff": """这些文件不在节点、钱包、base_layer/core 和 gRPC client 里。测试、文档、锁文件和仅空白变化已去掉。
 只报告重点问题：硬分叉、激活高度、共识或挖矿漏洞、破坏性变更、密钥泄露、内存、崩溃、认证绕过、明显可疑行为。
-没有这类问题就写「这段没有」。merge-mining proxy 不要展开业务流程，但出现上述问题必须写出。不要因为文件不在节点或钱包目录就忽略。""",
+没有这类问题就写「这段没有」。merge-mining proxy 不要展开业务流程，但出现上述问题必须写出。不要因为文件不在节点或钱包目录就忽略。材料若有多个 ## 版本号，只描述本段里的版本。""",
     "重叠重点文件-上游 Diff": """这些预设重点文件 Fork 和上游都改过。本段只展示上游一侧。
 识别上游在公开 API、配置、协议、状态机、锁、错误处理上的变化，写出需要和 Fork 核对的位置。
-不要声称已经发现 Git 冲突。""",
+不要声称已经发现 Git 冲突。材料若有多个 ## 版本号，只描述本段里的版本。""",
     "重叠重点文件-Fork Diff": """这是共同祖先到 Fork develop 的代码 Diff，只包含双方都改过的预设重点文件。
 总结 Fork 这里要保留的行为，并引用本段里的文件路径。本段没有上游实现，不要单独判断兼容。
 指出应和上游的哪类改动对照。""",
@@ -141,18 +141,21 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 例：1. [4][已确认] gRPC：UnblindedOutput 退出时清零 — 钱包导入；核对失败后是否拿到全零密钥。#8166
 diff 里能对上的写已确认或可能影响；只有发行说明、diff 里看不到的写[待验证]，不能省略。没有的不要编。一条都没有就写「发行说明里没有这类重点。」
 同一证据档内按这个顺序：密钥泄露，内存、崩溃或认证绕过，共识分叉或必须升级，共识或挖矿漏洞，破坏性变更。没有归入这五类的放在该档最后。待验证整体放在本节最后。
+材料里有多个版本时，按从旧到新分块。每块第一行只写 `### 版本号`，下面只放这个版本的条目，不要把不同版本混进同一个列表。只有一个版本时不要写版本标题。
 
 ## 代码风险
 最多 5 条，只写 diff 里另外看到的风险。和上一节重复的不写。每条只占一行：
 序号. [P等级][已确认/可能影响/待验证] 路径 — 一句改动；影响；要核对什么。
 不要粘贴函数签名，不要把同一事实写成两句。没有就写「没有发行说明以外的高优先级风险。」
 同一证据档内 P0 在前。待验证放在本节最后。
+材料里有多个版本时，代码风险也按从旧到新分块。每块第一行只写 `### 版本号`，该版本最多 5 条，不要把不同版本混进同一个列表。只有一个版本时不要写版本标题。
 
 ## 双方改动取舍
 这一节只写双方都改过的预设文件。不要写安全总判，不要写覆盖范围，不要写「证据不足」「需要人工复核」「未见明显可疑行为」。可疑行为写在「代码风险」。
 每个文件只占一行：序号. [已确认/待验证] 路径 — 上游：一句；要保留：一句；合并时看：一句。
 用中文短句，不贴函数签名，不罗列依赖版本。一个文件一条。
 某个文件这次没拿来对比时，这一条写「这次没拿来对比」，其它文件照常写。
+多个版本改过同一个文件时，按版本各写一行，上游那句开头写版本号。
 没有你这边的对照材料时，只写「这次没有你这边的改动对照。」
 没有双方都改过的文件时，只写「这次没有双方都改过的预设文件。」
 例：1. [已确认] applications/minotari_node/src/grpc/base_node_grpc_server.rs — 上游：coinbase 校验提前，错误码改为参数错误；要保留：合并挖矿的四个接口，以及按高度生成的 coinbase 前缀；合并时看：两套校验是否同一套规则，随机生成的 coinbase 密钥能否花出去。
@@ -266,6 +269,23 @@ def narrow_diff(diff_text, limit):
     if dropped_other:
         notes.append(f"另有 {dropped_other} 个行为变化文件因长度限制未送入。这不构成材料不足。")
     return "".join(parts), "\n".join(notes)
+
+
+def narrow_labeled(text, limit):
+    matches = list(re.finditer(r"(?m)^## ([^\n]+)\n", text))
+    if len(matches) < 2:
+        return narrow_diff(text, limit)
+    slice_limit = max(8000, limit // len(matches))
+    parts = []
+    notes = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        narrowed, note = narrow_diff(text[match.end():end], slice_limit)
+        label = match.group(1).strip()
+        parts.append(f"## {label}\n{narrowed.strip() or '（这个 release 没有送入的行为变化。）'}")
+        if note:
+            notes.append(f"{label}：{note}")
+    return "\n\n".join(parts), "\n".join(notes)
 
 
 def release_json():
@@ -441,6 +461,39 @@ def number_highlights(text):
     return "\n".join(preamble + lines + trailer)
 
 
+def number_release_blocks(text, tags):
+    if len(tags) < 2:
+        return number_highlights(text)
+    known = set(tags)
+    blocks = []
+    current_tag = None
+    current = []
+    seen = False
+    for line in text.splitlines():
+        heading = normalize_line(line).strip("`")
+        if heading in known:
+            if seen:
+                blocks.append((current_tag, "\n".join(current)))
+            seen = True
+            current_tag = heading
+            current = []
+            continue
+        current.append(line)
+    if seen or current:
+        blocks.append((current_tag, "\n".join(current)))
+    if not any(tag for tag, _ in blocks):
+        return number_highlights(text)
+    order = {tag: index for index, tag in enumerate(tags)}
+    blocks.sort(key=lambda item: order.get(item[0], len(tags)))
+    rendered = []
+    for tag, body in blocks:
+        numbered = number_highlights(body).strip()
+        if not numbered:
+            continue
+        rendered.append(f"### {tag}\n\n{numbered}" if tag else numbered)
+    return "\n\n".join(rendered)
+
+
 def is_fork_heading(line):
     return normalize_line(line) in {"安全与 Fork", "双方改动取舍"}
 
@@ -465,11 +518,27 @@ def normalize_fork_section(text):
     return "\n".join(lines)
 
 
+def order_blocks(text, orderer):
+    parts = re.split(r"(?m)^(### .+)$", text)
+    if len(parts) < 3:
+        return orderer(text)
+    rendered = []
+    if parts[0].strip():
+        rendered.append(orderer(parts[0]))
+    index = 1
+    while index < len(parts):
+        rendered.append(parts[index].strip())
+        body = parts[index + 1] if index + 1 < len(parts) else ""
+        rendered.append(orderer(body))
+        index += 2
+    return "\n\n".join(part for part in rendered if part.strip())
+
+
 def order_numbered_sections(text):
     parts = re.split(r"(?m)^(## .+)$", text)
     ordered = []
     if parts[0].strip():
-        ordered.append(order_list(parts[0]))
+        ordered.append(order_blocks(parts[0], order_list))
     index = 1
     while index < len(parts):
         heading = parts[index].strip()
@@ -478,7 +547,7 @@ def order_numbered_sections(text):
             heading = "## 双方改动取舍"
             body = normalize_fork_section(body)
         ordered.append(heading)
-        ordered.append(order_list(body))
+        ordered.append(order_blocks(body, order_list))
         index += 2
     return "\n\n".join(part for part in ordered if part.strip())
 
@@ -511,17 +580,29 @@ def render_report_parts(values):
     return fill(head), fill(appendix)
 
 
-def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff, outside_diff, commits, other_commit_count):
+def release_notes(release):
+    notes = (release.get("body") or "").replace("\r\n", "\n").strip()
+    return notes or "（这个 tag 没有 GitHub Release 正文。）"
+
+
+def format_notes(releases):
+    if len(releases) < 2:
+        return release_notes(releases[0]) if releases else "（这个 tag 没有 GitHub Release 正文。）"
+    return "\n\n".join(f"## {release['tag_name']}\n{release_notes(release)}" for release in releases)
+
+
+def build_issue(release, releases, both_names, only_upstream, diff, fork_diff, focus_diff, outside_diff, commits, other_commit_count):
     tag = release["tag_name"]
     branch = os.environ["COMPARE_BRANCH"]
-    notes = (release.get("body") or "").replace("\r\n", "\n").strip()
-    if not notes:
-        notes = "（这个 tag 没有 GitHub Release 正文。）"
+    notes = format_notes(releases)
     url = release.get("html_url") or f"https://github.com/{os.environ['UPSTREAM_REPO']}/releases/tag/{tag}"
     status = (
         f"`{branch}` 还没有包含 `{tag}`。节点和钱包会详细对比。"
         f"其它目录有 {other_commit_count} 个提交，其中有行为变化的文件也会送入，用来发现重点问题。"
     )
+    if len(releases) > 1:
+        names = "、".join(f"`{item['tag_name']}`" for item in releases)
+        status += f" 这次从旧到新跨过 {names}。发行说明和代码风险按每个 release 分开写。合并仍是合到最终的 `{tag}`。"
 
     ai = summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_names, only_upstream, tag)
     class_a_names = set(CLASS_A)
@@ -546,7 +627,7 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
             }.get(decision, decision)
         highlights, remainder = split_section(analysis, "发行说明重点")
         if highlights:
-            highlights = number_highlights(highlights)
+            highlights = number_release_blocks(highlights, [item["tag_name"] for item in releases])
             analysis = remainder or analysis
         else:
             highlights = "模型没有按 1. 2. 3. 列出发行说明重点，原文保留在下一节。"
@@ -691,10 +772,10 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                 )
             return text
 
-        focus_for_model, focus_note = narrow_diff(focus_diff, 96000)
-        outside_for_model, outside_note = narrow_diff(outside_diff, 48000)
-        overlap_for_model, overlap_note = narrow_diff(diff, 24000)
-        fork_for_model, fork_note = narrow_diff(fork_diff, 24000)
+        focus_for_model, focus_note = narrow_labeled(focus_diff, 96000)
+        outside_for_model, outside_note = narrow_labeled(outside_diff, 48000)
+        overlap_for_model, overlap_note = narrow_labeled(diff, 24000)
+        fork_for_model, fork_note = narrow_labeled(fork_diff, 24000)
         sources = [
             ("发行说明", notes, SOURCE_INSTRUCTIONS["发行说明"]),
             ("重点提交", commits, SOURCE_INSTRUCTIONS["重点提交"]),
@@ -789,6 +870,36 @@ def notify_logins():
     return logins
 
 
+def releases_since_head(newest_tag):
+    upstream = os.environ["UPSTREAM_REPO"]
+    result = run(["gh", "api", f"repos/{upstream}/releases?per_page=20"], check=True)
+    found = json.loads(result.stdout)
+    names = [item.get("tag_name") or "" for item in found if item.get("tag_name") and item.get("tag_name") != newest_tag]
+    if names:
+        refspecs = [f"refs/tags/{name}:refs/tags/{name}" for name in names]
+        run(["git", "fetch", "--no-tags", f"https://github.com/{upstream}.git", *refspecs], check=False)
+
+    def on_path(name):
+        if run(["git", "merge-base", "--is-ancestor", name, "HEAD"], check=False).returncode == 0:
+            return False
+        if name != newest_tag and run(["git", "merge-base", "--is-ancestor", name, newest_tag], check=False).returncode != 0:
+            return False
+        return True
+
+    selected = [item for item in found if item.get("tag_name") and on_path(item["tag_name"])]
+    if not any(item.get("tag_name") == newest_tag for item in selected):
+        newest = next((item for item in found if item.get("tag_name") == newest_tag), None)
+        if newest:
+            selected.append(newest)
+
+    def commit_time(item):
+        stamped = git_text(["log", "-1", "--format=%ct", item["tag_name"]]).strip()
+        return int(stamped or "0")
+
+    selected.sort(key=commit_time)
+    return selected or [item for item in found if item.get("tag_name") == newest_tag]
+
+
 def main():
     release = release_json()
     tag = release.get("tag_name") or ""
@@ -812,19 +923,48 @@ def main():
     our_names = set(names_between(tag, branch))
     both_names = [name for name in upstream_names if name in our_names]
     only_upstream = [name for name in upstream_names if name not in our_names]
-    diff = git_text(["diff", f"{branch}...{tag}", "--", *both_names]) if both_names else ""
+    releases = releases_since_head(tag)
+    if not any(item.get("tag_name") == tag for item in releases):
+        releases.append(release)
+    outside_excludes = [f":(exclude){path}" for path in FOCUS]
+
+    def span(left, right):
+        return (
+            git_text(["diff", f"{left}...{right}", "--", *FOCUS]),
+            git_text(["diff", f"{left}...{right}", "--", ".", *outside_excludes]),
+            git_text(["diff", f"{left}...{right}", "--", *both_names]) if both_names else "",
+            git_text(["log", "--oneline", f"{left}..{right}"]),
+        )
+
+    if len(releases) < 2:
+        focus_diff, outside_diff, diff, commit_text = span(branch, tag)
+        commits = "\n".join(sorted(lines(commit_text)))
+    else:
+        focus_parts = []
+        outside_parts = []
+        overlap_parts = []
+        commit_parts = []
+        left = branch
+        for item in releases:
+            right = item["tag_name"]
+            focus_text, outside_text, overlap_text, commit_text = span(left, right)
+            focus_parts.append(f"## {right}\n{focus_text.strip()}")
+            outside_parts.append(f"## {right}\n{outside_text.strip()}")
+            overlap_parts.append(f"## {right}\n{overlap_text.strip()}")
+            commit_parts.append(f"## {right}\n{commit_text.strip() or '（没有提交。）'}")
+            left = right
+        focus_diff = "\n\n".join(focus_parts)
+        outside_diff = "\n\n".join(outside_parts)
+        diff = "\n\n".join(overlap_parts)
+        commits = "\n\n".join(commit_parts)
     base = run(["git", "merge-base", branch, tag], check=False)
     fork_diff = git_text(["diff", base.stdout.strip(), branch, "--", *both_names]) if both_names and base.returncode == 0 else ""
-    focus_diff = git_text(["diff", f"{branch}...{tag}", "--", *FOCUS])
-    outside_excludes = [f":(exclude){path}" for path in FOCUS]
-    outside_diff = git_text(["diff", f"{branch}...{tag}", "--", ".", *outside_excludes])
     all_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}"])))
-    commits = "\n".join(sorted(all_commits))
     focus_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}", "--", *FOCUS])))
     other_commit_count = len(all_commits - focus_commits)
 
     issue_body, full_report, run_url = build_issue(
-        release, both_names, only_upstream, diff, fork_diff, focus_diff, outside_diff, commits, other_commit_count,
+        release, releases, both_names, only_upstream, diff, fork_diff, focus_diff, outside_diff, commits, other_commit_count,
     )
     repo = os.environ["GITHUB_REPOSITORY"]
     run(
