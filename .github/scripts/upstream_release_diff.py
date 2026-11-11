@@ -135,10 +135,10 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 [3] 数据格式、存储、配置、导出方式等破坏性变更
 [4] 私钥、助记词或花费密钥泄露
 [5] 内存、崩溃、认证或权限绕过
-每条只占一行，不要写英文 PR 标题，不要写仓库链接，不要在列表后面再加注释。
-格式：序号. [类别][已确认/可能影响/待验证] 模块：一句中文 — 谁受影响；要核对什么。#编号或短哈希
-报告里等级和证据会加粗，正文不要再重复「已确认」「P1」这些词。
-例：1. [4][已确认] gRPC：UnblindedOutput 退出时清零 — 钱包导入；核对失败后是否拿到全零密钥。#8166
+每条只占一行，不要写英文提交标题，不要写仓库链接，不要在列表后面再加注释。
+格式：序号. [类别][已确认/可能影响/待验证][模块] 一句中文 — 谁受影响；要核对什么。#编号或短哈希
+模块只能是 applications 下的一个目录名：minotari_node、minotari_console_wallet、minotari_app_grpc、minotari_app_utilities、minotari_miner、minotari_merge_mining_proxy、minotari_ledger_wallet、minotari_mcp_node、minotari_mcp_wallet、minotari_mcp_common、minotari_offline_signer、minotari_peer_sync、minotari_utils。改动在 base_layer 或 common 时，选最终受影响的那个应用，例如共识和同步用 minotari_node，钱包存储用 minotari_console_wallet，gRPC 用 minotari_app_grpc。报告会把这个名字加粗放在每条开头。不要写文件路径，不要写「头部同步」这类说明。
+例：1. [4][已确认][minotari_console_wallet] UnblindedOutput 退出时清零 — 导入方；核对失败后是否拿到全零密钥。#8166
 diff 里能对上的写已确认或可能影响；只有发行说明、diff 里看不到的写[待验证]，不能省略。没有的不要编。一条都没有就写「发行说明里没有这类重点。」
 同一证据档内按这个顺序：密钥泄露，内存、崩溃或认证绕过，共识分叉或必须升级，共识或挖矿漏洞，破坏性变更。没有归入这五类的放在该档最后。待验证整体放在本节最后。
 材料里有多个版本时，按从旧到新分块。每块第一行只写 `### 版本号`，下面只放这个版本的条目，不要把不同版本混进同一个列表。只有一个版本时不要写版本标题。
@@ -431,6 +431,9 @@ def emphasize_labels(item):
             labels.append(label.upper() if re.fullmatch(r"p[0-3]", label, re.IGNORECASE) else label)
             rest = rest[match.end():]
             continue
+        if labels and len(label) <= 24 and "http" not in label:
+            labels.append(label)
+            rest = rest[match.end():]
         break
     if not labels:
         return item.strip()
@@ -440,6 +443,27 @@ def emphasize_labels(item):
 def severity_rank(item):
     match = re.search(r"\[P([0-3])\]", item, re.IGNORECASE)
     return int(match.group(1)) if match else 9
+
+
+def strip_release_noise(text):
+    numbers = re.findall(r"#(\d+)", text)
+    text = re.sub(r"\s+https://github\.com/\S+", "", text)
+    text = re.sub(r"\s+tari-project/tari#\d+", "", text)
+    text = re.sub(r"(?:\s|(?<=[。；]))(?:fix|feat|refactor|perf|chore|docs|test|ci)\([^)]*\):.*$", "", text)
+    text = text.strip()
+    if numbers and not re.search(r"#\d+\s*$", text):
+        text = f"{text} #{numbers[-1]}"
+    return text
+
+
+def mark_leading_module(line):
+    match = re.match(r"^(\d+\.\s+)\*\*([^*]+)\*\*\s+([^：\n]{1,24})：(.*)$", line)
+    if not match:
+        return line
+    module = match.group(3).strip()
+    if not module:
+        return line
+    return f"{match.group(1)}**{match.group(2)} · {module}** {match.group(4).strip()}"
 
 
 def number_highlights(text):
@@ -456,8 +480,8 @@ def number_highlights(text):
     ranked = sorted(enumerate(items), key=lambda pair: (evidence_rank(pair[1]), category(pair[1]), pair[0]))
     lines = []
     for number, (_, item) in enumerate(ranked, 1):
-        body = re.sub(r"^\[([1-5])\]\s*", "", item).strip()
-        lines.append(f"{number}. {emphasize_labels(body)}")
+        body = strip_release_noise(re.sub(r"^\[([1-5])\]\s*", "", item).strip())
+        lines.append(mark_leading_module(f"{number}. {emphasize_labels(body)}"))
     return "\n".join(preamble + lines + trailer)
 
 
