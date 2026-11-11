@@ -10,9 +10,9 @@
 
 {{reason}}
 
-本机切到 `{{branch}}` 后执行 `/merge-upstream {{tag}}`。
-skill 会新建 `feat/merge-<tag>`，结束时把 origin 改回 fork。
-Class A 冲突逐段问人，禁止自动选边。版本号、`Cargo.lock`、生成物属于 Class B，自动采用官方。其它源码冲突属于 Class C，问人。
+要合并时，在本机的 `{{branch}}` 上执行 `/merge-upstream {{tag}}`。
+这个命令会新建 `feat/merge-{{tag}}` 并完成合并，结束时把 origin 改回你的仓库。它不会 push，也不会编译。
+双方都改过的重点文件如果发生冲突，需要逐段确认。版本号、`Cargo.lock` 和生成文件采用官方版本。
 
 ## 2. 范围
 

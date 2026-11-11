@@ -79,7 +79,7 @@ P3：低影响变化。不能只凭关键词定级。证据不足不要给 P0。
 # 安全判断
 区分可疑特征、漏洞风险、有证据支持的恶意行为。外链、unsafe、执行命令、依赖变更并不自动构成后门。
 公钥、genesis 常量和网络常量不是恶意代码。测试、注释、文档、版本号、127.0.0.1、localhost、github.com、docs.rs、crates.io 链接不是恶意迹象。
-「已检查材料内未见明显可疑行为」只覆盖已读材料，不能推断整个仓库安全。材料被截断时，只把受影响的那部分写成证据不足。
+「已检查材料内未见明显可疑行为」只覆盖已读材料，不能推断整个仓库安全。某一段材料不完整时，只把那一段里受影响的发现标成待验证，不要用「证据不足」代替具体发现。
 
 # 分段回复
 分段审查时用简体中文。每条写成「[P等级][已确认/可能影响/待验证] 路径或短哈希 — 变化；影响；要核对什么」。
@@ -113,12 +113,14 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 这份结论不执行 merge 或 push。
 
 开头两行必须是这个格式，不要加标题：
-结论：可以开始
-原因：一句话，不超过 40 字。
+结论：先核对再开始
+原因：一句完整的话，40 到 80 字，写给要执行合并的人。
 结论只能是「可以开始」「先核对再开始」「证据不足」之一。不要写「建议升级」。
-可以开始：已读材料里没有需要先停下来的 P0 或 P1。没送入的普通文件，以及只出现在发行说明里的条目，不阻止这个结论。
-先核对再开始：已读材料里有 P0 或 P1。原因里点出要先看的那一件。发行说明里对不上 diff 的条目保持待验证，不要因此改选证据不足。
-证据不足：已读材料里看不到任何可核对的 P0 或 P1，并且优先文件没有送入或关键 diff 被截断。已经有可核对的 P0 或 P1 时，不要选证据不足。
+原因必须写出具体变化和后果。例：gRPC 认证从密码哈希比对改成明文比对，旧配置升级后会登录失败。
+禁止出现这些说法：优先文件、未全送、P0、P1、Class、skill、diff、截断。材料没送全时写成「有重要文件这次没拿来对比」。
+可以开始：已读材料里没有需要先停下来核对的问题。没送入的普通文件，以及只出现在发行说明里的条目，不阻止这个结论。
+先核对再开始：已读材料里有会破坏升级、资金或认证的问题。原因里点出要先看的那一件。发行说明里对不上代码的条目保持待验证，不要因此改选证据不足。
+证据不足：已读材料里看不到任何需要先核对的具体问题，并且重要文件没有送入或关键代码被截断。已经有可核对的问题时，不要选证据不足。
 文件重叠不是 Git 冲突。这份结论不执行 merge 或 push。
 
 然后只输出下面四节。条目用 1. 2. 3.，一条一件事。
@@ -144,10 +146,14 @@ diff 里能对上的写已确认或可能影响；只有发行说明、diff 里�
 不要粘贴函数签名，不要把同一事实写成两句。没有就写「没有发行说明以外的高优先级风险。」
 同一证据档内 P0 在前。待验证放在本节最后。
 
-## 安全与 Fork
-第一行三选一：需要人工复核 / 已检查材料内未见明显可疑行为 / 证据不足。
-第二行写覆盖范围：节点、钱包、共识、同步、gRPC。不得宣布仓库没有后门。材料截断时这一节写证据不足，已确认的问题仍保留在上面。
-只有 Fork 一侧 diff 已提供时，接着用 1. 2. 3. 写双方都改过的预设文件：上游变了什么，Fork 这段要保留什么，要人看的位置。没有 Fork diff 就写「没有 Fork 一侧 diff，不判断定制行为。」
+## 双方改动取舍
+这一节只写双方都改过的预设文件。不要写安全总判，不要写覆盖范围，不要写「证据不足」「需要人工复核」「未见明显可疑行为」。可疑行为写在「代码风险」。
+每个文件只占一行：序号. [已确认/待验证] 路径 — 上游：一句；要保留：一句；合并时看：一句。
+用中文短句，不贴函数签名，不罗列依赖版本。一个文件一条。
+某个文件这次没拿来对比时，这一条写「这次没拿来对比」，其它文件照常写。
+没有你这边的对照材料时，只写「这次没有你这边的改动对照。」
+没有双方都改过的文件时，只写「这次没有双方都改过的预设文件。」
+例：1. [已确认] applications/minotari_node/src/grpc/base_node_grpc_server.rs — 上游：coinbase 校验提前，错误码改为参数错误；要保留：合并挖矿的四个接口，以及按高度生成的 coinbase 前缀；合并时看：两套校验是否同一套规则，随机生成的 coinbase 密钥能否花出去。
 
 ## 合并后核对
 最多 5 条，每条一行：序号. [已确认/可能影响/待验证] 一句要做的核对。已确认和可能影响在前，待验证在最后。编译和测试都没有执行，不要写已经跑过。"""
@@ -254,7 +260,7 @@ def narrow_diff(diff_text, limit):
     if skipped:
         notes.append(f"已跳过测试、文档或仅空白变化的文件 {skipped} 个。这不构成材料不足。")
     if dropped_priority:
-        notes.append(f"收窄后仍有 {dropped_priority} 个优先文件没有送入模型。")
+        notes.append(f"收窄后仍有 {dropped_priority} 个重要文件没有拿来对比。")
     if dropped_other:
         notes.append(f"另有 {dropped_other} 个行为变化文件因长度限制未送入。这不构成材料不足。")
     return "".join(parts), "\n".join(notes)
@@ -431,6 +437,30 @@ def number_highlights(text):
     return "\n".join(preamble + lines + trailer)
 
 
+def is_fork_heading(line):
+    return normalize_line(line) in {"安全与 Fork", "双方改动取舍"}
+
+
+def normalize_fork_section(text):
+    drop = ("证据不足", "覆盖范围", "需要人工复核", "已检查材料内未见明显可疑行为")
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        heading = normalize_line(stripped)
+        if any(heading.startswith(prefix) for prefix in drop):
+            continue
+        if is_item_start(stripped):
+            lines.append(stripped)
+            continue
+        if re.match(r"^[A-Za-z0-9_./-]+\s+[—\-]", stripped):
+            lines.append(f"1. {stripped}")
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
 def order_numbered_sections(text):
     parts = re.split(r"(?m)^(## .+)$", text)
     ordered = []
@@ -438,8 +468,12 @@ def order_numbered_sections(text):
         ordered.append(order_list(parts[0]))
     index = 1
     while index < len(parts):
-        ordered.append(parts[index].strip())
+        heading = parts[index].strip()
         body = parts[index + 1] if index + 1 < len(parts) else ""
+        if is_fork_heading(heading):
+            heading = "## 双方改动取舍"
+            body = normalize_fork_section(body)
+        ordered.append(heading)
         ordered.append(order_list(body))
         index += 2
     return "\n\n".join(part for part in ordered if part.strip())
@@ -491,7 +525,7 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
     class_c_overlap = [name for name in both_names if name not in class_a_names]
     if ai.startswith("（"):
         decision = "证据不足"
-        reason = "模型没有给出分析，不能据此判断可以开始合并。"
+        reason = "模型没有给出分析，先不要合并。"
         highlights = "模型没有给出分析，发行说明重点没有按 1. 2. 3. 列出。"
         analysis = ai
     else:
@@ -507,6 +541,11 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
         else:
             highlights = "模型没有按 1. 2. 3. 列出发行说明重点，原文保留在下一节。"
             analysis = ai if not analysis.strip() else analysis
+    decision = {
+        "可以开始": "可以开始合并",
+        "先核对再开始": "先核对，再合并",
+        "证据不足": "材料不够，先不要合并",
+    }.get(decision, decision)
     def listed(names):
         return "\n".join(f"- `{name}`" for name in names) if names else "（没有）"
 
@@ -701,9 +740,9 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
         synthesis = "\n\n".join(partials)
         if len(synthesis) > 80000:
             synthesis = synthesis[:80000] + "\n…（分段摘要过长，汇总时截断）"
-            narrow_notes += "\n分段摘要超过 80000 字符，汇总时被截断。已读材料里已有 P0 或 P1 时结论选「先核对再开始」，原因里说明摘要被截断。已确认的问题保留。"
-        elif "没有送入模型" in narrow_notes:
-            narrow_notes += "\n优先文件没有送完整。已读材料里已有 P0 或 P1 时结论选「先核对再开始」，原因里说明缺了优先文件。不要只因为发行说明对不上 diff 就选「证据不足」。"
+            narrow_notes += "\n分段摘要超过 80000 字符，后面没有送进汇总。已经看到会破坏升级、资金或认证的问题时，结论选「先核对再开始」，原因里用完整的话说明还缺哪一块。已确认的问题保留。"
+        elif "没有拿来对比" in narrow_notes or "没有送入模型" in narrow_notes:
+            narrow_notes += "\n有重要文件这次没拿来对比。已经看到需要先核对的问题时，结论选「先核对再开始」，原因里直接写那个问题，并补一句有重要文件没拿来对比。不要写「优先文件」「未全送」「P0」。"
         return final_request(synthesis, narrow_notes)
     except Exception as error:
         detail = str(error).replace(api_key, "***")
