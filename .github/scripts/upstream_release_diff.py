@@ -131,14 +131,17 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 [3] 数据格式、存储、配置、导出方式等破坏性变更
 [4] 私钥、助记词或花费密钥泄露
 [5] 内存、崩溃、认证或权限绕过
-每条格式：序号. [类别][已确认/可能影响/待验证] 一句话 — 谁受影响，要核对什么。类别只能是 1 到 5。
+每条只占一行，不要写英文 PR 标题，不要写仓库链接，不要在列表后面再加注释。
+格式：序号. [类别][已确认/可能影响/待验证] 模块：一句中文 — 谁受影响；要核对什么。#编号或短哈希
+报告里等级和证据会加粗，正文不要再重复「已确认」「P1」这些词。
+例：1. [4][已确认] gRPC：UnblindedOutput 退出时清零 — 钱包导入；核对失败后是否拿到全零密钥。#8166
 diff 里能对上的写已确认或可能影响；只有发行说明、diff 里看不到的写[待验证]，不能省略。没有的不要编。一条都没有就写「发行说明里没有这类重点。」
 同一证据档内按类别 1 到 5。待验证整体放在本节最后。
 
 ## 代码风险
-最多 5 条，只写 diff 里另外看到的风险。节点和钱包里已证实的问题写在前面，其它目录和待验证写在后面。每条：
-序号. [P等级][已确认/可能影响/待验证] 文件路径或短哈希 — 改动；触发条件与影响；要核对什么。
-和上一节重复的不写。没有就写「没有发行说明以外的高优先级风险。」
+最多 5 条，只写 diff 里另外看到的风险。和上一节重复的不写。每条只占一行：
+序号. [P等级][已确认/可能影响/待验证] 路径 — 一句改动；影响；要核对什么。
+不要粘贴函数签名，不要把同一事实写成两句。没有就写「没有发行说明以外的高优先级风险。」
 同一证据档内 P0 在前。待验证放在本节最后。
 
 ## 安全与 Fork
@@ -147,7 +150,7 @@ diff 里能对上的写已确认或可能影响；只有发行说明、diff 里�
 只有 Fork 一侧 diff 已提供时，接着用 1. 2. 3. 写双方都改过的预设文件：上游变了什么，Fork 这段要保留什么，要人看的位置。没有 Fork diff 就写「没有 Fork 一侧 diff，不判断定制行为。」
 
 ## 合并后核对
-最多 5 条，只列这次材料里实际出现的验证。已确认和可能影响的核对项在前，待验证在最后。编译和测试都没有执行，不要写已经跑过。"""
+最多 5 条，每条一行：序号. [已确认/可能影响/待验证] 一句要做的核对。已确认和可能影响在前，待验证在最后。编译和测试都没有执行，不要写已经跑过。"""
 
 
 def run(args, check=True):
@@ -333,27 +336,46 @@ def split_section(text, title):
     return section, rest
 
 
+def is_item_start(text):
+    if re.match(r"^(\d+[.、)]|[-*])\s+", text):
+        return True
+    return bool(re.match(r"^\[(?:[1-5]|P[0-3]|已确认|可能影响|待验证|证据不足)\]", text, re.IGNORECASE))
+
+
+def item_body(text):
+    return re.sub(r"^(\d+[.、)]|[-*])\s+", "", text).strip()
+
+
 def list_items(text):
     preamble = []
     items = []
+    trailer = []
     current = []
     started = False
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        if re.match(r"^(\d+[.、)]|[-*])\s+", stripped):
+        if stripped.startswith(("（注", "注：", "注:")):
+            if current:
+                items.append(" ".join(current))
+                current = []
+            trailer.append(stripped)
+            continue
+        if is_item_start(stripped):
             started = True
             if current:
                 items.append(" ".join(current))
-            current = [re.sub(r"^(\d+[.、)]|[-*])\s+", "", stripped)]
-        elif started:
+            current = [item_body(stripped)]
+        elif started and not trailer:
             current.append(stripped)
+        elif started:
+            trailer.append(stripped)
         else:
             preamble.append(stripped)
     if current:
         items.append(" ".join(current))
-    return preamble, items
+    return preamble, items, trailer
 
 
 def evidence_rank(item):
@@ -366,14 +388,35 @@ def evidence_rank(item):
     return 1
 
 
+def emphasize_labels(item):
+    rest = item.strip()
+    labels = []
+    while True:
+        match = re.match(r"^\[([^\]]+)\]\s*", rest)
+        if not match:
+            break
+        label = match.group(1).strip()
+        if re.fullmatch(r"[1-5]", label):
+            rest = rest[match.end():]
+            continue
+        if label in {"已确认", "可能影响", "待验证", "证据不足"} or re.fullmatch(r"P[0-3]", label, re.IGNORECASE):
+            labels.append(label.upper() if re.fullmatch(r"p[0-3]", label, re.IGNORECASE) else label)
+            rest = rest[match.end():]
+            continue
+        break
+    if not labels:
+        return item.strip()
+    return f"**{' · '.join(labels)}** {rest}".strip()
+
+
 def severity_rank(item):
     match = re.search(r"\[P([0-3])\]", item, re.IGNORECASE)
     return int(match.group(1)) if match else 9
 
 
 def number_highlights(text):
-    _, items = list_items(text)
-    if len(items) <= 1 and not re.match(r"^(\d+[.、)]|[-*])\s+", text.strip()):
+    preamble, items, trailer = list_items(text)
+    if not items:
         return text.strip()
 
     def category(item):
@@ -384,8 +427,8 @@ def number_highlights(text):
     lines = []
     for number, (_, item) in enumerate(ranked, 1):
         body = re.sub(r"^\[([1-5])\]\s*", "", item).strip()
-        lines.append(f"{number}. {body}")
-    return "\n".join(lines)
+        lines.append(f"{number}. {emphasize_labels(body)}")
+    return "\n".join(preamble + lines + trailer)
 
 
 def order_numbered_sections(text):
@@ -403,12 +446,12 @@ def order_numbered_sections(text):
 
 
 def order_list(text):
-    preamble, items = list_items(text)
+    preamble, items, trailer = list_items(text)
     if not items:
         return text.strip()
     ranked = sorted(enumerate(items), key=lambda pair: (evidence_rank(pair[1]), severity_rank(pair[1]), pair[0]))
-    numbered = [f"{number}. {item}" for number, (_, item) in enumerate(ranked, 1)]
-    return "\n".join(preamble + numbered)
+    numbered = [f"{number}. {emphasize_labels(item)}" for number, (_, item) in enumerate(ranked, 1)]
+    return "\n".join(preamble + numbered + trailer)
 
 
 def render_report_parts(values):
