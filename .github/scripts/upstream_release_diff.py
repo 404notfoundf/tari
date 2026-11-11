@@ -632,16 +632,19 @@ def build_issue(release, releases, both_names, only_upstream, diff, fork_diff, f
     class_a_names = set(CLASS_A)
     class_a_overlap = [name for name in both_names if name in class_a_names]
     class_c_overlap = [name for name in both_names if name not in class_a_names]
+    ready = True
     if ai.startswith("（"):
+        ready = False
         decision = "这次没有分析"
-        reason = "模型接口没有返回分析，先不要合并。删掉这条 issue 后可以再跑一次。"
+        reason = "模型接口没有返回分析。"
         highlights = "模型没有给出分析，发行说明重点没有按 1. 2. 3. 列出。"
         analysis = ai
     else:
         decision, reason, analysis = split_conclusion(ai)
         if not decision:
+            ready = False
             decision = "这次没有分析"
-            reason = "模型没有把结论写在开头，原文保留在下面。"
+            reason = "模型没有把结论写在开头。"
             analysis = ai
         else:
             decision = {
@@ -694,7 +697,7 @@ def build_issue(release, releases, both_names, only_upstream, diff, fork_diff, f
     if len(issue_body) > 60000:
         values["analysis"] = "（分析过长，完整内容在 Artifact 的报告文件中。）"
         issue_body, _ = render_report_parts(values)
-    return issue_body, full_report, run_url
+    return issue_body, full_report, run_url, ready
 
 
 def chat_completions_url(api_url):
@@ -987,17 +990,20 @@ def main():
     focus_commits = set(lines(git_text(["log", "--oneline", f"{branch}..{tag}", "--", *FOCUS])))
     other_commit_count = len(all_commits - focus_commits)
 
-    issue_body, full_report, run_url = build_issue(
+    issue_body, full_report, run_url, ready = build_issue(
         release, releases, both_names, only_upstream, diff, fork_diff, focus_diff, outside_diff, commits, other_commit_count,
     )
+    report_file = os.path.join(os.environ.get("GITHUB_WORKSPACE", os.getcwd()), "upstream-release-report.md")
+    with open(report_file, "w", encoding="utf-8") as handle:
+        handle.write(full_report)
+    if not ready:
+        print(f"AI review for {tag} did not finish. Not opening an issue.")
+        sys.exit(1)
     repo = os.environ["GITHUB_REPOSITORY"]
     run(
         ["gh", "label", "create", "upstream-release", "--repo", repo, "--color", "1D76DB", "--description", "Upstream Tari release to review"],
         check=False,
     )
-    report_file = os.path.join(os.environ.get("GITHUB_WORKSPACE", os.getcwd()), "upstream-release-report.md")
-    with open(report_file, "w", encoding="utf-8") as handle:
-        handle.write(full_report)
     issue_file = "/tmp/upstream-release-issue.md"
     with open(issue_file, "w", encoding="utf-8") as handle:
         handle.write(issue_body)
