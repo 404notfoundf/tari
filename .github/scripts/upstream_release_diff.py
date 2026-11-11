@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Compare develop with a tari-project/tari Release and open one GitHub issue."""
 
+import http.client
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -524,16 +526,22 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
     class_a_overlap = [name for name in both_names if name in class_a_names]
     class_c_overlap = [name for name in both_names if name not in class_a_names]
     if ai.startswith("（"):
-        decision = "证据不足"
-        reason = "模型没有给出分析，先不要合并。"
+        decision = "这次没有分析"
+        reason = "模型接口没有返回分析，先不要合并。删掉这条 issue 后可以再跑一次。"
         highlights = "模型没有给出分析，发行说明重点没有按 1. 2. 3. 列出。"
         analysis = ai
     else:
         decision, reason, analysis = split_conclusion(ai)
         if not decision:
-            decision = "证据不足"
+            decision = "这次没有分析"
             reason = "模型没有把结论写在开头，原文保留在下面。"
             analysis = ai
+        else:
+            decision = {
+                "可以开始": "可以开始合并",
+                "先核对再开始": "先核对，再合并",
+                "证据不足": "材料不够，先不要合并",
+            }.get(decision, decision)
         highlights, remainder = split_section(analysis, "发行说明重点")
         if highlights:
             highlights = number_highlights(highlights)
@@ -541,11 +549,6 @@ def build_issue(release, both_names, only_upstream, diff, fork_diff, focus_diff,
         else:
             highlights = "模型没有按 1. 2. 3. 列出发行说明重点，原文保留在下一节。"
             analysis = ai if not analysis.strip() else analysis
-    decision = {
-        "可以开始": "可以开始合并",
-        "先核对再开始": "先核对，再合并",
-        "证据不足": "材料不够，先不要合并",
-    }.get(decision, decision)
     def listed(names):
         return "\n".join(f"- `{name}`" for name in names) if names else "（没有）"
 
@@ -631,16 +634,39 @@ def summarize(notes, commits, focus_diff, outside_diff, diff, fork_diff, both_na
                     {"role": "user", "content": user_text},
                 ],
             }).encode()
-            request = urllib.request.Request(
-                api_url,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            with urllib.request.urlopen(request, timeout=300) as response:
-                body = json.loads(response.read().decode())
+            attempts = 4
+            for attempt in range(1, attempts + 1):
+                request = urllib.request.Request(
+                    api_url,
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=300) as response:
+                        raw = response.read()
+                    body = json.loads(raw.decode())
+                    break
+                except urllib.error.HTTPError as error:
+                    if error.code not in {408, 429, 500, 502, 503, 504} or attempt == attempts:
+                        raise
+                    wait = 5 * (2 ** (attempt - 1))
+                    print(
+                        f"AI request returned HTTP {error.code}. Retry {attempt}/{attempts - 1} after {wait}s.",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                except (TimeoutError, ConnectionError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError) as error:
+                    if attempt == attempts:
+                        raise
+                    wait = 5 * (2 ** (attempt - 1))
+                    print(
+                        f"AI request dropped ({type(error).__name__}: {error}). Retry {attempt}/{attempts - 1} after {wait}s.",
+                        flush=True,
+                    )
+                    time.sleep(wait)
             choice = body.get("choices", [{}])[0]
             message = choice.get("message", {}) if isinstance(choice, dict) else {}
             text = message_text(message)
