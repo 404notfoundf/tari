@@ -140,7 +140,7 @@ FINAL_REVIEW_PROMPT = """你在汇总分段审查结果，为 Tari Fork 维护�
 报告里等级和证据会加粗，正文不要再重复「已确认」「P1」这些词。
 例：1. [4][已确认] gRPC：UnblindedOutput 退出时清零 — 钱包导入；核对失败后是否拿到全零密钥。#8166
 diff 里能对上的写已确认或可能影响；只有发行说明、diff 里看不到的写[待验证]，不能省略。没有的不要编。一条都没有就写「发行说明里没有这类重点。」
-同一证据档内按类别 1 到 5。待验证整体放在本节最后。
+同一证据档内按这个顺序：密钥泄露，内存、崩溃或认证绕过，共识分叉或必须升级，共识或挖矿漏洞，破坏性变更。没有归入这五类的放在该档最后。待验证整体放在本节最后。
 
 ## 代码风险
 最多 5 条，只写 diff 里另外看到的风险。和上一节重复的不写。每条只占一行：
@@ -427,9 +427,11 @@ def number_highlights(text):
     if not items:
         return text.strip()
 
+    importance = {4: 0, 5: 1, 1: 2, 2: 3, 3: 4}
+
     def category(item):
         match = re.match(r"^\[([1-5])\]\s*", item)
-        return int(match.group(1)) if match else 9
+        return importance.get(int(match.group(1)), 9) if match else 9
 
     ranked = sorted(enumerate(items), key=lambda pair: (evidence_rank(pair[1]), category(pair[1]), pair[0]))
     lines = []
